@@ -103,6 +103,16 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
                     "    Characteristic: %s  props=%s", char.uuid, char.properties
                 )
 
+        difluid_chars = [
+            c
+            for svc in client.services
+            for c in svc.characteristics
+            if svc.uuid.lower() in (
+                "000000ee-0000-1000-8000-00805f9b34fb",
+                "000000dd-0000-1000-8000-00805f9b34fb",
+            )
+        ]
+
         write_uuid, notify_uuids = self._pick_characteristics(client)
 
         if not notify_uuids:
@@ -120,6 +130,14 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
 
         self._write_char_uuid = write_uuid
         _LOGGER.info("Using %s for write commands", write_uuid)
+
+        # Verify device responds to direct reads before relying on notifications
+        for char_uuid in [c.uuid.lower() for c in difluid_chars]:
+            try:
+                test = await client.read_gatt_char(char_uuid)
+                _LOGGER.info("Direct read from %s: %s (%d bytes)", char_uuid, test.hex(), len(test))
+            except Exception as read_err:
+                _LOGGER.warning("Direct read from %s failed: %s", char_uuid, read_err)
 
         _LOGGER.info("Writing auto-send enable command (response=False)…")
         await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=False)
