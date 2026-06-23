@@ -33,9 +33,11 @@ def _build_cmd(func: int, cmd: int, data: bytes = b"") -> bytes:
 
 
 _CMD_AUTO_SEND_ON = _build_cmd(0x01, 0x00, bytes([0x01]))
+_CMD_GET_SENSOR_DATA = _build_cmd(0x03, 0x00)
 _CMD_GET_STATUS = _build_cmd(0x03, 0x05)
 
-_STATUS_POLL_INTERVAL = 60
+_DATA_POLL_INTERVAL = 2    # poll sensor data every 2 s
+_STATUS_POLL_INTERVAL = 30  # poll battery/status every 30 s
 
 
 @dataclass
@@ -119,15 +121,20 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         self._write_char_uuid = write_uuid
         _LOGGER.info("Using %s for write commands", write_uuid)
 
-        # Use response=True because the characteristic has 'write' (not 'write-without-response')
-        await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=True)
-        await client.write_gatt_char(write_uuid, _CMD_GET_STATUS, response=True)
+        _LOGGER.info("Writing auto-send enable command (response=False)…")
+        await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=False)
+        _LOGGER.info("Auto-send enable command written OK")
+
+        _LOGGER.info("Writing get-status command…")
+        await client.write_gatt_char(write_uuid, _CMD_GET_STATUS, response=False)
+        _LOGGER.info("Get-status command written OK")
+
         self._client = client
 
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
         self._poll_task = self.hass.async_create_task(
-            self._poll_status_loop(), eager_start=False
+            self._poll_loop(), eager_start=False
         )
 
     def _pick_characteristics(
@@ -170,16 +177,30 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         notify_uuids = [c.uuid.lower() for c in notify_chars]
         return write_uuid, notify_uuids
 
-    async def _poll_status_loop(self) -> None:
+    async def _poll_loop(self) -> None:
+        """Poll sensor data every 3 s; poll status every 30 s.
+
+        Active polling ensures we receive data even if auto-send does not work
+        (e.g. through an ESPHome Bluetooth Proxy that does not forward notifications
+        until the device has been explicitly queried).
+        """
+        tick = 0
         while True:
-            await asyncio.sleep(_STATUS_POLL_INTERVAL)
-            if self._client and self._client.is_connected and self._write_char_uuid:
-                try:
-                    await self._client.write_gatt_char(
-                        self._write_char_uuid, _CMD_GET_STATUS, response=True
+            await asyncio.sleep(_DATA_POLL_INTERVAL)
+            client = self._client
+            if client is None or not client.is_connected or not self._write_char_uuid:
+                continue
+            try:
+                await client.write_gatt_char(
+                    self._write_char_uuid, _CMD_GET_SENSOR_DATA, response=False
+                )
+                if tick % (_STATUS_POLL_INTERVAL // _DATA_POLL_INTERVAL) == 0:
+                    await client.write_gatt_char(
+                        self._write_char_uuid, _CMD_GET_STATUS, response=False
                     )
-                except Exception as err:
-                    _LOGGER.debug("Status poll write failed: %s", err)
+                tick += 1
+            except Exception as err:
+                _LOGGER.debug("Poll write failed: %s", err)
 
     def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
         _LOGGER.warning("Difluid Microbalance %s disconnected, will retry", self.address)
