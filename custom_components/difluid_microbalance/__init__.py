@@ -5,7 +5,16 @@ from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 
-from .const import CONF_DEVICE_TYPE, CONF_IS_TI, CONF_LICENSE_KEY, DEVICE_TYPE_R2, DOMAIN
+from .const import (
+    CONF_DEVICE_TYPE,
+    CONF_IS_TI,
+    CONF_LICENSE_KEY,
+    CONF_MODEL,
+    DEFAULT_MODEL_MICROBALANCE,
+    DEFAULT_MODEL_MICROBALANCE_TI,
+    DEVICE_TYPE_R2,
+    DOMAIN,
+)
 from .coordinator import DifluidMicrobalanceCoordinator
 from .coordinator_r2 import DifluidR2Coordinator
 
@@ -22,10 +31,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             license_key=entry.data.get(CONF_LICENSE_KEY, ""),
         )
     else:
+        is_ti = entry.data.get(CONF_IS_TI, False)
+        default_model = (
+            DEFAULT_MODEL_MICROBALANCE_TI if is_ti else DEFAULT_MODEL_MICROBALANCE
+        )
         coordinator = DifluidMicrobalanceCoordinator(
             hass,
             address=address,
-            is_ti=entry.data.get(CONF_IS_TI, False),
+            is_ti=is_ti,
+            license_key=entry.data.get(CONF_LICENSE_KEY, ""),
+            model=entry.data.get(CONF_MODEL) or default_model,
         )
 
     try:

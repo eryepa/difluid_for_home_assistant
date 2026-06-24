@@ -13,6 +13,7 @@ from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
+from .cloud_auth import DifluidCloudAuth
 from .const import (
     CHARACTERISTIC_UUID_MICROBALANCE,
     CHARACTERISTIC_UUID_MICROBALANCE_TI,
@@ -24,6 +25,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 _HEADER = bytes([0xDF, 0xDF])
+_ENCRYPTED_HEADER = bytes([0xDA, 0xDA])
 
 
 def _build_cmd(func: int, cmd: int, data: bytes = b"") -> bytes:
@@ -53,15 +55,29 @@ class MicrobalanceData:
 
 class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
 
-    def __init__(self, hass: HomeAssistant, address: str, is_ti: bool = False) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        address: str,
+        is_ti: bool = False,
+        license_key: str = "",
+        model: str = "",
+    ) -> None:
         super().__init__(hass, _LOGGER, name=f"{DOMAIN}_{address}", update_interval=None)
         self.address = address
         self.is_ti = is_ti
+        self.license_key = license_key
+        self.model = model
         self._preferred_char_uuid = (
             CHARACTERISTIC_UUID_MICROBALANCE_TI if is_ti else CHARACTERISTIC_UUID_MICROBALANCE
         )
         self._write_char_uuid: Optional[str] = None
         self._all_difluid_char_uuids: list[str] = []
+        # Encrypted-firmware support: the device only streams cleartext DF DF data
+        # after a license-authenticated cloud handshake on the encrypted channel.
+        self._encrypted_uuid: Optional[str] = None
+        self._cleartext_uuid: Optional[str] = None
+        self._auth: Optional[DifluidCloudAuth] = None
         self._client: Optional[BleakClientWithServiceCache] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
@@ -133,20 +149,53 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         self._write_char_uuid = write_uuid
         _LOGGER.info("Using %s for write commands", write_uuid)
 
-        # Enable continuous sensor-data streaming via notifications, then request
-        # an initial status. We intentionally avoid reading characteristics here:
-        # reads return only the echo of the last command and add link traffic.
-        await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=False)
-        await client.write_gatt_char(write_uuid, _CMD_GET_STATUS, response=False)
-        _LOGGER.info("Auto-send enabled; waiting for notifications")
+        # Identify encrypted (ff01) and cleartext (aa01) channels for firmware
+        # that gates sensor data behind a license-authenticated handshake.
+        self._encrypted_uuid = next(
+            (u for u in self._all_difluid_char_uuids if "ff01" in u), None
+        )
+        self._cleartext_uuid = next(
+            (u for u in self._all_difluid_char_uuids if "aa01" in u), None
+        )
 
         self._client = client
+
+        if self.license_key and self._encrypted_uuid:
+            await self._run_handshake(client)
+        else:
+            # Cleartext firmware: enable streaming directly on the command channel.
+            await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=False)
+            await client.write_gatt_char(write_uuid, _CMD_GET_STATUS, response=False)
+            _LOGGER.info("Auto-send enabled; waiting for notifications")
 
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
         self._poll_task = self.hass.async_create_task(
             self._poll_loop(), eager_start=False
         )
+
+    async def _run_handshake(self, client: BleakClientWithServiceCache) -> None:
+        """Authenticate the encrypted channel, then stream cleartext data."""
+        _LOGGER.info(
+            "Encrypted firmware detected; running cloud handshake (model=%s)",
+            self.model,
+        )
+        self._auth = DifluidCloudAuth(
+            client, self._encrypted_uuid, self.license_key, self.model
+        )
+        try:
+            await self._auth.run()
+        except Exception as err:
+            self._auth = None
+            raise RuntimeError(f"Difluid cloud handshake failed: {err}") from err
+        self._auth = None
+
+        # Cleartext is now unlocked. Stream sensor data on the cleartext channel.
+        cleartext = self._cleartext_uuid or self._write_char_uuid
+        self._write_char_uuid = cleartext
+        await client.write_gatt_char(cleartext, _CMD_AUTO_SEND_ON, response=False)
+        await client.write_gatt_char(cleartext, _CMD_GET_STATUS, response=False)
+        _LOGGER.info("Handshake complete; auto-send enabled on cleartext channel %s", cleartext)
 
     def _pick_characteristics(
         self, client: BleakClientWithServiceCache
@@ -235,6 +284,15 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         )
 
     def _on_notification(self, sender: Any, raw: bytearray) -> None:
+        # Encrypted-channel frames (0xDADA …) belong to the handshake. While auth
+        # is running, hand them to it; afterwards they are heartbeats we ignore.
+        if len(raw) >= 2 and raw[0] == 0xDA and raw[1] == 0xDA:
+            if self._auth is not None:
+                self._auth.feed_notification(bytes(raw))
+            else:
+                _LOGGER.debug("Ignoring encrypted heartbeat: %s", raw.hex())
+            return
+
         _LOGGER.info(
             "Notification from %s: %s",
             getattr(sender, "uuid", sender),

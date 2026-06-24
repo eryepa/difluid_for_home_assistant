@@ -14,6 +14,7 @@ from .const import (
     CONF_DEVICE_TYPE,
     CONF_IS_TI,
     CONF_LICENSE_KEY,
+    CONF_MODEL,
     DEVICE_TYPE_MICROBALANCE,
     DEVICE_TYPE_R2,
     DOMAIN,
@@ -76,11 +77,19 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_ADDRESS: info.address,
                     CONF_DEVICE_TYPE: DEVICE_TYPE_MICROBALANCE,
                     CONF_IS_TI: is_ti,
+                    CONF_LICENSE_KEY: user_input.get(CONF_LICENSE_KEY, "").strip(),
+                    CONF_MODEL: user_input.get(CONF_MODEL, "").strip(),
                 },
             )
 
         return self.async_show_form(
             step_id="bluetooth_confirm",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(CONF_LICENSE_KEY, default=""): str,
+                    vol.Optional(CONF_MODEL, default=""): str,
+                }
+            ),
             description_placeholders={"name": info.name or info.address},
         )
 
@@ -155,6 +164,8 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_ADDRESS: address,
                     CONF_DEVICE_TYPE: DEVICE_TYPE_MICROBALANCE,
                     CONF_IS_TI: is_ti,
+                    CONF_LICENSE_KEY: user_input.get(CONF_LICENSE_KEY, "").strip(),
+                    CONF_MODEL: user_input.get(CONF_MODEL, "").strip(),
                 },
             )
 
@@ -168,7 +179,13 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
                 addr: f"{d.name or 'Difluid Device'} ({addr})"
                 for addr, d in self._discovered_devices.items()
             }
-            schema = vol.Schema({vol.Required(CONF_ADDRESS): vol.In(choices)})
+            schema = vol.Schema(
+                {
+                    vol.Required(CONF_ADDRESS): vol.In(choices),
+                    vol.Optional(CONF_LICENSE_KEY, default=""): str,
+                    vol.Optional(CONF_MODEL, default=""): str,
+                }
+            )
         else:
             # No devices found via scan — offer manual MAC entry + device type selector
             errors["base"] = "no_devices_found"
@@ -181,6 +198,8 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
                             DEVICE_TYPE_R2: "R2 Extract",
                         }
                     ),
+                    vol.Optional(CONF_LICENSE_KEY, default=""): str,
+                    vol.Optional(CONF_MODEL, default=""): str,
                 }
             )
 

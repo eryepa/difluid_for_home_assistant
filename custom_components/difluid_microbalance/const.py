@@ -15,9 +15,17 @@ R2_API_URL = "https://cloud-gateway-os.digitizefluid.com/system"
 CONF_IS_TI = "is_ti"
 CONF_DEVICE_TYPE = "device_type"
 CONF_LICENSE_KEY = "license_key"
+CONF_MODEL = "model"
 
 DEVICE_TYPE_MICROBALANCE = "microbalance"
 DEVICE_TYPE_R2 = "r2"
+
+# Device model identifiers sent to the DiFluid cloud during the encrypted
+# handshake. Newer firmware encrypts its BLE traffic (frames start with 0xDADA)
+# and only streams cleartext sensor data after a license-authenticated handshake.
+DEFAULT_MODEL_MICROBALANCE = "DFT-S101"
+DEFAULT_MODEL_MICROBALANCE_TI = "DFT-S102"
+DEFAULT_MODEL_R2 = "DFT-R102"
 
 R2_STATUS_MAP = {
     0: "Test Finished",
