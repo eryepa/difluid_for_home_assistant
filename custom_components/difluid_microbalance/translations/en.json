@@ -3,9 +3,9 @@
     "step": {
       "bluetooth_confirm": {
         "title": "Difluid Microbalance",
-        "description": "Do you want to add **{name}** to Home Assistant?\n\nLeave the fields blank for older (cleartext) scales. If your scale uses encrypted firmware (sensors stay at 0 and the log shows `DA DA` packets), enter your DiFluid SDK license key. The model is optional and defaults to the standard Microbalance model.",
+        "description": "Do you want to add **{name}** to Home Assistant?\n\nEncrypted firmware is handled automatically — no license key required. Leave both fields blank.",
         "data": {
-          "license_key": "License Key (optional, encrypted firmware only)",
+          "license_key": "License Key (leave blank — no longer required)",
           "model": "Model override (optional, e.g. DFT-S101)"
         }
       },
@@ -18,11 +18,11 @@
       },
       "user": {
         "title": "Difluid Device",
-        "description": "Select your Difluid device. If nothing appears in the list, make sure the device is on and Bluetooth is working in Home Assistant. You can also enter the MAC address manually (format: `AA:BB:CC:DD:EE:FF`) — find it in the official DiFluid app or via **nRF Connect** on your phone.\n\nThe License Key is only needed for encrypted-firmware scales (sensors stay at 0 and the log shows `DA DA` packets). Leave it blank otherwise. Model is optional.",
+        "description": "Select your Difluid device. If nothing appears in the list, make sure the device is on and Bluetooth is working in Home Assistant. You can also enter the MAC address manually (format: `AA:BB:CC:DD:EE:FF`) — find it in the official DiFluid app or via **nRF Connect** on your phone.\n\nEncrypted firmware is handled automatically — leave License Key and Model blank.",
         "data": {
           "address": "Device (or MAC address)",
           "device_type": "Device type (for manual entry)",
-          "license_key": "License Key (optional, encrypted firmware only)",
+          "license_key": "License Key (leave blank — no longer required)",
           "model": "Model override (optional, e.g. DFT-S101)"
         }
       }

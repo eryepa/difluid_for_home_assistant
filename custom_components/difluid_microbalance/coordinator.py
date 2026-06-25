@@ -160,8 +160,19 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
 
         self._client = client
 
-        if self.license_key and self._encrypted_uuid:
-            await self._run_handshake(client)
+        if self._encrypted_uuid:
+            # Encrypted-capable firmware detected (ff01 channel present).
+            # The DiFluid server no longer requires a license key; handshake works
+            # with an empty key.  If it fails for any reason, fall back to direct
+            # cleartext so the user still sees data on unencrypted devices.
+            try:
+                await self._run_handshake(client)
+            except Exception as err:
+                _LOGGER.warning(
+                    "Cloud handshake failed (%s); falling back to direct cleartext", err
+                )
+                await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=False)
+                await client.write_gatt_char(write_uuid, _CMD_GET_STATUS, response=False)
         else:
             # Cleartext firmware: enable streaming directly on the command channel.
             await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=False)
