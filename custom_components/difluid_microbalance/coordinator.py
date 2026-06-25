@@ -99,9 +99,29 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
     # ── public API for button / select / number entities ─────────────────────
 
     async def async_send_command(self, cmd: bytes) -> None:
-        if not self._client or not self._client.is_connected or not self._write_char_uuid:
+        """Send a control command, writing to both known channels for maximum compatibility.
+
+        Protocol docs specify FF01 as the write channel for non-Ti Microbalance, but in
+        practice the device streams data on AA01.  Some control commands (power-off, tare)
+        may only be accepted on FF01, so we write to both and silently ignore individual
+        channel errors.
+        """
+        if not self._client or not self._client.is_connected:
             raise RuntimeError("Device not connected")
-        await self._client.write_gatt_char(self._write_char_uuid, cmd, response=False)
+        sent = False
+        for char_uuid in dict.fromkeys(filter(None, [
+            self._write_char_uuid,
+            self._encrypted_uuid,   # FF01 — documented write channel
+            self._cleartext_uuid,   # AA01 — cleartext fallback
+        ])):
+            try:
+                await self._client.write_gatt_char(char_uuid, cmd, response=False)
+                _LOGGER.debug("Command %s sent to %s", cmd.hex(), char_uuid)
+                sent = True
+            except Exception as err:
+                _LOGGER.debug("Write to %s failed (ignored): %s", char_uuid, err)
+        if not sent:
+            raise RuntimeError("Device not connected or no writable characteristic found")
 
     def set_auto_shutdown_minutes(self, minutes: int) -> None:
         self._auto_shutdown_minutes = max(0, minutes)
@@ -324,12 +344,10 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
                     _LOGGER.info(
                         "Auto-shutdown: idle for %.1f min, sending power-off", idle_sec / 60
                     )
-                    # Reset timer so we don't send power-off every poll until device disconnects
+                    # Reset timer so we don't resend every 30 s until the device disconnects
                     self._last_weight_change_time = asyncio.get_event_loop().time()
                     try:
-                        await client.write_gatt_char(
-                            self._write_char_uuid, _CMD_POWER_OFF, response=False
-                        )
+                        await self.async_send_command(_CMD_POWER_OFF)
                     except Exception as err:
                         _LOGGER.warning("Auto-shutdown command failed: %s", err)
 
