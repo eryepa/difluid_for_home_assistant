@@ -12,7 +12,7 @@ from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN, DEFAULT_MODEL_R2, R2_API_URL, R2_STATUS_MAP
+from .const import DOMAIN, DEFAULT_MODEL_R2, R2_API_URL, R2_DEFAULT_LICENSE_KEY, R2_STATUS_MAP
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
     ) -> None:
         super().__init__(hass, _LOGGER, name=f"{DOMAIN}_r2_{address}", update_interval=None)
         self.address = address
-        self.license_key = license_key
+        self.license_key = license_key or R2_DEFAULT_LICENSE_KEY
         self._client: Optional[BleakClientWithServiceCache] = None
         self._uuid_encrypted: Optional[str] = None  # ff01
         self._uuid_cleartext: Optional[str] = None  # aa01

@@ -10,10 +10,10 @@
         }
       },
       "r2_license": {
-        "title": "Difluid R2 Extract — License",
-        "description": "A **{name}** was found. Enter your DiFluid SDK license key to enable communication. You can get a license key from [digitizefluid.com](https://digitizefluid.com).",
+        "title": "Difluid R2 Extract",
+        "description": "A **{name}** was found. Leave the License Key blank to use the built-in default key. Only fill it in if you have your own DiFluid SDK license key.",
         "data": {
-          "license_key": "License Key"
+          "license_key": "License Key (optional, leave blank for default)"
         }
       },
       "user": {

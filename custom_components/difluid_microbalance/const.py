@@ -11,6 +11,9 @@ CHARACTERISTIC_UUID_MICROBALANCE_TI = "0000aa01-0000-1000-8000-00805f9b34fb"
 # R2 Extract
 SERVICE_UUID_R2 = "000000ff-0000-1000-8000-00805f9b34fb"
 R2_API_URL = "https://cloud-gateway-os.digitizefluid.com/system"
+# Public demo key from the DiFluid SDK demo repository (r2Detail.vue).
+# Used as the default when no key is provided.
+R2_DEFAULT_LICENSE_KEY = "b0b978c8d7fe4ac782767996f34a6ce1"
 
 CONF_IS_TI = "is_ti"
 CONF_DEVICE_TYPE = "device_type"

@@ -101,22 +101,18 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            license_key = user_input[CONF_LICENSE_KEY].strip()
-            if len(license_key) < 8:
-                errors[CONF_LICENSE_KEY] = "invalid_license"
-            else:
-                return self.async_create_entry(
-                    title=info.name or f"Difluid R2 ({info.address})",
-                    data={
-                        CONF_ADDRESS: info.address,
-                        CONF_DEVICE_TYPE: DEVICE_TYPE_R2,
-                        CONF_LICENSE_KEY: license_key,
-                    },
-                )
+            return self.async_create_entry(
+                title=info.name or f"Difluid R2 ({info.address})",
+                data={
+                    CONF_ADDRESS: info.address,
+                    CONF_DEVICE_TYPE: DEVICE_TYPE_R2,
+                    CONF_LICENSE_KEY: user_input.get(CONF_LICENSE_KEY, "").strip(),
+                },
+            )
 
         return self.async_show_form(
             step_id="r2_license",
-            data_schema=vol.Schema({vol.Required(CONF_LICENSE_KEY): str}),
+            data_schema=vol.Schema({vol.Optional(CONF_LICENSE_KEY, default=""): str}),
             description_placeholders={"name": info.name or info.address},
             errors=errors,
         )
@@ -127,7 +123,28 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            address = user_input[CONF_ADDRESS].strip().upper()
+            raw_addr = user_input[CONF_ADDRESS]
+            # "manual" is the sentinel value shown when discovered devices are listed
+            # but the user chooses to type their own MAC instead.
+            if raw_addr == "manual":
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=vol.Schema(
+                        {
+                            vol.Required(CONF_ADDRESS): str,
+                            vol.Required(CONF_DEVICE_TYPE, default=DEVICE_TYPE_MICROBALANCE): vol.In(
+                                {
+                                    DEVICE_TYPE_MICROBALANCE: "Microbalance / Microbalance Ti",
+                                    DEVICE_TYPE_R2: "R2 Extract",
+                                }
+                            ),
+                            vol.Optional(CONF_LICENSE_KEY, default=""): str,
+                            vol.Optional(CONF_MODEL, default=""): str,
+                        }
+                    ),
+                    errors={},
+                )
+            address = raw_addr.strip().upper()
             device_type_override = user_input.get(CONF_DEVICE_TYPE, DEVICE_TYPE_MICROBALANCE)
             await self.async_set_unique_id(address, raise_on_progress=False)
             self._abort_if_unique_id_configured()
@@ -174,30 +191,36 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
             if info.address not in current and _device_type(info.service_uuids):
                 self._discovered_devices[info.address] = info
 
+        # DiFluid devices do not advertise Service UUIDs in their BLE packets, so
+        # auto-discovery rarely works.  Always show the manual-MAC form; if any
+        # devices happened to be found, offer them as a dropdown choice too.
+        device_type_selector = vol.Required(
+            CONF_DEVICE_TYPE, default=DEVICE_TYPE_MICROBALANCE
+        )
+        device_type_choices = {
+            DEVICE_TYPE_MICROBALANCE: "Microbalance / Microbalance Ti",
+            DEVICE_TYPE_R2: "R2 Extract",
+        }
         if self._discovered_devices:
             choices = {
                 addr: f"{d.name or 'Difluid Device'} ({addr})"
                 for addr, d in self._discovered_devices.items()
             }
+            # Add a "manual entry" sentinel so the user can still type a MAC
+            choices["manual"] = "Enter MAC address manually…"
             schema = vol.Schema(
                 {
-                    vol.Required(CONF_ADDRESS): vol.In(choices),
+                    vol.Required(CONF_ADDRESS, default="manual"): vol.In(choices),
+                    device_type_selector: vol.In(device_type_choices),
                     vol.Optional(CONF_LICENSE_KEY, default=""): str,
                     vol.Optional(CONF_MODEL, default=""): str,
                 }
             )
         else:
-            # No devices found via scan — offer manual MAC entry + device type selector
-            errors["base"] = "no_devices_found"
             schema = vol.Schema(
                 {
                     vol.Required(CONF_ADDRESS): str,
-                    vol.Required(CONF_DEVICE_TYPE, default=DEVICE_TYPE_MICROBALANCE): vol.In(
-                        {
-                            DEVICE_TYPE_MICROBALANCE: "Microbalance / Microbalance Ti",
-                            DEVICE_TYPE_R2: "R2 Extract",
-                        }
-                    ),
+                    device_type_selector: vol.In(device_type_choices),
                     vol.Optional(CONF_LICENSE_KEY, default=""): str,
                     vol.Optional(CONF_MODEL, default=""): str,
                 }

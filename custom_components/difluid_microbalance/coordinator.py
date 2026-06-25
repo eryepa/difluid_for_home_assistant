@@ -331,11 +331,11 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         updated = False
 
         if func == 0x03 and cmd == 0x00 and len(payload) >= 13:
-            weight_raw = int.from_bytes(payload[0:4], "big")
+            weight_raw = int.from_bytes(payload[0:4], "big", signed=True)
             unit_idx = payload[12]
             self.data.weight_unit = WEIGHT_UNITS.get(unit_idx, "g")
             self.data.weight = weight_raw / (1000.0 if unit_idx == 1 else 10.0)
-            self.data.flow_rate = int.from_bytes(payload[4:6], "big") / 10.0
+            self.data.flow_rate = int.from_bytes(payload[4:6], "big", signed=True) / 10.0
             self.data.timer = int.from_bytes(payload[6:8], "big")
             updated = True
 
