@@ -169,10 +169,16 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
                 await self._run_handshake(client)
             except Exception as err:
                 _LOGGER.warning(
-                    "Cloud handshake failed (%s); falling back to direct cleartext", err
+                    "Cloud handshake failed (%s); trying cleartext channel directly", err
                 )
-                await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=False)
-                await client.write_gatt_char(write_uuid, _CMD_GET_STATUS, response=False)
+                # Try the cleartext channel (aa01) directly — it may work without
+                # a handshake on some firmware versions, or if the server validates
+                # the device independently.
+                fallback_uuid = self._cleartext_uuid or write_uuid
+                self._write_char_uuid = fallback_uuid
+                await client.write_gatt_char(fallback_uuid, _CMD_AUTO_SEND_ON, response=False)
+                await client.write_gatt_char(fallback_uuid, _CMD_GET_STATUS, response=False)
+                _LOGGER.info("Sent AUTO_SEND_ON to cleartext channel %s; waiting for notifications", fallback_uuid)
         else:
             # Cleartext firmware: enable streaming directly on the command channel.
             await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=False)

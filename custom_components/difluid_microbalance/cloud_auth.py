@@ -93,6 +93,11 @@ class DifluidCloudAuth:
         ) as resp:
             resp.raise_for_status()
             data = await resp.json()
+            _LOGGER.debug("Server response for %s: code=%s message=%s", cmd_type, data.get("code"), data.get("message"))
+            if data.get("data") is None:
+                raise RuntimeError(
+                    f"Server error for {cmd_type}: code={data.get('code')}, {data.get('message', '(no message)')}"
+                )
             return data["data"]
 
     async def _dev_respond(
