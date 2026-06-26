@@ -50,8 +50,7 @@ async def async_setup_entry(
         )
         async_add_entities([
             TareButton(coordinator, entry, device_info),
-            TimerStartButton(coordinator, entry, device_info),
-            TimerStopButton(coordinator, entry, device_info),
+            TimerStartStopButton(coordinator, entry, device_info),
         ])
 
 
@@ -101,20 +100,12 @@ class TareButton(_MicrobalanceButton):
         await self.coordinator.async_send_command(_CMD_TARE)
 
 
-class TimerStartButton(_MicrobalanceButton):
+class TimerStartStopButton(_MicrobalanceButton):
     def __init__(self, coordinator, entry, device_info):
-        super().__init__(coordinator, entry, device_info, "timer_start", "Timer Start", "mdi:timer-play-outline")
+        super().__init__(coordinator, entry, device_info, "timer_start", "Start/Stop", "mdi:timer-play-outline")
 
     async def async_press(self) -> None:
         await self.coordinator.async_send_command(_CMD_TIMER_START)
-
-
-class TimerStopButton(_MicrobalanceButton):
-    def __init__(self, coordinator, entry, device_info):
-        super().__init__(coordinator, entry, device_info, "timer_stop", "Timer Stop", "mdi:timer-stop-outline")
-
-    async def async_press(self) -> None:
-        await self.coordinator.async_send_command(_CMD_TIMER_STOP)
 
 
 # ── R2 buttons ─────────────────────────────────────────────────────────────────

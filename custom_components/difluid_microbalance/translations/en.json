@@ -48,8 +48,7 @@
     },
     "button": {
       "tare": { "name": "Tare" },
-      "timer_start": { "name": "Timer Start" },
-      "timer_stop": { "name": "Timer Stop" },
+      "timer_start": { "name": "Start/Stop" },
       "test": { "name": "Start Test" }
     },
     "number": {

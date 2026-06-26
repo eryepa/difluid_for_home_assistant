@@ -239,6 +239,7 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             await asyncio.wait_for(asyncio.shield(self._direct_probe), timeout=_DIRECT_PROBE_TIMEOUT)
             _LOGGER.info("R2: cleartext channel works without handshake")
             self.data.authenticated = True
+            self.async_set_updated_data(self.data)
             import time as _time
             self._last_activity_time = _time.monotonic()
             if self._shutdown_task and not self._shutdown_task.done():
@@ -295,6 +296,7 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
 
         await client.stop_notify(self._uuid_encrypted)
         self.data.authenticated = True
+        self.async_set_updated_data(self.data)
         _LOGGER.info("R2 %s: handshake complete (SN=%s)", self.address, self._sn)
 
         # Initial query on cleartext channel
@@ -441,6 +443,7 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
     def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
         import time as _time
         self.data.authenticated = False
+        self.async_set_updated_data(self.data)
         if _time.monotonic() < self._no_reconnect_until:
             _LOGGER.info("Difluid R2 %s disconnected (power-off cooldown, won't reconnect for 60 s)", self.address)
             return
