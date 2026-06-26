@@ -48,7 +48,9 @@
     },
     "button": {
       "tare": { "name": "Tare" },
-      "power_off": { "name": "Power Off" }
+      "timer_start": { "name": "Timer Start" },
+      "timer_stop": { "name": "Timer Stop" },
+      "test": { "name": "Start Test" }
     },
     "number": {
       "auto_shutdown": { "name": "Auto Shutdown" }

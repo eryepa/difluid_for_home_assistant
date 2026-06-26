@@ -63,8 +63,11 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         self._auth_response: Optional[asyncio.Future] = None
         self._direct_probe: Optional[asyncio.Future] = None
         self._reconnect_task: Optional[asyncio.Task] = None
+        self._shutdown_task: Optional[asyncio.Task] = None
         self._bt_cancel: Optional[Callable] = None
         self._no_reconnect_until: float = 0.0
+        self._auto_shutdown_minutes: int = 0
+        self._last_activity_time: float = 0.0
         self._sn: str = ""
         self._mac: str = ""
         self.data = R2Data()
@@ -90,12 +93,58 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             self._bt_cancel = None
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
+        if self._shutdown_task and not self._shutdown_task.done():
+            self._shutdown_task.cancel()
         if self._client and self._client.is_connected:
             try:
                 await self._client.disconnect()
             except Exception:
                 pass
         self._client = None
+
+    def set_auto_shutdown_minutes(self, minutes: int) -> None:
+        self._auto_shutdown_minutes = max(0, minutes)
+
+    async def async_power_off(self) -> None:
+        """Disconnect BLE and suppress reconnect for 60 s."""
+        import time as _time
+        self._no_reconnect_until = _time.monotonic() + 60.0
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+        if self._shutdown_task and not self._shutdown_task.done():
+            self._shutdown_task.cancel()
+        client = self._client
+        if client and client.is_connected:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        _LOGGER.info("R2 power-off: BLE disconnected, reconnect suppressed for 60 s")
+
+    async def async_send_command(self, cmd: bytes) -> None:
+        """Send a DF DF command to the device."""
+        client = self._client
+        if not client or not client.is_connected:
+            raise RuntimeError("R2 not connected")
+        char_uuid = self._uuid_cleartext or self._uuid_encrypted
+        if char_uuid:
+            await client.write_gatt_char(char_uuid, cmd, response=False)
+
+    async def _auto_shutdown_loop(self) -> None:
+        """Disconnect after _auto_shutdown_minutes of inactivity (no test results)."""
+        import time as _time
+        while True:
+            await asyncio.sleep(30)
+            if self._auto_shutdown_minutes <= 0:
+                continue
+            client = self._client
+            if not client or not client.is_connected:
+                return
+            idle_seconds = _time.monotonic() - self._last_activity_time
+            if idle_seconds >= self._auto_shutdown_minutes * 60:
+                _LOGGER.info("R2 auto-shutdown: %.0f min idle, disconnecting", idle_seconds / 60)
+                await self.async_power_off()
+                return
 
     @callback
     def _on_bt_advertisement(
@@ -190,6 +239,13 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             await asyncio.wait_for(asyncio.shield(self._direct_probe), timeout=_DIRECT_PROBE_TIMEOUT)
             _LOGGER.info("R2: cleartext channel works without handshake")
             self.data.authenticated = True
+            import time as _time
+            self._last_activity_time = _time.monotonic()
+            if self._shutdown_task and not self._shutdown_task.done():
+                self._shutdown_task.cancel()
+            self._shutdown_task = self.hass.async_create_task(
+                self._auto_shutdown_loop(), eager_start=False
+            )
         except asyncio.TimeoutError:
             _LOGGER.info(
                 "R2: no response on aa01 in %.0fs; trying cloud handshake", _DIRECT_PROBE_TIMEOUT
@@ -243,6 +299,14 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
 
         # Initial query on cleartext channel
         await client.write_gatt_char(self._uuid_cleartext, _CMD_GET_FIRMWARE, response=False)
+
+        import time as _time
+        self._last_activity_time = _time.monotonic()
+        if self._shutdown_task and not self._shutdown_task.done():
+            self._shutdown_task.cancel()
+        self._shutdown_task = self.hass.async_create_task(
+            self._auto_shutdown_loop(), eager_start=False
+        )
 
     # ── server helpers ──────────────────────────────────────────────────────
 
@@ -368,6 +432,8 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             updated = True
 
         if updated:
+            import time as _time
+            self._last_activity_time = _time.monotonic()
             self.async_set_updated_data(self.data)
 
     # ── disconnect / reconnect ──────────────────────────────────────────────

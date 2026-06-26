@@ -11,6 +11,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CONF_DEVICE_TYPE, CONF_IS_TI, DEVICE_TYPE_R2, DOMAIN
 from .coordinator import DifluidMicrobalanceCoordinator
+from .coordinator_r2 import DifluidR2Coordinator
 
 
 async def async_setup_entry(
@@ -18,21 +19,30 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    if entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_R2:
-        return
-    coordinator: DifluidMicrobalanceCoordinator = hass.data[DOMAIN][entry.entry_id]
-    is_ti = entry.data.get(CONF_IS_TI, False)
-    device_info = DeviceInfo(
-        identifiers={(DOMAIN, entry.entry_id)},
-        name=entry.title,
-        manufacturer="Difluid",
-        model="Microbalance Ti" if is_ti else "Microbalance",
-    )
+    is_r2 = entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_R2
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+
+    if is_r2:
+        device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=entry.title,
+            manufacturer="Difluid",
+            model="R2 Extract",
+        )
+    else:
+        is_ti = entry.data.get(CONF_IS_TI, False)
+        device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=entry.title,
+            manufacturer="Difluid",
+            model="Microbalance Ti" if is_ti else "Microbalance",
+        )
+
     async_add_entities([AutoShutdownNumber(coordinator, entry, device_info)])
 
 
 class AutoShutdownNumber(
-    CoordinatorEntity[DifluidMicrobalanceCoordinator], NumberEntity, RestoreEntity
+    CoordinatorEntity, NumberEntity, RestoreEntity  # type: ignore[type-arg]
 ):
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.CONFIG
