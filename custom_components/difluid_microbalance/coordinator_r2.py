@@ -64,6 +64,7 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         self._direct_probe: Optional[asyncio.Future] = None
         self._reconnect_task: Optional[asyncio.Task] = None
         self._bt_cancel: Optional[Callable] = None
+        self._no_reconnect_until: float = 0.0
         self._sn: str = ""
         self._mac: str = ""
         self.data = R2Data()
@@ -102,6 +103,9 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         service_info: BluetoothServiceInfoBleak,
         change: BluetoothChange,
     ) -> None:
+        import time as _time
+        if _time.monotonic() < self._no_reconnect_until:
+            return
         if self._client and self._client.is_connected:
             return
         if self._reconnect_task and not self._reconnect_task.done():
@@ -112,6 +116,9 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         )
 
     async def _connect_once(self) -> None:
+        import time as _time
+        if _time.monotonic() < self._no_reconnect_until:
+            return
         try:
             await self._do_connect()
         except Exception as err:
@@ -366,8 +373,12 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
     # ── disconnect / reconnect ──────────────────────────────────────────────
 
     def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
-        _LOGGER.warning("Difluid R2 %s disconnected, will retry", self.address)
+        import time as _time
         self.data.authenticated = False
+        if _time.monotonic() < self._no_reconnect_until:
+            _LOGGER.info("Difluid R2 %s disconnected (power-off cooldown, won't reconnect for 60 s)", self.address)
+            return
+        _LOGGER.warning("Difluid R2 %s disconnected, will retry", self.address)
         if self._reconnect_task and not self._reconnect_task.done():
             return
         self._reconnect_task = self.hass.async_create_task(

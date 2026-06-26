@@ -92,6 +92,7 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         self._reconnect_task: Optional[asyncio.Task] = None
         self._bt_cancel: Optional[Callable] = None
         self._auto_shutdown_minutes: int = 0
+        self._no_reconnect_until: float = 0.0  # monotonic timestamp; reconnect suppressed until then
         self._last_weight_change_time: float = 0.0
         self._last_weight_value: float = 0.0
         self.data = MicrobalanceData()
@@ -123,40 +124,27 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
             raise RuntimeError("Device not connected or no writable characteristic found")
 
     async def async_power_off(self) -> None:
-        """Send power-off command and wait up to 3 s for the device to shut down.
+        """Disconnect BLE and suppress reconnect for 60 s.
 
-        Sending to both FF01 and AA01 (as async_send_command does) appears to
-        trigger the command twice, which cancels the shutdown on some firmware
-        versions.  Send to the FF01 channel only — that is the channel that
-        produces the beep and is therefore confirmed to deliver the command.
-
-        Physical long press takes ~3 s; we give the device the same window.
-        If the device powers off by itself, it disconnects and _on_disconnect
-        fires before we reach the cleanup below.
+        The scale has a hardware auto-off timer that fires when no BLE client
+        is connected.  Dropping the connection and holding off reconnect for
+        60 seconds gives the device time to power itself off.
         """
+        import time as _time
+        # Suppress auto-reconnect for 60 seconds.
+        self._no_reconnect_until = _time.monotonic() + 60.0
+
+        # Cancel any sleeping reconnect task immediately.
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+
         client = self._client
-        if not client or not client.is_connected:
-            raise RuntimeError("Device not connected")
-
-        # FF01 is the confirmed delivery channel (produces the beep).
-        char_uuid = self._encrypted_uuid or self._write_char_uuid
-        if char_uuid:
-            await client.write_gatt_char(char_uuid, _CMD_POWER_OFF, response=False)
-            _LOGGER.info("Power-off sent to %s; waiting 3 s for device to shut down", char_uuid)
-
-        # Give the device 3 s — same duration as a physical long press.
-        await asyncio.sleep(3.0)
-
-        # Device still connected → firmware did not execute shutdown.
-        # Drop BLE from our side so the device is no longer "held".
-        if client.is_connected:
-            _LOGGER.info("Device did not power off; dropping BLE connection")
-            if self._reconnect_task and not self._reconnect_task.done():
-                self._reconnect_task.cancel()
+        if client and client.is_connected:
             try:
                 await client.disconnect()
             except Exception:
                 pass
+        _LOGGER.info("Power-off: BLE disconnected, reconnect suppressed for 60 s")
 
     def set_auto_shutdown_minutes(self, minutes: int) -> None:
         self._auto_shutdown_minutes = max(0, minutes)
@@ -205,6 +193,9 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         change: BluetoothChange,
     ) -> None:
         """Triggered when the device starts advertising — attempt immediate connection."""
+        import time as _time
+        if _time.monotonic() < self._no_reconnect_until:
+            return  # power-off cooldown active
         if self._client and self._client.is_connected:
             return
         # Cancel any sleeping reconnect loop and connect right now.
@@ -217,6 +208,9 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
 
     async def _connect_once(self) -> None:
         """Single connection attempt; restarts reconnect loop on failure."""
+        import time as _time
+        if _time.monotonic() < self._no_reconnect_until:
+            return  # power-off cooldown active
         try:
             await self._do_connect()
         except Exception as err:
@@ -389,11 +383,15 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
     # ── disconnect / reconnect ────────────────────────────────────────────────
 
     def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
-        _LOGGER.warning("Difluid Microbalance %s disconnected, will retry", self.address)
+        import time as _time
         self.data.connected = False
         self.async_set_updated_data(self.data)
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
+        if _time.monotonic() < self._no_reconnect_until:
+            _LOGGER.info("Difluid Microbalance %s disconnected (power-off cooldown, won't reconnect for 60 s)", self.address)
+            return
+        _LOGGER.warning("Difluid Microbalance %s disconnected, will retry", self.address)
         if self._reconnect_task and not self._reconnect_task.done():
             return
         self._reconnect_task = self.hass.async_create_task(
