@@ -99,20 +99,19 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
     # ── public API for button / select / number entities ─────────────────────
 
     async def async_send_command(self, cmd: bytes) -> None:
-        """Send a control command, writing to both known channels for maximum compatibility.
+        """Send a control command to all known writable channels.
 
-        Protocol docs specify FF01 as the write channel for non-Ti Microbalance, but in
-        practice the device streams data on AA01.  Some control commands (power-off, tare)
-        may only be accepted on FF01, so we write to both and silently ignore individual
-        channel errors.
+        Protocol docs specify FF01 as the write channel for non-Ti Microbalance, but
+        sensor notifications arrive on AA01.  We write to both channels so the command
+        reaches the device regardless of which one it actually listens on.
         """
         if not self._client or not self._client.is_connected:
             raise RuntimeError("Device not connected")
         sent = False
         for char_uuid in dict.fromkeys(filter(None, [
             self._write_char_uuid,
-            self._encrypted_uuid,   # FF01 — documented write channel
-            self._cleartext_uuid,   # AA01 — cleartext fallback
+            self._encrypted_uuid,   # FF01 — documented write channel for non-Ti
+            self._cleartext_uuid,   # AA01 — cleartext channel
         ])):
             try:
                 await self._client.write_gatt_char(char_uuid, cmd, response=False)
@@ -122,6 +121,25 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
                 _LOGGER.debug("Write to %s failed (ignored): %s", char_uuid, err)
         if not sent:
             raise RuntimeError("Device not connected or no writable characteristic found")
+
+    async def async_power_off(self) -> None:
+        """Send power-off command then immediately drop BLE from our side.
+
+        Some firmware versions block power-off while a BLE connection is active.
+        Disconnecting right after sending the command removes that barrier.
+        """
+        await self.async_send_command(_CMD_POWER_OFF)
+        await asyncio.sleep(0.4)
+        # Stop the reconnect loop so HA does not immediately reconnect.
+        # The BT advertisement callback will reconnect when the device turns on again.
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+        client = self._client
+        if client and client.is_connected:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
     def set_auto_shutdown_minutes(self, minutes: int) -> None:
         self._auto_shutdown_minutes = max(0, minutes)
@@ -347,9 +365,9 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
                     # Reset timer so we don't resend every 30 s until the device disconnects
                     self._last_weight_change_time = asyncio.get_event_loop().time()
                     try:
-                        await self.async_send_command(_CMD_POWER_OFF)
+                        await self.async_power_off()
                     except Exception as err:
-                        _LOGGER.warning("Auto-shutdown command failed: %s", err)
+                        _LOGGER.warning("Auto-shutdown failed: %s", err)
 
     # ── disconnect / reconnect ────────────────────────────────────────────────
 

@@ -4,7 +4,7 @@ from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTime
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -35,6 +35,7 @@ class AutoShutdownNumber(
     CoordinatorEntity[DifluidMicrobalanceCoordinator], NumberEntity, RestoreEntity
 ):
     _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.CONFIG
     _attr_name = "Auto Shutdown"
     _attr_icon = "mdi:timer-off-outline"
     _attr_native_min_value = 0

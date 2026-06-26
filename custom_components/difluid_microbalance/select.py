@@ -3,7 +3,7 @@ from __future__ import annotations
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -44,6 +44,7 @@ async def async_setup_entry(
 
 class DifluidModeSelect(CoordinatorEntity[DifluidMicrobalanceCoordinator], SelectEntity):
     _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.CONFIG
     _attr_name = "Mode"
     _attr_icon = "mdi:coffee-maker"
     _attr_options = list(_MODE_MAP.keys())

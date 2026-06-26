@@ -39,6 +39,24 @@ def _device_type(service_uuids: list[str]) -> str | None:
     return None
 
 
+def _device_type_from_name(name: str) -> str | None:
+    """Detect device type from BLE advertisement name.
+
+    DiFluid devices do not advertise service UUIDs, so UUID-based discovery
+    never fires.  Name prefix matching is the only reliable way to auto-discover.
+    """
+    lower = (name or "").lower()
+    if lower.startswith("r2"):
+        return DEVICE_TYPE_R2
+    if lower.startswith("microbalance"):
+        return DEVICE_TYPE_MICROBALANCE
+    return None
+
+
+def _discover_type(info: BluetoothServiceInfoBleak) -> str | None:
+    return _device_type(info.service_uuids) or _device_type_from_name(info.name or "")
+
+
 class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
@@ -49,7 +67,7 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
     ) -> ConfigFlowResult:
-        dtype = _device_type(discovery_info.service_uuids)
+        dtype = _discover_type(discovery_info)
         if dtype is None:
             return self.async_abort(reason="not_supported")
         await self.async_set_unique_id(discovery_info.address)
@@ -151,7 +169,7 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
 
             info = self._discovered_devices.get(address)
             if info is not None:
-                dtype = _device_type(info.service_uuids) or device_type_override
+                dtype = _discover_type(info) or device_type_override
                 self._discovery_info = info
             else:
                 # Manual MAC entry — trust the user-selected device type
@@ -175,8 +193,9 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
                 if info
                 else False
             )
+            title = (info.name if info and info.name else None) or f"Difluid Microbalance ({address})"
             return self.async_create_entry(
-                title=f"Difluid Microbalance ({address})",
+                title=title,
                 data={
                     CONF_ADDRESS: address,
                     CONF_DEVICE_TYPE: DEVICE_TYPE_MICROBALANCE,
@@ -188,7 +207,7 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
 
         current = self._async_current_ids()
         for info in async_discovered_service_info(self.hass, connectable=True):
-            if info.address not in current and _device_type(info.service_uuids):
+            if info.address not in current and _discover_type(info):
                 self._discovered_devices[info.address] = info
 
         # DiFluid devices do not advertise Service UUIDs in their BLE packets, so
