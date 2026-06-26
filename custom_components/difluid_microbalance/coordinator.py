@@ -123,19 +123,36 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
             raise RuntimeError("Device not connected or no writable characteristic found")
 
     async def async_power_off(self) -> None:
-        """Send power-off command then immediately drop BLE from our side.
+        """Send power-off command and wait up to 3 s for the device to shut down.
 
-        Some firmware versions block power-off while a BLE connection is active.
-        Disconnecting right after sending the command removes that barrier.
+        Sending to both FF01 and AA01 (as async_send_command does) appears to
+        trigger the command twice, which cancels the shutdown on some firmware
+        versions.  Send to the FF01 channel only — that is the channel that
+        produces the beep and is therefore confirmed to deliver the command.
+
+        Physical long press takes ~3 s; we give the device the same window.
+        If the device powers off by itself, it disconnects and _on_disconnect
+        fires before we reach the cleanup below.
         """
-        await self.async_send_command(_CMD_POWER_OFF)
-        await asyncio.sleep(0.4)
-        # Stop the reconnect loop so HA does not immediately reconnect.
-        # The BT advertisement callback will reconnect when the device turns on again.
-        if self._reconnect_task and not self._reconnect_task.done():
-            self._reconnect_task.cancel()
         client = self._client
-        if client and client.is_connected:
+        if not client or not client.is_connected:
+            raise RuntimeError("Device not connected")
+
+        # FF01 is the confirmed delivery channel (produces the beep).
+        char_uuid = self._encrypted_uuid or self._write_char_uuid
+        if char_uuid:
+            await client.write_gatt_char(char_uuid, _CMD_POWER_OFF, response=False)
+            _LOGGER.info("Power-off sent to %s; waiting 3 s for device to shut down", char_uuid)
+
+        # Give the device 3 s — same duration as a physical long press.
+        await asyncio.sleep(3.0)
+
+        # Device still connected → firmware did not execute shutdown.
+        # Drop BLE from our side so the device is no longer "held".
+        if client.is_connected:
+            _LOGGER.info("Device did not power off; dropping BLE connection")
+            if self._reconnect_task and not self._reconnect_task.done():
+                self._reconnect_task.cancel()
             try:
                 await client.disconnect()
             except Exception:
