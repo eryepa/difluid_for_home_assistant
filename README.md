@@ -26,6 +26,7 @@
 - Кнопки управления: Tare, Start/Stop таймера (весы), Start Test (R2)
 - Поддержка зашифрованной прошивки через автоматический handshake
 - Работа через ESPHome Bluetooth Proxy
+- Собственная иконка встроена в интеграцию (папка `brand/`, отображается в HA 2026.3+)
 
 ---
 
@@ -259,6 +260,7 @@ All communication is **fully local** via BLE. Works with an **ESPHome Bluetooth 
 - Control buttons: Tare, Timer Start/Stop (scale), Start Test (R2)
 - Encrypted firmware support via automatic DiFluid cloud handshake
 - ESPHome Bluetooth Proxy support
+- Brand icon bundled with the integration (`brand/` folder, shown in HA 2026.3+)
 
 ---
 
