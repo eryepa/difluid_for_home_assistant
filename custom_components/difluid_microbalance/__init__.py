@@ -24,9 +24,12 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.SENSOR, Platform.BUTTON, Platform.NUMBER, Platform.SELECT]
 
-# Lovelace card bundled with the integration.
-_CARD_URL = f"/{DOMAIN}/difluid-card.js"
-_CARD_PATH = Path(__file__).parent / "www" / "difluid-card.js"
+# Lovelace card bundled with the integration.  We serve the whole www/
+# directory (a directory static path is more reliable than a single-file one)
+# and auto-load the module so the card shows up in the "Add card" picker.
+_WWW_DIR = Path(__file__).parent / "www"
+_CARD_URL_BASE = f"/{DOMAIN}"
+_CARD_FILE_URL = f"{_CARD_URL_BASE}/difluid-card.js"
 _FRONTEND_KEY = f"{DOMAIN}_frontend_registered"
 
 
@@ -36,30 +39,36 @@ async def _async_register_card(hass: HomeAssistant) -> None:
         return
     hass.data[_FRONTEND_KEY] = True
 
-    # Serve the JS file.
+    # Serve the www/ directory statically.
     try:
         from homeassistant.components.http import StaticPathConfig
 
         await hass.http.async_register_static_paths(
-            [StaticPathConfig(_CARD_URL, str(_CARD_PATH), False)]
+            [StaticPathConfig(_CARD_URL_BASE, str(_WWW_DIR), False)]
         )
     except ImportError:  # older HA
-        hass.http.register_static_path(_CARD_URL, str(_CARD_PATH), False)
+        hass.http.register_static_path(_CARD_URL_BASE, str(_WWW_DIR), False)
+    except Exception as err:  # noqa: BLE001 - already registered / path issue
+        _LOGGER.warning("Could not register DiFluid card static path: %s", err)
 
-    # Auto-load the module on the frontend (registers it into window.customCards).
+    # Version string is used only for cache-busting the module URL.
     version = ""
     try:
         from homeassistant.loader import async_get_integration
 
         integration = await async_get_integration(hass, DOMAIN)
         version = integration.version or ""
-    except Exception:  # noqa: BLE001 - version is only for cache-busting
+    except Exception:  # noqa: BLE001
         pass
 
+    # Auto-load the module on the frontend (registers it into window.customCards).
     try:
         from homeassistant.components.frontend import add_extra_js_url
 
-        add_extra_js_url(hass, f"{_CARD_URL}?v={version}")
+        add_extra_js_url(hass, f"{_CARD_FILE_URL}?v={version}")
+        _LOGGER.info(
+            "DiFluid dashboard card registered and served at %s", _CARD_FILE_URL
+        )
     except Exception as err:  # noqa: BLE001
         _LOGGER.warning("Could not auto-load DiFluid card: %s", err)
 
