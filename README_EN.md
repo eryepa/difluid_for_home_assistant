@@ -21,8 +21,9 @@ All communication is **fully local** via BLE. Works with an **ESPHome Bluetooth 
 
 - Auto-discovery by BLE advertisement name (`Microbalance…`, `DiFluid R2…`) and by service UUID
 - Manual MAC address entry when auto-discovery doesn't find the device
-- Push updates — the device sends data via BLE notifications, no constant polling
-- Auto-reconnect: instantly reconnects when the device is powered on (BT advertisement callback)
+- Weight & flow are high-priority push notifications; battery / status are polled once per second
+- Instant reconnect when the device powers on (BT advertisement callback) + endless reconnect loop
+- Control buttons: Tare, Timer Start/Stop (scale), Start Test (R2)
 - Encrypted firmware support via automatic DiFluid cloud handshake
 - ESPHome Bluetooth Proxy support
 
@@ -69,14 +70,17 @@ All communication is **fully local** via BLE. Works with an **ESPHome Bluetooth 
 
 ### Microbalance — sensors
 
+Display order: Weight → Flow Rate → Timer → Device Status → Battery.
+
 | Entity | Description |
 |---|---|
-| `weight` | Weight (g / oz / gr) |
-| `flow_rate` | Flow rate (g/s) |
-| `timer` | Timer (seconds) |
-| `battery` | Battery level (%) |
-| `charging` | Charging status (Charging / Idle) |
-| `device_status` | Device status (Idle, Timing in Progress, Timer Pause, …) |
+| **Weight** | Weight (g / oz / gr) — high-priority push notification |
+| **Flow Rate** | Flow rate (g/s) — push notification |
+| **Timer** | Timer (seconds) — push notification |
+| **Device Status** | Device status (Idle, Timing in Progress, Timer Pause, Tare in Progress, …) |
+| **Battery** | Battery level (%). While charging the icon shows a lightning bolt — there is no separate "Charging" sensor. |
+
+> Secondary values (status, battery, charging) are polled **once per second**. Weight and flow are independent — they arrive as separate push notifications.
 
 ### Microbalance — controls
 
@@ -85,7 +89,7 @@ All communication is **fully local** via BLE. Works with an **ESPHome Bluetooth 
 | **Tare** button | Zero the scale (Power Button single click) |
 | **Start/Stop** button | Start or resume the timer (DLink Button single click) |
 | **Mode** selector | `Manual` / `Espresso` / `Pour Over` — controls Auto Detect Timing and Auto Stop Timing |
-| **Auto Shutdown** number | Disconnect BLE after N minutes of no weight change (0 = disabled). The scale powers off via its own hardware timer once BLE drops. |
+| **Auto-disconnect Bluetooth** number | Drop BLE after N minutes of no weight change (0 = disabled). The scale then powers off via its own hardware timer. |
 
 ### R2 Extract — sensors
 
@@ -102,9 +106,8 @@ All communication is **fully local** via BLE. Works with an **ESPHome Bluetooth 
 | Entity | Description |
 |---|---|
 | **Start Test** button | Trigger a single measurement |
-| **Auto Shutdown** number | Disconnect BLE after N minutes of no test results (0 = disabled) |
 
-> R2 does not stream data continuously — results arrive only after a measurement completes (either from the **Start Test** button or the physical TEST button on the device).
+> R2 does not stream data continuously — results arrive only after a measurement completes (either from the **Start Test** button or the physical TEST button on the device). R2 has no BLE auto-disconnect entity: it powers off on its own hardware timer regardless of the connection.
 
 ---
 
@@ -120,13 +123,14 @@ The **Mode** selector maps to two device settings:
 
 ---
 
-## Auto Shutdown
+## Auto-disconnect Bluetooth (Microbalance)
 
-Set **Auto Shutdown** to a number of minutes (1–60). When the scale/refractometer has been idle for that long:
+Set **Auto-disconnect Bluetooth** to a number of minutes (1–60). When the weight hasn't changed for that long:
 
 1. The BLE connection is dropped
 2. Reconnection is suppressed for 60 seconds
-3. The device powers off via its own hardware auto-off timer
+3. The scale powers off via its own hardware auto-off timer
+4. When the scale is turned on again, the integration reconnects automatically
 
 Set to **0** to disable. The value is restored across HA restarts.
 
@@ -146,9 +150,9 @@ For **older, unencrypted** scales the handshake is skipped entirely — no inter
 
 1. HA registers the BLE service UUIDs in `manifest.json` for automatic discovery; devices are also matched by advertisement name prefix
 2. On connect, the integration subscribes to BLE notifications and sends **AUTO_SEND_ON** (`Func=1, Cmd=0, Data=01`) to start the data stream
-3. Weight / flow rate arrive as push notifications; battery and status are fetched once at connect time and then every 30 seconds
+3. Weight / flow rate arrive as push notifications; battery and status are fetched at connect time and then polled once per second
 4. For encrypted firmware, the cloud handshake runs first; data is then read from the cleartext channel
-5. On disconnect, auto-reconnect uses the BT advertisement callback for instant reconnect when the device is powered on, with a 5 → 15 → 30 → 60 → 120 s retry loop as fallback
+5. On disconnect, auto-reconnect uses the BT advertisement callback for instant reconnect when the device is powered on, backed by an endless retry loop (5 → 10 → 20 → 40 → 80 → 120 s, capped at 2 min) that never gives up
 
 ---
 

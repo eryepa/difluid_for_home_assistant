@@ -35,10 +35,6 @@
       "flow_rate": { "name": "Flow Rate" },
       "timer": { "name": "Timer" },
       "battery": { "name": "Battery" },
-      "charging": {
-        "name": "Charging",
-        "state": { "charging": "Charging", "idle": "Idle" }
-      },
       "device_status": { "name": "Device Status" },
       "concentration": { "name": "Concentration (TDS)" },
       "refractive_index": { "name": "Refractive Index" },
@@ -52,7 +48,7 @@
       "test": { "name": "Start Test" }
     },
     "number": {
-      "auto_shutdown": { "name": "Auto Shutdown" }
+      "auto_shutdown": { "name": "Auto-disconnect Bluetooth" }
     },
     "select": {
       "mode": {

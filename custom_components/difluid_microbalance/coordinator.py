@@ -47,7 +47,10 @@ _CMD_POWER_OFF      = _build_cmd(0x03, 0x04, bytes([0x01]))  # Power Button Long
 _CMD_GET_AUTO_DETECT = _build_cmd(0x01, 0x01)
 _CMD_GET_AUTO_STOP   = _build_cmd(0x01, 0x02)
 
-_STATUS_POLL_INTERVAL = 30
+# Weight / flow / timer arrive as high-priority push notifications and are NOT
+# affected by this interval.  This only controls how often we poll the secondary
+# status packet (battery, charging, device_status) via GET_STATUS.
+_STATUS_POLL_INTERVAL = 1
 
 
 @dataclass

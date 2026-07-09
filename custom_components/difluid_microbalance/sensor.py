@@ -24,9 +24,32 @@ from .coordinator_r2 import DifluidR2Coordinator, R2Data
 @dataclass(frozen=True)
 class DifluidSensorDescription(SensorEntityDescription):
     value_fn: Callable = lambda _: None
+    # Optional dynamic-icon callback: (data) -> icon string, or None to fall
+    # back to the device_class / static icon.
+    icon_fn: Callable | None = None
+
+
+def _battery_icon(d) -> str | None:
+    """Show a lightning-bolt (charging) battery icon while charging.
+
+    Returns None when not charging so HA uses the dynamic battery-level icon
+    provided by device_class = battery.
+    """
+    if not d.charging:
+        return None
+    level = max(0, min(100, int(d.battery)))
+    if level >= 95:
+        return "mdi:battery-charging-100"
+    if level < 15:
+        return "mdi:battery-charging-outline"
+    rounded = min(90, max(20, int(round(level / 10.0) * 10)))
+    return f"mdi:battery-charging-{rounded}"
 
 
 # ── Microbalance sensors ──────────────────────────────────────────────────────
+# Order here is the intended display order (Weight → Flow → Timer → Status →
+# Battery).  Charging is merged into the Battery icon (lightning bolt while
+# charging), so there is no separate Charging sensor.
 
 MICROBALANCE_SENSORS: tuple[DifluidSensorDescription, ...] = (
     DifluidSensorDescription(
@@ -56,24 +79,19 @@ MICROBALANCE_SENSORS: tuple[DifluidSensorDescription, ...] = (
         value_fn=lambda d: d.timer,
     ),
     DifluidSensorDescription(
+        key="device_status",
+        name="Device Status",
+        icon="mdi:information-outline",
+        value_fn=lambda d: d.device_status,
+    ),
+    DifluidSensorDescription(
         key="battery",
         name="Battery",
         device_class=SensorDeviceClass.BATTERY,
         state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=PERCENTAGE,
         value_fn=lambda d: d.battery,
-    ),
-    DifluidSensorDescription(
-        key="charging",
-        name="Charging",
-        icon="mdi:battery-charging",
-        value_fn=lambda d: "charging" if d.charging else "idle",
-    ),
-    DifluidSensorDescription(
-        key="device_status",
-        name="Device Status",
-        icon="mdi:information-outline",
-        value_fn=lambda d: d.device_status,
+        icon_fn=_battery_icon,
     ),
 )
 
@@ -171,6 +189,16 @@ class DifluidMicrobalanceSensor(
         if self.coordinator.data is None:
             return None
         return self.entity_description.value_fn(self.coordinator.data)
+
+    @property
+    def icon(self):
+        icon_fn = self.entity_description.icon_fn
+        if icon_fn is not None and self.coordinator.data is not None:
+            dynamic = icon_fn(self.coordinator.data)
+            if dynamic is not None:
+                return dynamic
+            return None  # fall back to device_class default (battery level icon)
+        return self.entity_description.icon
 
     @property
     def available(self) -> bool:

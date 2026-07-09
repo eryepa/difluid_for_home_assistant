@@ -37,8 +37,10 @@ class AutoShutdownNumber(
 ):
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.CONFIG
-    _attr_name = "Auto Shutdown"
-    _attr_icon = "mdi:timer-off-outline"
+    # Name it after what it actually does: disconnect BLE after N idle minutes,
+    # which lets the scale power off via its own hardware auto-off timer.
+    _attr_name = "Auto-disconnect Bluetooth"
+    _attr_icon = "mdi:bluetooth-off"
     _attr_native_min_value = 0
     _attr_native_max_value = 60
     _attr_native_step = 1
