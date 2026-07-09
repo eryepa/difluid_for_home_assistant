@@ -114,59 +114,22 @@
 
 ## Карточка для дашборда
 
-Порядок объектов на странице устройства Home Assistant задаёт сама HA — надёжнее вывести их своей карточкой. Готовый пример (только встроенные карточки, без зависимостей):
+В интеграцию встроена **собственная карточка** — её не нужно настраивать вручную:
 
-> Замените префикс `microbalance_…` / `r2_…` на реальные `entity_id` ваших объектов (**Инструменты разработчика → Состояния**).
+1. Обновите интеграцию и перезапустите Home Assistant
+2. На дашборде: **Изменить → Добавить карточку**
+3. В поиске введите **DiFluid** → выберите **DiFluid Microbalance / R2**
+4. В редакторе карточки выберите ваше устройство — всё остальное соберётся автоматически (сенсоры в нужном порядке + интерактивные кнопки, режим, авто-отключение)
 
-**Microbalance:**
-
-```yaml
-type: entities
-title: DiFluid Microbalance
-show_header_toggle: false
-entities:
-  - entity: sensor.microbalance_weight
-    name: Вес
-  - entity: sensor.microbalance_flow_rate
-    name: Поток
-  - entity: sensor.microbalance_timer
-    name: Таймер
-  - entity: sensor.microbalance_device_status
-    name: Статус
-  - entity: sensor.microbalance_battery
-    name: Батарея
-  - type: divider
-  - entity: button.microbalance_tare
-    name: Tare
-  - entity: button.microbalance_start_stop
-    name: Start / Stop
-  - entity: select.microbalance_mode
-    name: Режим
-  - entity: number.microbalance_auto_disconnect_bluetooth
-    name: Авто-отключение Bluetooth
-```
-
-**R2 Extract:**
+Карточка работает и для весов, и для R2. То же самое в YAML:
 
 ```yaml
-type: entities
-title: DiFluid R2 Extract
-show_header_toggle: false
-entities:
-  - entity: sensor.r2_concentration
-    name: Концентрация (TDS)
-  - entity: sensor.r2_refractive_index
-    name: Показатель преломления
-  - entity: sensor.r2_prism_temperature
-    name: Температура призмы
-  - entity: sensor.r2_sample_temperature
-    name: Температура образца
-  - entity: sensor.r2_test_status
-    name: Статус теста
-  - type: divider
-  - entity: button.r2_start_test
-    name: Запустить тест
+type: custom:difluid-card
+device: <device_id>   # выбирается в редакторе карточки
+title: Мои весы       # необязательно
 ```
+
+> Карточка грузится автоматически (интеграция регистрирует её как ресурс) — добавлять её в **Настройки → Панели** вручную не нужно. Если сразу не появилась в списке — обновите страницу с очисткой кэша (Ctrl+F5).
 
 ---
 
@@ -348,59 +311,22 @@ Display order: Weight → Flow Rate → Timer → Device Status → Battery.
 
 ## Dashboard card
 
-The order of entities on the Home Assistant device page is controlled by HA itself — a custom card is the reliable way to get the layout you want. Ready-to-paste example (core cards only, no dependencies):
+The integration ships its **own Lovelace card** — no manual setup required:
 
-> Replace the `microbalance_…` / `r2_…` prefixes with your entities' real `entity_id`s (**Developer Tools → States**).
+1. Update the integration and restart Home Assistant
+2. On a dashboard: **Edit → Add card**
+3. Search for **DiFluid** → pick **DiFluid Microbalance / R2**
+4. Choose your device in the card editor — everything else is built automatically (sensors in the right order + interactive buttons, mode, auto-disconnect)
 
-**Microbalance:**
-
-```yaml
-type: entities
-title: DiFluid Microbalance
-show_header_toggle: false
-entities:
-  - entity: sensor.microbalance_weight
-    name: Weight
-  - entity: sensor.microbalance_flow_rate
-    name: Flow Rate
-  - entity: sensor.microbalance_timer
-    name: Timer
-  - entity: sensor.microbalance_device_status
-    name: Status
-  - entity: sensor.microbalance_battery
-    name: Battery
-  - type: divider
-  - entity: button.microbalance_tare
-    name: Tare
-  - entity: button.microbalance_start_stop
-    name: Start / Stop
-  - entity: select.microbalance_mode
-    name: Mode
-  - entity: number.microbalance_auto_disconnect_bluetooth
-    name: Auto-disconnect Bluetooth
-```
-
-**R2 Extract:**
+The card works for both the scale and the R2. The YAML equivalent:
 
 ```yaml
-type: entities
-title: DiFluid R2 Extract
-show_header_toggle: false
-entities:
-  - entity: sensor.r2_concentration
-    name: Concentration (TDS)
-  - entity: sensor.r2_refractive_index
-    name: Refractive Index
-  - entity: sensor.r2_prism_temperature
-    name: Prism Temperature
-  - entity: sensor.r2_sample_temperature
-    name: Sample Temperature
-  - entity: sensor.r2_test_status
-    name: Test Status
-  - type: divider
-  - entity: button.r2_start_test
-    name: Start Test
+type: custom:difluid-card
+device: <device_id>   # chosen in the card editor
+title: My Scale       # optional
 ```
+
+> The card is loaded automatically (the integration registers it as a resource) — you do **not** need to add it under **Settings → Dashboards → Resources**. If it doesn't appear right away, hard-refresh the page (Ctrl+F5).
 
 ---
 

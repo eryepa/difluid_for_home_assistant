@@ -3,12 +3,12 @@
   "name": "Difluid Microbalance & R2",
   "codeowners": ["@eryepa"],
   "config_flow": true,
-  "dependencies": ["bluetooth"],
+  "dependencies": ["bluetooth", "http", "frontend"],
   "documentation": "https://github.com/eryepa/difluid_for_home_assistant",
   "issue_tracker": "https://github.com/eryepa/difluid_for_home_assistant/issues",
   "iot_class": "local_push",
   "requirements": ["bleak>=0.21.1", "bleak-retry-connector>=3.4.0"],
-  "version": "1.3.1",
+  "version": "1.3.2",
   "bluetooth": [
     {
       "service_uuid": "000000ee-0000-1000-8000-00805f9b34fb"

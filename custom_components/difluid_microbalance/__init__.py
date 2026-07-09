@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import HomeAssistant
@@ -17,10 +20,53 @@ from .const import (
 from .coordinator import DifluidMicrobalanceCoordinator
 from .coordinator_r2 import DifluidR2Coordinator
 
+_LOGGER = logging.getLogger(__name__)
+
 PLATFORMS = [Platform.SENSOR, Platform.BUTTON, Platform.NUMBER, Platform.SELECT]
+
+# Lovelace card bundled with the integration.
+_CARD_URL = f"/{DOMAIN}/difluid-card.js"
+_CARD_PATH = Path(__file__).parent / "www" / "difluid-card.js"
+_FRONTEND_KEY = f"{DOMAIN}_frontend_registered"
+
+
+async def _async_register_card(hass: HomeAssistant) -> None:
+    """Serve the custom card and auto-load it so it shows in the card picker."""
+    if hass.data.get(_FRONTEND_KEY):
+        return
+    hass.data[_FRONTEND_KEY] = True
+
+    # Serve the JS file.
+    try:
+        from homeassistant.components.http import StaticPathConfig
+
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig(_CARD_URL, str(_CARD_PATH), False)]
+        )
+    except ImportError:  # older HA
+        hass.http.register_static_path(_CARD_URL, str(_CARD_PATH), False)
+
+    # Auto-load the module on the frontend (registers it into window.customCards).
+    version = ""
+    try:
+        from homeassistant.loader import async_get_integration
+
+        integration = await async_get_integration(hass, DOMAIN)
+        version = integration.version or ""
+    except Exception:  # noqa: BLE001 - version is only for cache-busting
+        pass
+
+    try:
+        from homeassistant.components.frontend import add_extra_js_url
+
+        add_extra_js_url(hass, f"{_CARD_URL}?v={version}")
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning("Could not auto-load DiFluid card: %s", err)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    await _async_register_card(hass)
+
     address = entry.data[CONF_ADDRESS]
 
     if entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_R2:
