@@ -18,8 +18,9 @@ const SENSOR_ORDER = [
 // Display order for the control rows.
 const CONTROL_ORDER = [
   "tare", "start", "test", "mode",
-  "auto_disconnect", "disconnect", "shutdown", "auto",
 ];
+// Control entities to hide from the card (still available on the device page).
+const EXCLUDE_CONTROLS = ["auto_disconnect", "auto_shutdown"];
 
 const rank = (entityId, order) => {
   const id = entityId.split(".")[1] || entityId;
@@ -112,6 +113,7 @@ class DifluidCard extends HTMLElement {
       .sort((a, b) => rank(a, SENSOR_ORDER) - rank(b, SENSOR_ORDER));
     const controls = ids
       .filter((id) => /^(button|select|number|switch)\./.test(id))
+      .filter((id) => !EXCLUDE_CONTROLS.some((x) => id.includes(x)))
       .sort((a, b) => rank(a, CONTROL_ORDER) - rank(b, CONTROL_ORDER));
 
     this._rows = [];
