@@ -39,15 +39,17 @@ async def _async_register_card(hass: HomeAssistant) -> None:
         return
     hass.data[_FRONTEND_KEY] = True
 
-    # Serve the www/ directory statically.
+    # Serve the www/ directory statically.  cache_headers=True lets the browser
+    # cache the module (busted by the ?v={version} query on version bump) — with
+    # no caching every load re-downloads and can lose the render race.
     try:
         from homeassistant.components.http import StaticPathConfig
 
         await hass.http.async_register_static_paths(
-            [StaticPathConfig(_CARD_URL_BASE, str(_WWW_DIR), False)]
+            [StaticPathConfig(_CARD_URL_BASE, str(_WWW_DIR), True)]
         )
     except ImportError:  # older HA
-        hass.http.register_static_path(_CARD_URL_BASE, str(_WWW_DIR), False)
+        hass.http.register_static_path(_CARD_URL_BASE, str(_WWW_DIR), True)
     except Exception as err:  # noqa: BLE001 - already registered / path issue
         _LOGGER.warning("Could not register DiFluid card static path: %s", err)
 
@@ -61,16 +63,63 @@ async def _async_register_card(hass: HomeAssistant) -> None:
     except Exception:  # noqa: BLE001
         pass
 
-    # Auto-load the module on the frontend (registers it into window.customCards).
+    url = f"{_CARD_FILE_URL}?v={version}"
+
+    # Primary: register as a Lovelace resource.  Resources are delivered to every
+    # client over the websocket on each dashboard load, so the module loads
+    # reliably everywhere — including cached/PWA frontends on phones, where
+    # add_extra_js_url() often never reaches the client.
+    if await _async_register_lovelace_resource(hass, url):
+        _LOGGER.info(
+            "DiFluid dashboard card registered as Lovelace resource at %s", url
+        )
+        return
+
+    # Fallback (e.g. YAML-mode Lovelace where resources are read-only).
     try:
         from homeassistant.components.frontend import add_extra_js_url
 
-        add_extra_js_url(hass, f"{_CARD_FILE_URL}?v={version}")
+        add_extra_js_url(hass, url)
         _LOGGER.info(
-            "DiFluid dashboard card registered and served at %s", _CARD_FILE_URL
+            "DiFluid dashboard card auto-loaded via extra_js_url at %s", url
         )
     except Exception as err:  # noqa: BLE001
         _LOGGER.warning("Could not auto-load DiFluid card: %s", err)
+
+
+async def _async_register_lovelace_resource(hass: HomeAssistant, url: str) -> bool:
+    """Register the card as a storage-mode Lovelace resource.
+
+    Returns True on success, False if resources are unavailable or read-only
+    (YAML mode), in which case the caller falls back to add_extra_js_url.
+    """
+    try:
+        lovelace = hass.data.get("lovelace")
+        resources = getattr(lovelace, "resources", None)
+        if resources is None and isinstance(lovelace, dict):
+            resources = lovelace.get("resources")
+        # YAML-mode collection has no async_create_item -> not writable.
+        if resources is None or not hasattr(resources, "async_create_item"):
+            return False
+
+        if not getattr(resources, "loaded", True):
+            await resources.async_load()
+            resources.loaded = True
+
+        base = url.split("?")[0]
+        for item in resources.async_items():
+            if item.get("url", "").split("?")[0] == base:
+                if item.get("url") != url:
+                    await resources.async_update_item(
+                        item["id"], {"res_type": "module", "url": url}
+                    )
+                return True
+
+        await resources.async_create_item({"res_type": "module", "url": url})
+        return True
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug("Lovelace resource registration failed: %s", err)
+        return False
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
