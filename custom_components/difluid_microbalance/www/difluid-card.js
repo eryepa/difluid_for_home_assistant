@@ -104,6 +104,9 @@ class DifluidCard extends HTMLElement {
         border:1px solid var(--divider-color); border-radius:6px; padding:6px 8px; font-size:14px;
       }
       input.df-number { width:80px; }
+      .df-btn:disabled, .df-select:disabled, .df-number:disabled {
+        cursor:not-allowed; filter:grayscale(1);
+      }
     `;
     card.appendChild(style);
 
@@ -223,7 +226,7 @@ class DifluidCard extends HTMLElement {
       );
     }
     if (control) row.appendChild(control);
-    this._rows.push({ id, kind: domain, icon, control });
+    this._rows.push({ id, kind: domain, icon, control, row });
     return row;
   }
 
@@ -240,13 +243,21 @@ class DifluidCard extends HTMLElement {
       if (iconName && r.icon.getAttribute("icon") !== iconName)
         r.icon.setAttribute("icon", iconName);
 
+      // Disable controls (and dim the row) when the entity is unavailable —
+      // e.g. the device is powered off / disconnected — mirroring the device page.
+      const available = st.state !== "unavailable" && st.state !== "unknown";
+      if (r.kind !== "sensor" && r.control) {
+        r.control.disabled = !available;
+        if (r.row) r.row.style.opacity = available ? "" : "0.5";
+      }
+
       if (r.kind === "sensor") {
         r.value.textContent = this._formatState(st);
       } else if (r.kind === "select" && r.control) {
-        if (document.activeElement !== r.control && r.control.value !== st.state)
+        if (available && document.activeElement !== r.control && r.control.value !== st.state)
           r.control.value = st.state;
       } else if (r.kind === "number" && r.control) {
-        if (document.activeElement !== r.control)
+        if (available && document.activeElement !== r.control)
           r.control.value = st.state;
       }
     }
