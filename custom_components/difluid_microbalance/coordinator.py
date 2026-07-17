@@ -154,8 +154,8 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         # After the cooldown, proactively start the reconnect loop so we
         # reconnect when the scale is turned on — the BT advertisement callback
         # may miss the first advertisement if the device is still in HA's cache.
-        self._reconnect_task = self.hass.async_create_task(
-            self._reconnect_loop_after_poweroff(), eager_start=False
+        self._reconnect_task = self.hass.async_create_background_task(
+            self._reconnect_loop_after_poweroff(), name="difluid_reconnect_after_poweroff"
         )
 
     async def _reconnect_loop_after_poweroff(self) -> None:
@@ -225,8 +225,8 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
         _LOGGER.info("Device %s detected in BLE scan, connecting…", self.address)
-        self._reconnect_task = self.hass.async_create_task(
-            self._connect_once(), eager_start=False
+        self._reconnect_task = self.hass.async_create_background_task(
+            self._connect_once(), name="difluid_connect_once"
         )
 
     async def _connect_once(self) -> None:
@@ -238,8 +238,8 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
             await self._do_connect()
         except Exception as err:
             _LOGGER.debug("BT-triggered connection to %s failed: %s; resuming retry loop", self.address, err)
-            self._reconnect_task = self.hass.async_create_task(
-                self._reconnect_loop(), eager_start=False
+            self._reconnect_task = self.hass.async_create_background_task(
+                self._reconnect_loop(), name="difluid_reconnect_loop"
             )
 
     # ── connection ────────────────────────────────────────────────────────────
@@ -325,8 +325,8 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
 
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
-        self._poll_task = self.hass.async_create_task(
-            self._poll_loop(), eager_start=False
+        self._poll_task = self.hass.async_create_background_task(
+            self._poll_loop(), name="difluid_poll_loop"
         )
 
     async def _run_handshake(self, client: BleakClientWithServiceCache) -> None:
@@ -417,8 +417,8 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         _LOGGER.warning("Difluid Microbalance %s disconnected, will retry", self.address)
         if self._reconnect_task and not self._reconnect_task.done():
             return
-        self._reconnect_task = self.hass.async_create_task(
-            self._reconnect_loop(), eager_start=False
+        self._reconnect_task = self.hass.async_create_background_task(
+            self._reconnect_loop(), name="difluid_reconnect_loop"
         )
 
     async def _reconnect_loop(self) -> None:

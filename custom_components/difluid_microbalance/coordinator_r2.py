@@ -160,8 +160,8 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
         _LOGGER.info("R2 %s detected in BLE scan, connecting…", self.address)
-        self._reconnect_task = self.hass.async_create_task(
-            self._connect_once(), eager_start=False
+        self._reconnect_task = self.hass.async_create_background_task(
+            self._connect_once(), name="difluid_r2_connect_once"
         )
 
     async def _connect_once(self) -> None:
@@ -172,8 +172,8 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             await self._do_connect()
         except Exception as err:
             _LOGGER.debug("BT-triggered R2 connection to %s failed: %s; resuming retry loop", self.address, err)
-            self._reconnect_task = self.hass.async_create_task(
-                self._reconnect_loop(), eager_start=False
+            self._reconnect_task = self.hass.async_create_background_task(
+                self._reconnect_loop(), name="difluid_r2_reconnect_loop"
             )
 
     async def _do_connect(self) -> None:
@@ -244,8 +244,8 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             self._last_activity_time = _time.monotonic()
             if self._shutdown_task and not self._shutdown_task.done():
                 self._shutdown_task.cancel()
-            self._shutdown_task = self.hass.async_create_task(
-                self._auto_shutdown_loop(), eager_start=False
+            self._shutdown_task = self.hass.async_create_background_task(
+                self._auto_shutdown_loop(), name="difluid_r2_auto_shutdown"
             )
         except asyncio.TimeoutError:
             _LOGGER.info(
@@ -306,8 +306,8 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         self._last_activity_time = _time.monotonic()
         if self._shutdown_task and not self._shutdown_task.done():
             self._shutdown_task.cancel()
-        self._shutdown_task = self.hass.async_create_task(
-            self._auto_shutdown_loop(), eager_start=False
+        self._shutdown_task = self.hass.async_create_background_task(
+            self._auto_shutdown_loop(), name="difluid_r2_auto_shutdown"
         )
 
     # ── server helpers ──────────────────────────────────────────────────────
@@ -450,8 +450,8 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         _LOGGER.warning("Difluid R2 %s disconnected, will retry", self.address)
         if self._reconnect_task and not self._reconnect_task.done():
             return
-        self._reconnect_task = self.hass.async_create_task(
-            self._reconnect_loop(), eager_start=False
+        self._reconnect_task = self.hass.async_create_background_task(
+            self._reconnect_loop(), name="difluid_r2_reconnect_loop"
         )
 
     async def _reconnect_loop(self) -> None:
