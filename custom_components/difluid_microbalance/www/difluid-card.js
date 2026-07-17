@@ -245,7 +245,9 @@ class DifluidCard extends HTMLElement {
 
       // Disable controls (and dim the row) when the entity is unavailable —
       // e.g. the device is powered off / disconnected — mirroring the device page.
-      const available = st.state !== "unavailable" && st.state !== "unknown";
+      // Note: a button's normal "available" state is "unknown" (never pressed),
+      // so only "unavailable" means offline.
+      const available = st.state !== "unavailable";
       if (r.kind !== "sensor" && r.control) {
         r.control.disabled = !available;
         if (r.row) r.row.style.opacity = available ? "" : "0.5";
