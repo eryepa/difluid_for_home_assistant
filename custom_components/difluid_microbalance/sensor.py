@@ -119,11 +119,15 @@ def _weigh_attrs(event) -> dict:
     }
 
 
+# state_class = MEASUREMENT on all three: it is what makes Home Assistant keep
+# long-term statistics for them (permanent, unlike the recorder's ~10 days) and it
+# gives the Prometheus exporter a numeric series to publish.
 BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
     DifluidBrewSensorDescription(
         key="last_dose",
         name="Last Dose",
         device_class=SensorDeviceClass.WEIGHT,
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfMass.GRAMS,
         suggested_display_precision=1,
         icon="mdi:coffee-outline",
@@ -134,6 +138,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         key="last_yield",
         name="Last Yield",
         device_class=SensorDeviceClass.WEIGHT,
+        state_class=SensorStateClass.MEASUREMENT,
         native_unit_of_measurement=UnitOfMass.GRAMS,
         suggested_display_precision=1,
         icon="mdi:cup-outline",
@@ -143,6 +148,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
     DifluidBrewSensorDescription(
         key="brew_ratio",
         name="Brew Ratio",
+        state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=2,
         icon="mdi:scale-unbalanced",
         value_fn=lambda s: round(s.last_pair.ratio, 2) if s.last_pair else None,
