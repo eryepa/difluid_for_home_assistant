@@ -73,11 +73,14 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         self.data = R2Data()
 
     async def async_start(self) -> None:
+        # PASSIVE — see the matching note in coordinator.py.  The R2's name is in
+        # its advertisement, so a scan response buys us nothing and active scanning
+        # would cost battery on every BLE sensor in the house.
         self._bt_cancel = bluetooth.async_register_callback(
             self.hass,
             self._on_bt_advertisement,
             BluetoothCallbackMatcher(address=self.address),
-            BluetoothScanningMode.ACTIVE,
+            BluetoothScanningMode.PASSIVE,
         )
         try:
             await self._do_connect()

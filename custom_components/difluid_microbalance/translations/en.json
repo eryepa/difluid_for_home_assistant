@@ -29,6 +29,32 @@
       "not_supported": "This device is not supported."
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Brew detector",
+        "description": "Thresholds for detecting the bean dose and the pour on the weight stream. Defaults suit an 18 g dose and a 35-42 g espresso. Raise **dose_min_hold_seconds** if a portafilter left briefly on the scale is being mistaken for a dose; lower it if a quick weighing is missed.",
+        "data": {
+          "stable_tol": "Stability tolerance (g)",
+          "stable_seconds": "Stability window (s)",
+          "stable_time_fraction": "Share of the window that must hold (0-1)",
+          "min_mass": "Ignore plateaus below (g)",
+          "dose_min": "Dose minimum (g)",
+          "dose_max": "Dose maximum (g)",
+          "dose_min_hold_seconds": "Dose must be held for at least (s)",
+          "yield_min": "Yield minimum (g)",
+          "yield_max": "Yield maximum (g)",
+          "pair_window_seconds": "Maximum dose-to-pour gap (s)",
+          "ratio_min": "Implausible below ratio",
+          "ratio_max": "Implausible above ratio",
+          "record_dataset": "Record detections to difluid_brew_dataset.jsonl"
+        }
+      }
+    },
+    "abort": {
+      "no_options": "The R2 has no detector settings — open the scale's entry instead."
+    }
+  },
   "entity": {
     "sensor": {
       "weight": { "name": "Weight" },
@@ -36,6 +62,10 @@
       "timer": { "name": "Timer" },
       "battery": { "name": "Battery" },
       "device_status": { "name": "Device Status" },
+      "last_dose": { "name": "Last Dose" },
+      "last_yield": { "name": "Last Yield" },
+      "brew_ratio": { "name": "Brew Ratio" },
+      "integration_version": { "name": "Integration Version" },
       "concentration": { "name": "Concentration (TDS)" },
       "refractive_index": { "name": "Refractive Index" },
       "prism_temperature": { "name": "Prism Temperature" },

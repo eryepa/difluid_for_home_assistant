@@ -83,6 +83,25 @@
 
 > Второстепенные параметры (статус, батарея, зарядка) опрашиваются **раз в 1 секунду**. Вес и поток от этого не зависят — они приходят отдельными push-уведомлениями.
 
+### Microbalance — автоопределение дозы и пролива
+
+Интеграция сама распознаёт на потоке веса, когда ты взвесил зёрна и когда налил чашку, — вводить эти числа руками не нужно.
+
+| Объект | Описание |
+|---|---|
+| **Last Dose** | Вес зёрен последнего взвешивания (г). Атрибуты: `detected_at`, `plateau_seconds`, `rise_seconds` |
+| **Last Yield** | Вес напитка последнего пролива (г) |
+| **Brew Ratio** | Отношение пролив/доза последней пары. Атрибуты: `dose`, `yield`, `paired_at` |
+| **Integration Version** | Диагностический — какая сборка интеграции реально загружена |
+
+Эти сенсоры **не уходят в `unavailable`** вместе с весами: результат последней чашки остаётся виден и после того, как весы отключились по авто-таймауту.
+
+Как это работает: детектор ищет на потоке участки стабильного веса и делит их по величине — 12–25 г это доза, 25–80 г это пролив. Доза дополнительно обязана продержаться не меньше 10 секунд, иначе портафильтр, поставленный на весы на пару секунд, засчитается как взвешивание зёрен. Пара доза → пролив собирается, если между ними прошло не больше 30 минут и отношение попадает в диапазон 1.2–6.0.
+
+Событие `difluid_microbalance_brew_detected` выдаётся на шину при каждой собранной паре — его удобно ловить автоматизациями и смотреть в Инструментах разработчика. Отдельное событие `difluid_microbalance_plateau_detected` приходит на каждое найденное плато, включая отброшенные.
+
+Все пороги настраиваются: **Настройки → Устройства и службы → DiFluid → Настроить**. Там же включается запись `difluid_brew_dataset.jsonl` — по строке на каждое плато вместе с сырым окном измерений, чтобы потом разобрать промахи.
+
 ### Microbalance — управление
 
 | Объект | Описание |
@@ -279,6 +298,25 @@ Display order: Weight → Flow Rate → Timer → Device Status → Battery.
 | **Battery** | Battery level (%). While charging the icon shows a lightning bolt — there is no separate "Charging" sensor. |
 
 > Secondary values (status, battery, charging) are polled **once per second**. Weight and flow are independent — they arrive as separate push notifications.
+
+### Microbalance — automatic dose and yield detection
+
+The integration works out from the weight stream when you weighed beans and when you pulled a shot, so neither number has to be typed in.
+
+| Entity | Description |
+|---|---|
+| **Last Dose** | Bean weight of the last weighing (g). Attributes: `detected_at`, `plateau_seconds`, `rise_seconds` |
+| **Last Yield** | Beverage weight of the last pour (g) |
+| **Brew Ratio** | Yield-to-dose ratio of the last pair. Attributes: `dose`, `yield`, `paired_at` |
+| **Integration Version** | Diagnostic — which build is actually loaded |
+
+These sensors **do not go `unavailable`** with the scale: the last shot stays readable after the scale drops its BLE link on the idle timer.
+
+How it works: the detector finds stretches of stable weight and splits them by mass — 12–25 g is a dose, 25–80 g is a pour. A dose must additionally be held for at least 10 seconds, otherwise a portafilter rested on the scale for a moment would be counted as weighing beans. A dose → pour pair is formed when the two are less than 30 minutes apart and the ratio falls between 1.2 and 6.0.
+
+A `difluid_microbalance_brew_detected` event fires on the bus for every completed pair — convenient for automations and visible in Developer Tools. A separate `difluid_microbalance_plateau_detected` event fires for every plateau found, including rejected ones.
+
+Every threshold is configurable under **Settings → Devices & Services → DiFluid → Configure**, which is also where you enable writing `difluid_brew_dataset.jsonl` — one line per plateau with its raw measurement window, for diagnosing misses later.
 
 ### Microbalance — controls
 

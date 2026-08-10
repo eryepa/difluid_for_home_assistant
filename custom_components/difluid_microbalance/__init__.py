@@ -7,11 +7,14 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import HomeAssistant
 
+from .brew_detect import config_from_options
+from .brew_session import async_get_session
 from .const import (
     CONF_DEVICE_TYPE,
     CONF_IS_TI,
     CONF_LICENSE_KEY,
     CONF_MODEL,
+    CONF_RECORD_DATASET,
     DEFAULT_MODEL_MICROBALANCE,
     DEFAULT_MODEL_MICROBALANCE_TI,
     DEVICE_TYPE_R2,
@@ -138,13 +141,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         default_model = (
             DEFAULT_MODEL_MICROBALANCE_TI if is_ti else DEFAULT_MODEL_MICROBALANCE
         )
+        brew = await async_get_session(
+            hass,
+            config_from_options(dict(entry.options)),
+            bool(entry.options.get(CONF_RECORD_DATASET, False)),
+        )
         coordinator = DifluidMicrobalanceCoordinator(
             hass,
             address=address,
             is_ti=is_ti,
             license_key=entry.data.get(CONF_LICENSE_KEY, ""),
             model=entry.data.get(CONF_MODEL) or default_model,
+            brew=brew,
         )
+        # Changing a threshold in the options flow reloads the entry, which rebuilds
+        # the detector with the new config.
+        entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
 
     # Register coordinator before forwarding platforms so entity setup can access it.
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
@@ -153,6 +165,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # async_start never raises — if device is off it silently waits for BLE advertisement.
     await coordinator.async_start()
     return True
+
+
+async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

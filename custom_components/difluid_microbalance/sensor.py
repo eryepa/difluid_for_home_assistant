@@ -12,10 +12,12 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfMass, UnitOfTemperature, UnitOfTime
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
+from .brew_session import BREW_KEY, BrewSession
 from .const import CONF_DEVICE_TYPE, CONF_IS_TI, DEVICE_TYPE_R2, DOMAIN
 from .coordinator import DifluidMicrobalanceCoordinator, MicrobalanceData
 from .coordinator_r2 import DifluidR2Coordinator, R2Data
@@ -95,6 +97,70 @@ MICROBALANCE_SENSORS: tuple[DifluidSensorDescription, ...] = (
     ),
 )
 
+# ── brew detector sensors ─────────────────────────────────────────────────────
+# These read the shared BrewSession rather than the coordinator, because the last
+# detected shot must stay readable after the scale auto-disconnects — which it does
+# five minutes after the pour, well before anyone looks at the dashboard.
+
+
+@dataclass(frozen=True)
+class DifluidBrewSensorDescription(SensorEntityDescription):
+    value_fn: Callable = lambda _: None
+    attrs_fn: Callable | None = None
+
+
+def _weigh_attrs(event) -> dict:
+    if event is None:
+        return {}
+    return {
+        "detected_at": dt_util.utc_from_timestamp(event.at).isoformat(),
+        "plateau_seconds": event.hold_seconds,
+        "rise_seconds": event.rise_seconds,
+    }
+
+
+BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
+    DifluidBrewSensorDescription(
+        key="last_dose",
+        name="Last Dose",
+        device_class=SensorDeviceClass.WEIGHT,
+        native_unit_of_measurement=UnitOfMass.GRAMS,
+        suggested_display_precision=1,
+        icon="mdi:coffee-outline",
+        value_fn=lambda s: s.last_dose.value if s.last_dose else None,
+        attrs_fn=lambda s: _weigh_attrs(s.last_dose),
+    ),
+    DifluidBrewSensorDescription(
+        key="last_yield",
+        name="Last Yield",
+        device_class=SensorDeviceClass.WEIGHT,
+        native_unit_of_measurement=UnitOfMass.GRAMS,
+        suggested_display_precision=1,
+        icon="mdi:cup-outline",
+        value_fn=lambda s: s.last_yield.value if s.last_yield else None,
+        attrs_fn=lambda s: _weigh_attrs(s.last_yield),
+    ),
+    DifluidBrewSensorDescription(
+        key="brew_ratio",
+        name="Brew Ratio",
+        suggested_display_precision=2,
+        icon="mdi:scale-unbalanced",
+        value_fn=lambda s: round(s.last_pair.ratio, 2) if s.last_pair else None,
+        attrs_fn=lambda s: (
+            {
+                "dose": round(s.last_pair.dose, 2),
+                "yield": round(s.last_pair.yield_g, 2),
+                "paired_at": dt_util.utc_from_timestamp(
+                    s.last_pair.yield_at
+                ).isoformat(),
+            }
+            if s.last_pair
+            else {}
+        ),
+    ),
+)
+
+
 # ── R2 sensors ────────────────────────────────────────────────────────────────
 
 R2_SENSORS: tuple[DifluidSensorDescription, ...] = (
@@ -153,11 +219,29 @@ async def async_setup_entry(
         async_add_entities(
             DifluidR2Sensor(coordinator, desc, entry) for desc in R2_SENSORS
         )
-    else:
-        async_add_entities(
-            DifluidMicrobalanceSensor(coordinator, desc, entry)
-            for desc in MICROBALANCE_SENSORS
-        )
+        return
+
+    entities: list = [
+        DifluidMicrobalanceSensor(coordinator, desc, entry)
+        for desc in MICROBALANCE_SENSORS
+    ]
+
+    device_info = DeviceInfo(
+        identifiers={(DOMAIN, entry.entry_id)},
+        name=entry.title,
+        manufacturer="Difluid",
+        model="Microbalance Ti" if entry.data.get(CONF_IS_TI) else "Microbalance",
+    )
+
+    session: BrewSession | None = hass.data.get(DOMAIN, {}).get(BREW_KEY)
+    if session is not None:
+        entities += [
+            DifluidBrewSensor(session, desc, entry, device_info)
+            for desc in BREW_SENSORS
+        ]
+
+    entities.append(await DifluidVersionSensor.async_create(hass, entry, device_info))
+    async_add_entities(entities)
 
 
 # ── Microbalance entity ───────────────────────────────────────────────────────
@@ -204,6 +288,94 @@ class DifluidMicrobalanceSensor(
     def available(self) -> bool:
         client = self.coordinator._client
         return client is not None and client.is_connected
+
+
+# ── brew detector entities ────────────────────────────────────────────────────
+
+class DifluidBrewSensor(SensorEntity):
+    """A detected dose / pour / ratio.
+
+    Deliberately not a CoordinatorEntity: it must not go unavailable when the BLE
+    link drops.  State is restored from BrewSession's Store, which loads before
+    platform setup, so RestoreEntity would be redundant.
+    """
+
+    entity_description: DifluidBrewSensorDescription
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        session: BrewSession,
+        description: DifluidBrewSensorDescription,
+        entry: ConfigEntry,
+        device_info: DeviceInfo,
+    ) -> None:
+        self._session = session
+        self.entity_description = description
+        self._attr_unique_id = f"{entry.entry_id}_{description.key}"
+        self._attr_device_info = device_info
+
+    async def async_added_to_hass(self) -> None:
+        self._session.add_listener(self._handle_update)
+
+    async def async_will_remove_from_hass(self) -> None:
+        self._session.remove_listener(self._handle_update)
+
+    def _handle_update(self) -> None:
+        # Always invoked from the event loop (BLE notification -> BrewSession).
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        # The last shot stays meaningful whether or not the scale is switched on.
+        return True
+
+    @property
+    def native_value(self):
+        return self.entity_description.value_fn(self._session)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        attrs_fn = self.entity_description.attrs_fn
+        return attrs_fn(self._session) if attrs_fn else {}
+
+
+class DifluidVersionSensor(SensorEntity):
+    """Which build of the integration is actually loaded.
+
+    Exists to answer that question directly while iterating on pre-release builds,
+    instead of guessing from behaviour after a HACS redownload.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Integration Version"
+    _attr_icon = "mdi:package-variant"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_should_poll = False
+
+    def __init__(self, version: str, entry: ConfigEntry, device_info: DeviceInfo):
+        self._attr_native_value = version
+        self._attr_unique_id = f"{entry.entry_id}_integration_version"
+        self._attr_device_info = device_info
+
+    @classmethod
+    async def async_create(
+        cls, hass: HomeAssistant, entry: ConfigEntry, device_info: DeviceInfo
+    ) -> "DifluidVersionSensor":
+        version = "unknown"
+        try:
+            from homeassistant.loader import async_get_integration
+
+            integration = await async_get_integration(hass, DOMAIN)
+            version = str(integration.version or "unknown")
+        except Exception:  # noqa: BLE001 - diagnostic only, never block setup
+            pass
+        return cls(version, entry, device_info)
+
+    @property
+    def available(self) -> bool:
+        return True
 
 
 # ── R2 entity ─────────────────────────────────────────────────────────────────

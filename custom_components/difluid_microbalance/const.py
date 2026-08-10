@@ -20,6 +20,11 @@ CONF_DEVICE_TYPE = "device_type"
 CONF_LICENSE_KEY = "license_key"
 CONF_MODEL = "model"
 
+# ── brew detector options ─────────────────────────────────────────────────────
+# The tunable threshold names live in brew_detect.TUNABLE_FIELDS, next to the
+# dataclass they map onto, so the two cannot drift apart.
+CONF_RECORD_DATASET = "record_dataset"
+
 DEVICE_TYPE_MICROBALANCE = "microbalance"
 DEVICE_TYPE_R2 = "r2"
 

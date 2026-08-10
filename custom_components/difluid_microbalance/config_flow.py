@@ -7,14 +7,22 @@ from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_ADDRESS
+from homeassistant.core import callback
 
+from .brew_detect import TUNABLE_FIELDS, DetectorConfig
 from .const import (
     CONF_DEVICE_TYPE,
     CONF_IS_TI,
     CONF_LICENSE_KEY,
     CONF_MODEL,
+    CONF_RECORD_DATASET,
     DEVICE_TYPE_MICROBALANCE,
     DEVICE_TYPE_R2,
     DOMAIN,
@@ -59,6 +67,11 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._discovery_info: BluetoothServiceInfoBleak | None = None
         self._discovered_devices: dict[str, BluetoothServiceInfoBleak] = {}
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(entry: ConfigEntry) -> "DifluidOptionsFlow":
+        return DifluidOptionsFlow()
 
     # ── triggered by HA Bluetooth integration (service UUID match) ────────────
 
@@ -191,3 +204,37 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
             errors=errors,
         )
+
+
+# ── options: brew detector thresholds ─────────────────────────────────────────
+
+
+class DifluidOptionsFlow(OptionsFlow):
+    """Tune the dose/pour detector without editing code or redeploying.
+
+    Only exposed for the scale — the R2 entry has nothing to tune here.
+    """
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if self.config_entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_R2:
+            return self.async_abort(reason="no_options")
+
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current = self.config_entry.options
+        defaults = DetectorConfig()
+        schema: dict[Any, Any] = {}
+        for key in TUNABLE_FIELDS:
+            schema[
+                vol.Optional(key, default=current.get(key, getattr(defaults, key)))
+            ] = vol.Coerce(float)
+        schema[
+            vol.Optional(
+                CONF_RECORD_DATASET, default=current.get(CONF_RECORD_DATASET, False)
+            )
+        ] = bool
+
+        return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))

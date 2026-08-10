@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+if TYPE_CHECKING:
+    from .brew_session import BrewSession
 
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.exc import BleakError
@@ -76,12 +79,14 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         is_ti: bool = False,
         license_key: str = "",
         model: str = "",
+        brew: Optional["BrewSession"] = None,
     ) -> None:
         super().__init__(hass, _LOGGER, name=f"{DOMAIN}_{address}", update_interval=None)
         self.address = address
         self.is_ti = is_ti
         self.license_key = license_key
         self.model = model
+        self.brew = brew
         self._preferred_char_uuid = (
             CHARACTERISTIC_UUID_MICROBALANCE_TI if is_ti else CHARACTERISTIC_UUID_MICROBALANCE
         )
@@ -178,11 +183,18 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
     async def async_start(self) -> None:
         # Register a BLE advertisement callback so we reconnect immediately when
         # the device turns on, instead of waiting for HA's ConfigEntry retry timer.
+        #
+        # PASSIVE on purpose.  Active scanning makes every peripheral answer a
+        # SCAN_REQ with a SCAN_RSP, which drains the batteries of unrelated BLE
+        # sensors across the house, and requesting it here forces the mode on every
+        # proxy.  We gain nothing from it: DiFluid devices put their full name in
+        # the advertisement itself (`12 09 "DiFluid R2 301055"`), and connecting is
+        # by MAC.  A connection establishes fine from a passive scan.
         self._bt_cancel = bluetooth.async_register_callback(
             self.hass,
             self._on_bt_advertisement,
             BluetoothCallbackMatcher(address=self.address),
-            BluetoothScanningMode.ACTIVE,
+            BluetoothScanningMode.PASSIVE,
         )
         try:
             await self._do_connect()
@@ -409,6 +421,9 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         import time as _time
         self.data.connected = False
         self.async_set_updated_data(self.data)
+        # The stream is gone; samples either side of the gap are not comparable.
+        if self.brew is not None:
+            self.brew.reset()
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
         if _time.monotonic() < self._no_reconnect_until:
@@ -473,6 +488,9 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
             if abs(self.data.weight - self._last_weight_value) > 0.2:
                 self._last_weight_change_time = asyncio.get_event_loop().time()
                 self._last_weight_value = self.data.weight
+            # Feed the dose/pour detector.  Never raises — see BrewSession.feed.
+            if self.brew is not None:
+                self.brew.feed(self.data.weight, self.data.flow_rate)
             updated = True
 
         elif func == 0x03 and cmd == 0x05 and len(payload) >= 3:
