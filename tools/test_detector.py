@@ -93,11 +93,11 @@ def main() -> int:
         all(abs(v) < 100 for v in masses),
         f"non-other masses {masses}",
     )
-    ok &= check(
-        "portafilter placements are not mistaken for a dose",
-        sum(1 for k, _ in events if k == "dose") == 1,
-        f"{sum(1 for k, _ in events if k == 'dose')} dose(s)",
-    )
+    # Deliberately NOT asserting that only one plateau is labelled "dose". The
+    # 17.9 g placement at 19:46 really is held for 15.7 s and really is in the dose
+    # mass range — an earlier version of this test claimed otherwise, but that rested
+    # on a duration bug that under-measured holds in replay. What must hold is that
+    # it does not win the pairing; that is asserted on synthetic_pair.csv below.
     ok &= check(
         "no pair claimed — this capture contains none within the window",
         not pairs,
@@ -109,12 +109,30 @@ def main() -> int:
     if pairs:
         pair = pairs[0]
         ok &= check(
-            "pairs the real 18.2 g beans, not the 17.9 g portafilter",
+            "pairs the 18.2 g beans (held ~3 min), not the 17.9 g placement (16 s)",
             abs(pair.dose - 18.2) < 0.05,
             f"dose {pair.dose}",
         )
         ok &= check("yield 37.5 g", abs(pair.yield_g - 37.5) < 0.05, f"{pair.yield_g}")
         ok &= check("ratio about 1:2.06", abs(pair.ratio - 2.06) < 0.02, f"{pair.ratio:.3f}")
+
+    print("\nlost_shot.csv — the real 2026-08-10 19:47 cup that went unreported")
+    events, pairs = run(HERE / "testdata" / "lost_shot.csv")
+    ok &= check(
+        "the pour survives the lift-off transient and the BLE drop",
+        any(k == "yield" and 36.0 <= v <= 37.5 for k, v in events),
+        str(events),
+    )
+    ok &= check("the 18.0 g dose is recognised", ("dose", 18.0) in events)
+    ok &= check("one pair", len(pairs) == 1, f"{len(pairs)}")
+    if pairs:
+        p = pairs[0]
+        ok &= check(
+            "pair is dose 18.0 g / yield 36.7 g, ratio about 1:2.04",
+            abs(p.dose - 18.0) < 0.05 and abs(p.yield_g - 36.7) < 0.1
+            and abs(p.ratio - 2.04) < 0.02,
+            f"dose {p.dose} yield {p.yield_g} ratio {p.ratio:.3f}",
+        )
 
     print("\nOK" if ok else "\nFAILED")
     return 0 if ok else 1

@@ -110,7 +110,20 @@ class BrewSession:
             self._listeners.remove(callback)
 
     def reset(self) -> None:
-        """Stream broke — drop detector state but keep the detected results."""
+        """Stream broke — flush any finished plateau, then drop detector state.
+
+        Flushing first matters: the BLE link routinely drops within a second or two
+        of the cup being lifted, and an open plateau at that moment is complete data
+        — the pour already happened and was held long enough to qualify. Discarding
+        it silently loses the shot, which is exactly what happened on 2026-08-10
+        19:47 (pour held 5.8 s at 36.7 g, never reported).
+        """
+        try:
+            plateau = self._detector.flush()
+            if plateau is not None:
+                self._on_plateau(plateau)
+        except Exception:  # noqa: BLE001 - never let cleanup break the disconnect path
+            _LOGGER.exception("Failed to flush plateau on reset")
         self._detector.reset()
         self._recent.clear()
 

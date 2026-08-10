@@ -233,7 +233,12 @@ class BrewDetector:
             return None
 
         if abs(clean.weight) > cfg.max_mass:
-            return None
+            # Nothing in this workflow legitimately weighs this much, so the cup is
+            # being lifted off. That ends the plateau — close it and hand it over.
+            # Returning None here instead would lose the reading entirely: the
+            # Hampel filter absorbs the first samples of the lift-off transient, so
+            # this is often the only notice the detector gets that the pour is over.
+            return self._close_plateau(clean.t)
 
         if abs(clean.weight) <= cfg.zero_band:
             self._last_zero_t = clean.t
@@ -265,10 +270,25 @@ class BrewDetector:
             return None
 
         if self._in_plateau and abs(clean.weight - self._plateau_value) > cfg.stable_tol:
-            return self._close_plateau()
+            return self._close_plateau(clean.t)
         return None
 
-    def _close_plateau(self) -> Optional[Plateau]:
+    def _close_plateau(self, end_t: Optional[float] = None) -> Optional[Plateau]:
+        """Close the open plateau.
+
+        `end_t` is the timestamp of the sample that ended it. Under zero-order hold
+        the value was still being held right up to that moment, so that — not the
+        last sample that happened to fall inside the plateau — is the true end.
+
+        This matters because recorder history only stores change points: a value
+        held for twenty seconds appears as one sample, then nothing until it moves.
+        Measuring to the last in-plateau sample would report that as a fraction of a
+        second offline while production, streaming at 5 Hz, measured the full hold —
+        and thresholds tuned on replay would not match the ones that actually run.
+
+        Pass nothing when the stream simply stopped (disconnect or a long gap):
+        there is no evidence the value held through time we never observed.
+        """
         if not self._in_plateau:
             return None
         self._in_plateau = False
@@ -278,7 +298,7 @@ class BrewDetector:
         return Plateau(
             value=self._plateau_value,
             t_start=self._plateau_start,
-            t_end=self._plateau_last_t,
+            t_end=max(self._plateau_last_t, end_t) if end_t else self._plateau_last_t,
             rise_seconds=rise,
             peak_flow=self._plateau_peak_flow,
         )
@@ -329,8 +349,24 @@ class BrewPairer:
         kind = classify(plateau, cfg, self._pending_dose)
 
         if kind == "dose":
-            # A newer dose supersedes an older unpaired one.
-            self._pending_dose = plateau
+            # Keep the longest-held candidate, not simply the newest.
+            #
+            # Between weighing the beans and pulling the shot other things land on
+            # the scale in the same mass range — the portafilter, a cup. Those are
+            # brief; the beans sit there for the whole grind. Comparing holds within
+            # one cycle separates them without an absolute cutoff, which matters
+            # because the two populations are closer than they first appeared:
+            # a real dose has been seen at 29 s and an incidental placement at 16 s.
+            #
+            # dose_min_hold_seconds still applies in classify() as a floor against
+            # momentary taps; this only decides which qualifying candidate wins.
+            previous = self._pending_dose
+            stale = (
+                previous is not None
+                and plateau.t_start - previous.t_end > cfg.pair_window_seconds
+            )
+            if previous is None or stale or plateau.duration > previous.duration:
+                self._pending_dose = plateau
             return kind, None
 
         if kind == "yield" and self._pending_dose is not None:
