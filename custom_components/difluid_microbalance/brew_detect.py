@@ -1,4 +1,12 @@
-"""Plateau detection over the scale's weight stream.
+"""Weighing detection over the scale's weight stream.
+
+The unit of interest is a weighing — from the scale being empty to the load coming
+off again — not a stable reading.  Anything put on the scale in more than one go
+produces several stable readings and exactly one weighing, and it is the weighing
+that has a meaning: 30 g of oats poured from two packets, a shot that settles as the
+crema drops.  Reporting stable readings instead invents events and reports
+intermediate values, which is what once emailed "coffee, ratio 1:1.27" about a bowl
+of porridge.
 
 Pure logic — no Home Assistant imports.  That is deliberate: the same module runs
 inside the coordinator and inside ``tools/replay_brew.py`` against recorder history,
@@ -30,14 +38,32 @@ class Sample:
 
 @dataclass(frozen=True)
 class Plateau:
+    """One complete weighing — everything that happened between the scale being
+    empty and the load leaving it again.
+
+    Not one stable reading.  A single weighing routinely settles more than once:
+    the beans run out mid-pour and the packet is topped up, or the last drops of
+    a shot land while the crema settles.  Each of those produces its own stable
+    reading, and reporting them separately is wrong twice over — it invents events
+    that never happened, and the value it reports is an intermediate one.
+
+    ``value`` is therefore the reading that stood when the load was removed, and
+    ``steps`` records the ladder that led to it.
+    """
+
     value: float
     t_start: float
     t_end: float
     rise_seconds: float
     peak_flow: float
+    #: Every stable reading in this weighing, oldest first; the last is ``value``.
+    steps: tuple[float, ...] = ()
+    #: How long the final reading itself stood, as opposed to the whole weighing.
+    final_hold_seconds: float = 0.0
 
     @property
     def duration(self) -> float:
+        """Seconds from the first stable reading to the load being removed."""
         return self.t_end - self.t_start
 
 
@@ -72,11 +98,13 @@ class DetectorConfig:
     yield_min: float = 25.0
     yield_max: float = 80.0
 
-    # Beans sit on the scale while the grind is run, so a real dose is held for a
-    # long time.  Incidental placements in the same mass range — the portafilter,
-    # a cup — last only a few seconds.  Observed: real dose 33.6 s, portafilter
-    # 6.8 s and 5.9 s.  No equivalent floor applies to the pour: it is held only
-    # as long as it takes to lift the cup (5 s in one recorded shot).
+    # A floor against momentary taps only.  It is deliberately not the thing that
+    # tells beans from a portafilter: measured over reconstructed streams the real
+    # dose stayed 180 s but incidental placements ran 7 s, 17 s and 126 s, so the
+    # two populations overlap and no absolute cutoff separates them.  BrewPairer
+    # compares candidates within a cycle instead.  No equivalent floor applies to
+    # the pour: it is held only as long as it takes to lift the cup (5 s in one
+    # recorded shot).
     dose_min_hold_seconds: float = 10.0
 
     # Pairing
@@ -87,7 +115,9 @@ class DetectorConfig:
     # Stream discontinuity
     gap_reset_seconds: float = 15.0
 
-    # Below this the scale is considered empty; used to time the rise.
+    # At or below this the scale is empty and the weighing is over.  Compared
+    # signed, not absolute: taking a tared container off reads well below zero
+    # (-35 g for the portafilter here), and that is a removal just as much as 0 is.
     zero_band: float = 1.0
 
 
@@ -131,10 +161,17 @@ def _mad(values: list[float], centre: float) -> float:
 
 
 class BrewDetector:
-    """Streaming plateau detector.
+    """Streaming weighing detector.
 
-    Feed samples in chronological order; each call returns a ``Plateau`` at the
-    moment one closes, otherwise ``None``.
+    Feed samples in chronological order; each call returns a ``Plateau`` — one
+    complete weighing — at the moment the load leaves the scale, otherwise ``None``.
+
+    Two levels are at work.  Internally the detector finds stable readings, as it
+    always did.  Those are accumulated into the current weighing instead of being
+    reported, and only the removal of the load produces a result.  Which reading is
+    stable is a question about the signal; which weighing it belongs to is a
+    question about what the scale was being used for, and the two have different
+    answers whenever something is added in more than one go.
     """
 
     def __init__(self, config: Optional[DetectorConfig] = None) -> None:
@@ -146,6 +183,7 @@ class BrewDetector:
         self._plateau_start = 0.0
         self._plateau_last_t = 0.0
         self._plateau_peak_flow = 0.0
+        self._steps: list[Plateau] = []
         self._last_zero_t: Optional[float] = None
         self._last_t: Optional[float] = None
 
@@ -154,6 +192,7 @@ class BrewDetector:
         self._raw.clear()
         self._window.clear()
         self._in_plateau = False
+        self._steps = []
         self._last_zero_t = None
         self._last_t = None
 
@@ -173,10 +212,16 @@ class BrewDetector:
         weights = [s.weight for s in self._raw]
         centre = median(weights)
         spread = _mad(weights, centre)
-        if spread == 0.0:
-            return sample
         # 1.4826 converts MAD to a standard-deviation-equivalent for normal data.
-        if abs(sample.weight - centre) > self.cfg.hampel_sigmas * 1.4826 * spread:
+        #
+        # The floor is what makes this work on a settled scale.  A perfectly steady
+        # reading has a MAD of exactly zero, and a threshold of zero times anything
+        # is still zero — so the filter used to give up precisely when the signal was
+        # cleanest.  That is how a single 0.0 g glitch, gone again in 0.28 s, cut a
+        # bowl of oats in half and turned it into a dose and a pour.  Below
+        # stable_tol the movement would not count as movement anyway.
+        threshold = max(self.cfg.hampel_sigmas * 1.4826 * spread, self.cfg.stable_tol)
+        if abs(sample.weight - centre) > threshold:
             return None
         return sample
 
@@ -222,7 +267,8 @@ class BrewDetector:
 
         if self._last_t is not None and sample.t - self._last_t > cfg.gap_reset_seconds:
             # A gap this long means the stream broke; nothing before it is comparable.
-            closed = self._close_plateau()
+            self._end_step()
+            closed = self._close_weighing()
             self.reset()
             self._last_t = sample.t
             return closed
@@ -234,14 +280,24 @@ class BrewDetector:
 
         if abs(clean.weight) > cfg.max_mass:
             # Nothing in this workflow legitimately weighs this much, so the cup is
-            # being lifted off. That ends the plateau — close it and hand it over.
+            # being lifted off. That ends the weighing — close it and hand it over.
             # Returning None here instead would lose the reading entirely: the
             # Hampel filter absorbs the first samples of the lift-off transient, so
             # this is often the only notice the detector gets that the pour is over.
-            return self._close_plateau(clean.t)
+            self._end_step(clean.t)
+            return self._close_weighing()
 
-        if abs(clean.weight) <= cfg.zero_band:
+        if clean.weight <= cfg.zero_band:
+            # The scale is empty again, so whatever was on it has been taken off and
+            # the weighing is finished.  This — not a stable reading — is what ends
+            # one: a reading that stops changing may simply be a pause while the next
+            # packet is opened.
             self._last_zero_t = clean.t
+            self._end_step(clean.t)
+            closed = self._close_weighing()
+            self._window.append(clean)
+            self._trim_window(clean.t)
+            return closed
 
         self._window.append(clean)
         self._trim_window(clean.t)
@@ -254,9 +310,9 @@ class BrewDetector:
         centre = median([s.weight for s in self._window])
         held = self._time_within_tol(centre, window_start, clean.t)
         held_fraction = held / cfg.stable_seconds
-        stable = (
-            held_fraction >= cfg.stable_time_fraction and abs(centre) >= cfg.min_mass
-        )
+        # Signed, not absolute: a steady negative reading is the scale sitting below
+        # its tare with the container removed, never something being weighed.
+        stable = held_fraction >= cfg.stable_time_fraction and centre >= cfg.min_mass
 
         if stable:
             if not self._in_plateau:
@@ -270,11 +326,14 @@ class BrewDetector:
             return None
 
         if self._in_plateau and abs(clean.weight - self._plateau_value) > cfg.stable_tol:
-            return self._close_plateau(clean.t)
+            # The reading moved on, but the load is still on the scale — more was
+            # added, or it is still settling.  Bank the step and keep the weighing
+            # open; only removal ends it.
+            self._end_step(clean.t)
         return None
 
-    def _close_plateau(self, end_t: Optional[float] = None) -> Optional[Plateau]:
-        """Close the open plateau.
+    def _end_step(self, end_t: Optional[float] = None) -> None:
+        """Bank the open stable reading as one step of the current weighing.
 
         `end_t` is the timestamp of the sample that ended it. Under zero-order hold
         the value was still being held right up to that moment, so that — not the
@@ -290,22 +349,45 @@ class BrewDetector:
         there is no evidence the value held through time we never observed.
         """
         if not self._in_plateau:
-            return None
+            return
         self._in_plateau = False
         rise = 0.0
         if self._last_zero_t is not None and self._plateau_start > self._last_zero_t:
             rise = self._plateau_start - self._last_zero_t
+        self._steps.append(
+            Plateau(
+                value=self._plateau_value,
+                t_start=self._plateau_start,
+                t_end=max(self._plateau_last_t, end_t) if end_t else self._plateau_last_t,
+                rise_seconds=rise,
+                peak_flow=self._plateau_peak_flow,
+            )
+        )
+
+    def _close_weighing(self) -> Optional[Plateau]:
+        """Fold the banked steps into the one result for this weighing."""
+        steps = self._steps
+        self._steps = []
+        if not steps:
+            return None
+        last = steps[-1]
         return Plateau(
-            value=self._plateau_value,
-            t_start=self._plateau_start,
-            t_end=max(self._plateau_last_t, end_t) if end_t else self._plateau_last_t,
-            rise_seconds=rise,
-            peak_flow=self._plateau_peak_flow,
+            # What stood on the scale when it was taken off — 30 g of oats, not the
+            # 23.7 g that was there when the first packet ran out; 38.4 g of coffee,
+            # not the 38.1 g reached three seconds before the crema settled.
+            value=last.value,
+            t_start=steps[0].t_start,
+            t_end=last.t_end,
+            rise_seconds=steps[0].rise_seconds,
+            peak_flow=max(s.peak_flow for s in steps),
+            steps=tuple(round(s.value, 2) for s in steps),
+            final_hold_seconds=last.duration,
         )
 
     def flush(self) -> Optional[Plateau]:
-        """Close any open plateau — for end of a replay file or a clean shutdown."""
-        return self._close_plateau()
+        """Close any open weighing — end of a replay file, or a clean shutdown."""
+        self._end_step()
+        return self._close_weighing()
 
 
 def classify(
@@ -355,8 +437,9 @@ class BrewPairer:
             # the scale in the same mass range — the portafilter, a cup. Those are
             # brief; the beans sit there for the whole grind. Comparing holds within
             # one cycle separates them without an absolute cutoff, which matters
-            # because the two populations are closer than they first appeared:
-            # a real dose has been seen at 29 s and an incidental placement at 16 s.
+            # because the two populations overlap outright: over reconstructed
+            # streams a real dose measured 180 s and incidental placements 7 s,
+            # 17 s and 126 s.  Within one cycle the beans are still the longest.
             #
             # dose_min_hold_seconds still applies in classify() as a floor against
             # momentary taps; this only decides which qualifying candidate wins.

@@ -116,6 +116,10 @@ def _weigh_attrs(event) -> dict:
         "detected_at": dt_util.utc_from_timestamp(event.at).isoformat(),
         "plateau_seconds": event.hold_seconds,
         "rise_seconds": event.rise_seconds,
+        # More than one entry means the weighing was topped up or was still
+        # settling; it explains a value that looks off without a trip to the
+        # recorder. A single entry is the ordinary case.
+        "steps": event.steps,
     }
 
 
@@ -163,6 +167,13 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
             if s.last_pair
             else {}
         ),
+    ),
+    DifluidBrewSensorDescription(
+        key="brew_count",
+        name="Brew Count",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        icon="mdi:counter",
+        value_fn=lambda s: s.brew_count,
     ),
 )
 

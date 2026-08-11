@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 from homeassistant.core import HomeAssistant
@@ -51,6 +51,11 @@ class WeighEvent:
     at: float
     hold_seconds: float
     rise_seconds: float
+    #: Every stable reading of this weighing; more than one means it was topped up
+    #: or was still settling.  Kept so a surprising value can be explained after the
+    #: fact without digging through recorder history.  Defaulted so that state
+    #: stored by an earlier version still loads.
+    steps: list = field(default_factory=list)
 
     @classmethod
     def from_plateau(cls, plateau: Plateau) -> "WeighEvent":
@@ -59,6 +64,7 @@ class WeighEvent:
             at=plateau.t_end,
             hold_seconds=round(plateau.duration, 1),
             rise_seconds=round(plateau.rise_seconds, 1),
+            steps=list(plateau.steps),
         )
 
 
@@ -78,6 +84,11 @@ class BrewSession:
         self.last_dose: Optional[WeighEvent] = None
         self.last_yield: Optional[WeighEvent] = None
         self.last_pair: Optional[BrewPair] = None
+        # Monotonic count of completed pairs.  Exists to give alerting something
+        # unambiguous to trigger on: "the ratio changed" misses two shots in a row
+        # that happen to land on the same ratio, and "the yield changed" fires for
+        # anything at all put on the scale — it emailed about a bowl of porridge.
+        self.brew_count: int = 0
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -92,6 +103,7 @@ class BrewSession:
                 self.last_yield = WeighEvent(**data["last_yield"])
             if data.get("last_pair"):
                 self.last_pair = BrewPair(**data["last_pair"])
+            self.brew_count = int(data.get("brew_count") or 0)
         except (TypeError, ValueError) as err:
             _LOGGER.warning("Ignoring unreadable stored brew state: %s", err)
 
@@ -110,10 +122,10 @@ class BrewSession:
             self._listeners.remove(callback)
 
     def reset(self) -> None:
-        """Stream broke — flush any finished plateau, then drop detector state.
+        """Stream broke — flush any finished weighing, then drop detector state.
 
         Flushing first matters: the BLE link routinely drops within a second or two
-        of the cup being lifted, and an open plateau at that moment is complete data
+        of the cup being lifted, and an open weighing at that moment is complete data
         — the pour already happened and was held long enough to qualify. Discarding
         it silently loses the shot, which is exactly what happened on 2026-08-10
         19:47 (pour held 5.8 s at 36.7 g, never reported).
@@ -163,8 +175,8 @@ class BrewSession:
             self.last_yield = event
 
         _LOGGER.info(
-            "Plateau: %s %.1f g (held %.1f s, rise %.1f s)",
-            kind, plateau.value, plateau.duration, plateau.rise_seconds,
+            "Weighing: %s %.1f g (steps %s, on the scale %.1f s, rise %.1f s)",
+            kind, plateau.value, plateau.steps, plateau.duration, plateau.rise_seconds,
         )
         self.hass.bus.async_fire(
             EVENT_PLATEAU_DETECTED, {"kind": kind, **asdict(event)}
@@ -172,6 +184,7 @@ class BrewSession:
 
         if pair is not None:
             self.last_pair = pair
+            self.brew_count += 1
             _LOGGER.info(
                 "Brew pair: dose %.1f g -> yield %.1f g (1:%.2f)",
                 pair.dose, pair.yield_g, pair.ratio,
@@ -182,6 +195,7 @@ class BrewSession:
                     "dose": round(pair.dose, 2),
                     "yield": round(pair.yield_g, 2),
                     "ratio": round(pair.ratio, 3),
+                    "count": self.brew_count,
                     "dose_at": pair.dose_at,
                     "yield_at": pair.yield_at,
                 },
@@ -204,6 +218,7 @@ class BrewSession:
             "last_dose": asdict(self.last_dose) if self.last_dose else None,
             "last_yield": asdict(self.last_yield) if self.last_yield else None,
             "last_pair": asdict(self.last_pair) if self.last_pair else None,
+            "brew_count": self.brew_count,
         }
 
     def _append_dataset(self, kind: str, plateau: Plateau) -> None:
@@ -215,6 +230,8 @@ class BrewSession:
             "t_start": plateau.t_start,
             "t_end": plateau.t_end,
             "hold_seconds": round(plateau.duration, 2),
+            "final_hold_seconds": round(plateau.final_hold_seconds, 2),
+            "steps": list(plateau.steps),
             "rise_seconds": round(plateau.rise_seconds, 2),
             "peak_flow": round(plateau.peak_flow, 2),
             "window": [

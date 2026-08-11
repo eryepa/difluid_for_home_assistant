@@ -45,9 +45,60 @@ Sample = brew_detect.Sample
 WEIGHT_SUFFIX = "_weight"
 FLOW_SUFFIX = "_flow_rate"
 
+#: How often to re-emit a held reading when reconstructing the stream, and how far
+#: to carry one forward before accepting that the stream really did stop.  The scale
+#: powers off after five minutes and that shows up as an `unavailable` row, so a
+#: silent gap longer than this is a recorder artefact we should not invent data for.
+ZOH_PERIOD = 1.0
+ZOH_MAX_FILL = 300.0
+
 
 def parse_ts(raw: str) -> float:
     return datetime.fromisoformat(raw).timestamp()
+
+
+def zero_order_hold(readings, period: float = ZOH_PERIOD, max_fill: float = ZOH_MAX_FILL):
+    """Reconstruct the live stream from change-point-only recorder history.
+
+    The recorder collapses consecutive identical readings, so beans held on the
+    scale for three minutes appear as one row followed by silence.  The detector
+    cannot distinguish that from a dead BLE link — anything past
+    ``gap_reset_seconds`` is treated as a broken stream — so offline a single long
+    weighing gets chopped into fragments that production, streaming at 5 Hz, never
+    sees.  Re-emitting the held value at a steady period restores the replay ⇄
+    production equivalence the whole tuning approach rests on.
+
+    ``readings`` yields ``(t, weight)`` pairs; ``weight is None`` marks a genuine
+    break (an ``unavailable`` row) and nothing is filled across it.
+    """
+    prev_t = prev_w = None
+    for t, weight in readings:
+        if weight is None:
+            yield t, None
+            prev_t = prev_w = None
+            continue
+        if prev_t is not None:
+            filler = prev_t + period
+            while filler < t and filler - prev_t <= max_fill:
+                yield filler, prev_w
+                filler += period
+        yield t, weight
+        prev_t, prev_w = t, weight
+
+
+def weight_readings(rows: list[dict]):
+    """Yield ``(t, weight)`` for the weight entity; ``None`` weight marks a break."""
+    for row in rows:
+        if not row["entity_id"].endswith(WEIGHT_SUFFIX):
+            continue
+        state = row["state"]
+        if state in ("unavailable", "unknown", "", None):
+            yield parse_ts(row["ts"]), None
+            continue
+        try:
+            yield parse_ts(row["ts"]), float(state)
+        except ValueError:
+            continue
 
 
 def load_rows(path: str) -> list[dict]:
@@ -111,27 +162,13 @@ def main() -> int:
                 f"ratio 1:{pair.ratio:.2f}"
             )
 
-    for row in rows:
-        if not row["entity_id"].endswith(WEIGHT_SUFFIX):
-            continue
-        state = row["state"]
-        if state in ("unavailable", "unknown", "", None):
+    for ts, weight in zero_order_hold(weight_readings(rows)):
+        if weight is None:
             closed = detector.flush()
             detector.reset()
-            if closed is not None:
-                plateaus += 1
-                kind, pair = pairer.offer(closed)
-                pairs += pair is not None
-                report(closed, kind, pair)
-            continue
-        try:
-            weight = float(state)
-        except ValueError:
-            continue
-
-        ts = parse_ts(row["ts"])
-        last_flow = flow_by_time.get(ts, last_flow)
-        closed = detector.feed(Sample(t=ts, weight=weight, flow=last_flow))
+        else:
+            last_flow = flow_by_time.get(ts, last_flow)
+            closed = detector.feed(Sample(t=ts, weight=weight, flow=last_flow))
         if closed is not None:
             plateaus += 1
             kind, pair = pairer.offer(closed)
