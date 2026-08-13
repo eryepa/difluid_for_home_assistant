@@ -182,6 +182,29 @@ def main() -> int:
         str(events),
     )
 
+    print("\nsnatched.csv — the 2026-08-13 19:15 shot whose cup was lifted at once")
+    events, pairs, weighings = run(HERE / "testdata" / "snatched.csv", detail=True)
+    ok &= check(
+        "the pour is reported even though it never held for stable_seconds",
+        any(k == "yield" and 37.2 <= v <= 37.7 for k, v in events),
+        str(events),
+    )
+    ok &= check("the 18.2 g dose is recognised", ("dose", 18.2) in events)
+    ok &= check("one pair", len(pairs) == 1, f"{len(pairs)}")
+    if pairs:
+        p = pairs[0]
+        ok &= check(
+            "pair is dose 18.2 g / yield ~37.5 g, ratio about 1:2.06",
+            abs(p.dose - 18.2) < 0.05 and abs(p.yield_g - 37.5) < 0.2
+            and abs(p.ratio - 2.06) < 0.03,
+            f"dose {p.dose} yield {p.yield_g} ratio {p.ratio:.3f}",
+        )
+    ok &= check(
+        "the portafilter sitting at -35 g is not an event",
+        all(v > 0 for _, v in events),
+        str(events),
+    )
+
     print("\nOK" if ok else "\nFAILED")
     return 0 if ok else 1
 

@@ -88,6 +88,14 @@ class DetectorConfig:
     hampel_window: int = 5  # samples in the spike prefilter
     hampel_sigmas: float = 3.0
 
+    # How long the reading must have stood still for the value it showed at the moment
+    # of removal to count, when no full stable reading was ever established.  A cup
+    # lifted as soon as the pour stops never gives stable_seconds of quiet: on
+    # 2026-08-13 the shot reached 37.6 g and was picked up 0.5 s later, and the whole
+    # brew went unreported.  One second is well past what any pour covers by accident
+    # — at the 2.5 g/s observed here a second of flow is 2.5 g, eight times stable_tol.
+    settle_min_seconds: float = 1.0
+
     # Plausible masses
     min_mass: float = 5.0
     max_mass: float = 500.0
@@ -127,6 +135,7 @@ TUNABLE_FIELDS = (
     "stable_tol",
     "stable_seconds",
     "stable_time_fraction",
+    "settle_min_seconds",
     "min_mass",
     "dose_min",
     "dose_max",
@@ -285,7 +294,10 @@ class BrewDetector:
             # Hampel filter absorbs the first samples of the lift-off transient, so
             # this is often the only notice the detector gets that the pour is over.
             self._end_step(clean.t)
-            return self._close_weighing()
+            self._settle_from_window(clean.t)
+            closed = self._close_weighing()
+            self._window.clear()
+            return closed
 
         if clean.weight <= cfg.zero_band:
             # The scale is empty again, so whatever was on it has been taken off and
@@ -294,9 +306,15 @@ class BrewDetector:
             # packet is opened.
             self._last_zero_t = clean.t
             self._end_step(clean.t)
+            self._settle_from_window(clean.t)
             closed = self._close_weighing()
+            # Everything still in the window belongs to the weighing that just
+            # ended, so it must not survive into the next one.  A lift-off throws
+            # the reading across zero several times over a second or two, and each
+            # crossing would otherwise reconstruct the same pour again from the
+            # same stale samples — lost_shot.csv reported its 36.6 g three times.
+            self._window.clear()
             self._window.append(clean)
-            self._trim_window(clean.t)
             return closed
 
         self._window.append(clean)
@@ -364,6 +382,54 @@ class BrewDetector:
             )
         )
 
+    def _settle_from_window(self, end_t: float) -> None:
+        """Recover the reading the scale was showing when the load came off.
+
+        Only runs when the weighing is about to close with nothing banked at all.
+        A step needs stable_seconds of held reading before it counts, and a cup
+        lifted the moment the pour stops never provides one — on 2026-08-13 a
+        perfectly ordinary shot reached 37.6 g, was picked up half a second later,
+        and the entire cycle was reported as nothing at all.
+
+        Removal is itself evidence that the weighing was finished, so the question
+        is not whether to report but what value to report.  Walking back from the
+        last clean sample gives it: the run of readings that agree with the final
+        one, which is the pour after the flow stopped and before the lift.  It has
+        to be a run and not a single sample, or a value caught mid-rise would
+        qualify.
+
+        Deliberately not a lower `stable_seconds`.  A confirmed step keeps its full
+        three seconds of evidence; this weaker rule applies only where the
+        alternative is silence.
+        """
+        cfg = self.cfg
+        if self._in_plateau or self._steps or len(self._window) < 2:
+            return
+
+        samples = list(self._window)
+        centre = samples[-1].weight
+        first = len(samples) - 1
+        while first > 0 and abs(samples[first - 1].weight - centre) <= cfg.stable_tol:
+            first -= 1
+        run = samples[first:]
+
+        # Measured across the clean samples only, never up to end_t.  The lift-off
+        # transient is swallowed by the Hampel filter, and counting the time it
+        # occupied would credit the reading with a hold nobody observed.
+        if run[-1].t - run[0].t < cfg.settle_min_seconds:
+            return
+
+        value = median([s.weight for s in run])
+        if value < cfg.min_mass:
+            return
+
+        self._in_plateau = True
+        self._plateau_value = value
+        self._plateau_start = run[0].t
+        self._plateau_last_t = run[-1].t
+        self._plateau_peak_flow = max(abs(s.flow) for s in run)
+        self._end_step(end_t)
+
     def _close_weighing(self) -> Optional[Plateau]:
         """Fold the banked steps into the one result for this weighing."""
         steps = self._steps
@@ -385,7 +451,11 @@ class BrewDetector:
         )
 
     def flush(self) -> Optional[Plateau]:
-        """Close any open weighing — end of a replay file, or a clean shutdown."""
+        """Close any open weighing — end of a replay file, or a clean shutdown.
+
+        No settle recovery here, nor on a stream gap: both mean the stream stopped,
+        which is not evidence that the load was ever taken off the scale.
+        """
         self._end_step()
         return self._close_weighing()
 

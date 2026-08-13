@@ -38,6 +38,7 @@
           "stable_tol": "Stability tolerance (g)",
           "stable_seconds": "Stability window (s)",
           "stable_time_fraction": "Share of the window that must hold (0-1)",
+          "settle_min_seconds": "Accept a value removed after only (s)",
           "min_mass": "Ignore plateaus below (g)",
           "dose_min": "Dose minimum (g)",
           "dose_max": "Dose maximum (g)",
