@@ -36,6 +36,14 @@ _LOGGER = logging.getLogger(__name__)
 _HEADER = bytes([0xDF, 0xDF])
 _ENCRYPTED_HEADER = bytes([0xDA, 0xDA])
 
+# Reconnect pacing.  Keyed on whether the scale is advertising, not on how many
+# attempts have failed — see _reconnect_loop for why that distinction matters.
+# The absent poll is an in-memory lookup against Home Assistant's own BLE table,
+# so it costs nothing on air and can afford to be frequent.
+_ABSENT_POLL_SECONDS = 15.0
+_PRESENT_RETRY_SECONDS = 5.0
+_PRESENT_RETRY_MAX_SECONDS = 30.0
+
 
 def _build_cmd(func: int, cmd: int, data: bytes = b"") -> bytes:
     frame = bytes([func, cmd, len(data)]) + data
@@ -437,23 +445,60 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         )
 
     async def _reconnect_loop(self) -> None:
+        """Retry until connected, pacing on whether the scale is actually there.
+
+        Backing off on consecutive failures is the wrong instinct for this device.
+        Nearly every failure means the same thing — the scale is switched off — and
+        a failure count keeps growing the delay for as long as that stays true.  So
+        by the time the scale is switched back on, the delay is always at its
+        maximum: the one moment that matters is the one the loop is least ready
+        for.  On 2026-08-14 the scale went off at 08:37, came back on at 08:47:11,
+        and the loop was asleep in a 120 s window; the brew was never measured.
+
+        Presence is the variable that actually matters, so pace on that instead.
+        An absent scale is not worth calling _do_connect for at all — it would fail
+        instantly with "not found" — so poll cheaply and stay ready.  A scale that
+        is advertising is retried hard, because it powers itself off again after a
+        few idle minutes and every second of that budget spent asleep is a brew
+        that goes unrecorded.
+
+        This also stops the loop depending on the advertisement callback, which is
+        the fast path but not a reliable one: on 2026-08-14 Home Assistant recorded
+        an advertisement at 08:47:11 and _on_bt_advertisement never fired.
+        """
         import time as _time
-        delay = 5
+        delay = _PRESENT_RETRY_SECONDS
         while True:
             await asyncio.sleep(delay)
             # Respect power-off cooldown even if the loop was already running.
             remaining = self._no_reconnect_until - _time.monotonic()
             if remaining > 0:
                 await asyncio.sleep(remaining + 1)
-                delay = 5
+                delay = _PRESENT_RETRY_SECONDS
                 continue
+
+            if bluetooth.async_ble_device_from_address(
+                self.hass, self.address, connectable=True
+            ) is None:
+                # Switched off, or out of reach of every connectable proxy.
+                delay = _ABSENT_POLL_SECONDS
+                continue
+
             try:
                 await self._do_connect()
                 _LOGGER.info("Reconnected to Difluid Microbalance %s", self.address)
                 return
             except Exception as err:
-                _LOGGER.debug("Reconnect attempt failed (%ss): %s", delay, err)
-                delay = min(120, delay * 2)  # 5 → 10 → 20 → 40 → 80 → 120 s cap
+                # Worth a warning, not a debug line: the scale is advertising and we
+                # still cannot reach it, which is a broken proxy rather than a scale
+                # sitting switched off in a drawer.  That is what cost the
+                # 2026-08-14 08:47 brew, and it was invisible below WARNING.
+                _LOGGER.warning(
+                    "Difluid Microbalance %s is advertising but the connection failed "
+                    "(retry in %.0fs): %s",
+                    self.address, min(_PRESENT_RETRY_MAX_SECONDS, delay * 2), err,
+                )
+                delay = min(_PRESENT_RETRY_MAX_SECONDS, delay * 2)
 
     # ── notification handler ──────────────────────────────────────────────────
 
