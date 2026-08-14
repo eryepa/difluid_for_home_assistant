@@ -123,6 +123,10 @@ class DetectorConfig:
     # Stream discontinuity
     gap_reset_seconds: float = 15.0
 
+    # How long the stream must have been free of rejected samples for a return to
+    # zero to count as a tare rather than a removal.  See _is_tare.
+    tare_quiet_seconds: float = 0.5
+
     # At or below this the scale is empty and the weighing is over.  Compared
     # signed, not absolute: taking a tared container off reads well below zero
     # (-35 g for the portafilter here), and that is a removal just as much as 0 is.
@@ -195,6 +199,8 @@ class BrewDetector:
         self._steps: list[Plateau] = []
         self._last_zero_t: Optional[float] = None
         self._last_t: Optional[float] = None
+        #: When the spike filter last rejected a sample — the load cell ringing.
+        self._last_spike_t: float = float("-inf")
 
     def reset(self) -> None:
         """Drop all state — call on BLE disconnect or a gap in the stream."""
@@ -204,6 +210,7 @@ class BrewDetector:
         self._steps = []
         self._last_zero_t = None
         self._last_t = None
+        self._last_spike_t = float("-inf")
 
     # ── spike prefilter ──────────────────────────────────────────────────────
 
@@ -231,8 +238,35 @@ class BrewDetector:
         # stable_tol the movement would not count as movement anyway.
         threshold = max(self.cfg.hampel_sigmas * 1.4826 * spread, self.cfg.stable_tol)
         if abs(sample.weight - centre) > threshold:
+            self._last_spike_t = sample.t
             return None
         return sample
+
+    def _is_tare(self, clean: Sample) -> bool:
+        """True when this zero is the scale being re-zeroed, not the load leaving it.
+
+        The two are identical in shape — a settled reading, then zero — and the
+        whole weighing model rests on zero meaning "the scale is empty".  Taring
+        breaks that: on 2026-08-14 an empty cup read 64.4 g, was tared, and that
+        64.35 g "weighing" paired with the morning's dose and emailed 1:3.56.
+
+        Two things separate them and both must hold.
+
+        A tare lands on *exactly* zero, because that is what taring means.  A load
+        coming off lands wherever the empty scale happens to sit — here -35 g with
+        the portafilter away — and usually hundreds of grams out first.
+
+        And a tare is silent.  A load cannot leave a scale without the cell
+        ringing, so the spike filter always has samples to reject just before a
+        real removal and none at all before a tare.  At the 11:19:45 tare the last
+        rejected sample was 2.2 s old; at the 19:15 lift-off it was 0.26 s old.
+        """
+        cfg = self.cfg
+        if abs(clean.weight) > cfg.stable_tol:
+            return False
+        if clean.t - self._last_spike_t < cfg.tare_quiet_seconds:
+            return False
+        return bool(self._window) and self._window[-1].weight >= cfg.min_mass
 
     # ── stability over a time window ─────────────────────────────────────────
 
@@ -298,6 +332,17 @@ class BrewDetector:
             closed = self._close_weighing()
             self._window.clear()
             return closed
+
+        if clean.weight <= cfg.zero_band and self._is_tare(clean):
+            # Re-zeroing, not a removal.  Whatever is standing on the scale has just
+            # been declared the baseline, which makes it a container and not a
+            # weighing — so drop the open one rather than reporting it.
+            self._in_plateau = False
+            self._steps = []
+            self._last_zero_t = clean.t
+            self._window.clear()
+            self._window.append(clean)
+            return None
 
         if clean.weight <= cfg.zero_band:
             # The scale is empty again, so whatever was on it has been taken off and

@@ -205,6 +205,28 @@ def main() -> int:
         str(events),
     )
 
+    print("\ntare.csv — the 2026-08-14 11:19 empty cup tared to zero")
+    events, pairs, weighings = run(HERE / "testdata" / "tare.csv", detail=True)
+    ok &= check(
+        "the tared cup is not a weighing — 64 g must not appear at all",
+        not any(60.0 <= v <= 70.0 for _, v in events),
+        str(events),
+    )
+    ok &= check("one pair", len(pairs) == 1, f"{len(pairs)}")
+    if pairs:
+        p = pairs[0]
+        ok &= check(
+            "pair is the real shot: dose 18.1 g / yield 37.7 g, ratio about 1:2.08",
+            abs(p.dose - 18.1) < 0.1 and abs(p.yield_g - 37.7) < 0.2
+            and abs(p.ratio - 2.08) < 0.03,
+            f"dose {p.dose} yield {p.yield_g} ratio {p.ratio:.3f}",
+        )
+    ok &= check(
+        "the real removals either side of the tare still end their weighings",
+        any(k == "dose" and abs(v - 18.1) < 0.1 for k, v in events),
+        str(events),
+    )
+
     print("\nOK" if ok else "\nFAILED")
     return 0 if ok else 1
 
