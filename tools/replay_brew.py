@@ -49,7 +49,15 @@ FLOW_SUFFIX = "_flow_rate"
 #: to carry one forward before accepting that the stream really did stop.  The scale
 #: powers off after five minutes and that shows up as an `unavailable` row, so a
 #: silent gap longer than this is a recorder artefact we should not invent data for.
-ZOH_PERIOD = 1.0
+# Must be the production notification period, not a round number.  The detector is
+# written to be time-driven precisely so replay and production agree, but the Hampel
+# prefilter has one sample-counted quantity in it — its window is five samples — and
+# how long five samples take is exactly what this constant sets.  At 1.0 s a step to
+# a new value was rejected for two seconds before the filter flushed; at the real
+# 5 Hz it is rejected for four tenths.  Every rule that measures time since the last
+# rejection therefore read five times too long offline, which is how the tare fix of
+# v1.4.0-beta.7 passed its fixture and still emailed "ratio 1:3.56" the next morning.
+ZOH_PERIOD = 0.2
 ZOH_MAX_FILL = 300.0
 
 

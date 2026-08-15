@@ -123,8 +123,8 @@ class DetectorConfig:
     # Stream discontinuity
     gap_reset_seconds: float = 15.0
 
-    # How long the stream must have been free of rejected samples for a return to
-    # zero to count as a tare rather than a removal.  See _is_tare.
+    # How long the stream must have been free of the load cell ringing for a return
+    # to zero to count as a tare rather than a removal.  See _is_tare and _is_ring.
     tare_quiet_seconds: float = 0.5
 
     # At or below this the scale is empty and the weighing is over.  Compared
@@ -199,8 +199,8 @@ class BrewDetector:
         self._steps: list[Plateau] = []
         self._last_zero_t: Optional[float] = None
         self._last_t: Optional[float] = None
-        #: When the spike filter last rejected a sample — the load cell ringing.
-        self._last_spike_t: float = float("-inf")
+        #: When the load cell was last seen ringing.  See _is_ring.
+        self._last_ring_t: float = float("-inf")
 
     def reset(self) -> None:
         """Drop all state — call on BLE disconnect or a gap in the stream."""
@@ -210,7 +210,7 @@ class BrewDetector:
         self._steps = []
         self._last_zero_t = None
         self._last_t = None
-        self._last_spike_t = float("-inf")
+        self._last_ring_t = float("-inf")
 
     # ── spike prefilter ──────────────────────────────────────────────────────
 
@@ -238,9 +238,36 @@ class BrewDetector:
         # stable_tol the movement would not count as movement anyway.
         threshold = max(self.cfg.hampel_sigmas * 1.4826 * spread, self.cfg.stable_tol)
         if abs(sample.weight - centre) > threshold:
-            self._last_spike_t = sample.t
+            if self._is_ring(sample, centre):
+                self._last_ring_t = sample.t
             return None
         return sample
+
+    def _is_ring(self, rejected: Sample, centre: float) -> bool:
+        """Is this rejected sample the cell ringing, or just the step to a new value?
+
+        Both get rejected, and only one of them is evidence of anything.  A Hampel
+        filter judges a sample against the spread of its neighbours, so on a settled
+        scale — where the spread is nil — it rejects *any* change, including a
+        perfectly clean step down to zero.  It keeps rejecting until the new value
+        fills its five-sample window.
+
+        That matters because _is_tare asks how long the cell has been quiet, and
+        counting those rejections made the answer depend on the sample rate rather
+        than on the signal: at 5 Hz five samples take 0.4 s, so the "quiet" was over
+        before it began and every tare read as a removal.  That is the whole of the
+        2026-08-15 ratio 1:2.35 — a tared 42.8 g cup reported as the pour.
+
+        Ringing is not just any excursion, it is an excursion *outside the two
+        levels*.  A cell settling from 42.8 g to zero passes through the values in
+        between and stops; a cup coming off swings hundreds of grams past both ends
+        (-583 g and +737 g on the same morning).  So the band from zero to wherever
+        the reading was is innocent, and anything beyond it is the cell ringing.
+        """
+        cfg = self.cfg
+        low = min(0.0, centre) - cfg.zero_band
+        high = max(0.0, centre) + cfg.stable_tol
+        return not low <= rejected.weight <= high
 
     def _is_tare(self, clean: Sample) -> bool:
         """True when this zero is the scale being re-zeroed, not the load leaving it.
@@ -257,14 +284,17 @@ class BrewDetector:
         the portafilter away — and usually hundreds of grams out first.
 
         And a tare is silent.  A load cannot leave a scale without the cell
-        ringing, so the spike filter always has samples to reject just before a
-        real removal and none at all before a tare.  At the 11:19:45 tare the last
-        rejected sample was 2.2 s old; at the 19:15 lift-off it was 0.26 s old.
+        ringing, so there is always an excursion past the two levels just before a
+        real removal and none at all before a tare.  Across both recorded tares the
+        last ring was 2.2 s and 2.6 s old; at the 19:15 lift-off, 0.2 s.
+
+        "Ring" and not "rejected sample" — see _is_ring for why the difference is
+        the whole rule rather than a refinement of it.
         """
         cfg = self.cfg
         if abs(clean.weight) > cfg.stable_tol:
             return False
-        if clean.t - self._last_spike_t < cfg.tare_quiet_seconds:
+        if clean.t - self._last_ring_t < cfg.tare_quiet_seconds:
             return False
         return bool(self._window) and self._window[-1].weight >= cfg.min_mass
 

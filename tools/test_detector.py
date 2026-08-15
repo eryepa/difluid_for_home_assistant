@@ -134,10 +134,14 @@ def main() -> int:
     ok &= check("one pair", len(pairs) == 1, f"{len(pairs)}")
     if pairs:
         p = pairs[0]
+        # 36.7, not the 36.6 this expected while replay resampled at 1 Hz. One scale
+        # increment, and the finer stream is the honest one: at 5 Hz the detector
+        # sees the sample production saw. The value moved because the harness was
+        # corrected, not because the detector changed.
         ok &= check(
-            "pair is dose 18.0 g / yield 36.6 g, ratio about 1:2.03",
-            abs(p.dose - 18.0) < 0.05 and abs(p.yield_g - 36.6) < 0.1
-            and abs(p.ratio - 2.03) < 0.02,
+            "pair is dose 18.0 g / yield 36.7 g, ratio about 1:2.04",
+            abs(p.dose - 18.0) < 0.05 and abs(p.yield_g - 36.7) < 0.1
+            and abs(p.ratio - 2.04) < 0.02,
             f"dose {p.dose} yield {p.yield_g} ratio {p.ratio:.3f}",
         )
 
@@ -224,6 +228,28 @@ def main() -> int:
     ok &= check(
         "the real removals either side of the tare still end their weighings",
         any(k == "dose" and abs(v - 18.1) < 0.1 for k, v in events),
+        str(events),
+    )
+
+    print("\ntare_still.csv — the 2026-08-15 11:16 tare of a dead-still cup")
+    events, pairs, weighings = run(HERE / "testdata" / "tare_still.csv", detail=True)
+    ok &= check(
+        "the tared cup is not a weighing — 42.8 g must not appear at all",
+        not any(42.0 <= v <= 43.5 for _, v in events),
+        str(events),
+    )
+    ok &= check("one pair", len(pairs) == 1, f"{len(pairs)}")
+    if pairs:
+        p = pairs[0]
+        ok &= check(
+            "pair is the real shot: dose 18.2 g / yield 53.5 g, ratio about 1:2.94",
+            abs(p.dose - 18.2) < 0.1 and abs(p.yield_g - 53.5) < 0.2
+            and abs(p.ratio - 2.94) < 0.03,
+            f"dose {p.dose} yield {p.yield_g} ratio {p.ratio:.3f}",
+        )
+    ok &= check(
+        "the portafilter coming off at -35 g still ends the dose weighing",
+        any(k == "dose" and abs(v - 18.2) < 0.1 for k, v in events),
         str(events),
     )
 
