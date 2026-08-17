@@ -149,6 +149,47 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         value_fn=lambda s: s.last_yield.value if s.last_yield else None,
         attrs_fn=lambda s: _weigh_attrs(s.last_yield),
     ),
+    # The two members of the last pair, as opposed to the last weighing of each kind
+    # above.  They exist because those two are not the same thing and reporting them
+    # as if they were produced two wrong emails: on 2026-08-15 the ratio was computed
+    # from a 42.8 g pour while Last Yield had already moved on to 59.8 g, and on
+    # 2026-08-17 Last Dose read 19.3 g — the holder set back on the scale — while the
+    # pair had correctly used the 18.0 g that was ground.
+    #
+    # Anything reporting a brew must read these three together; they change at one
+    # moment and always describe the same cup.  Last Dose and Last Yield stay as they
+    # are, for seeing weighings that never paired — which is how the last three
+    # defects were found.
+    DifluidBrewSensorDescription(
+        key="brew_dose",
+        name="Brew Dose",
+        device_class=SensorDeviceClass.WEIGHT,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfMass.GRAMS,
+        suggested_display_precision=1,
+        icon="mdi:coffee",
+        value_fn=lambda s: round(s.last_pair.dose, 2) if s.last_pair else None,
+        attrs_fn=lambda s: (
+            {"paired_at": dt_util.utc_from_timestamp(s.last_pair.yield_at).isoformat()}
+            if s.last_pair
+            else {}
+        ),
+    ),
+    DifluidBrewSensorDescription(
+        key="brew_yield",
+        name="Brew Yield",
+        device_class=SensorDeviceClass.WEIGHT,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=UnitOfMass.GRAMS,
+        suggested_display_precision=1,
+        icon="mdi:cup",
+        value_fn=lambda s: round(s.last_pair.yield_g, 2) if s.last_pair else None,
+        attrs_fn=lambda s: (
+            {"paired_at": dt_util.utc_from_timestamp(s.last_pair.yield_at).isoformat()}
+            if s.last_pair
+            else {}
+        ),
+    ),
     DifluidBrewSensorDescription(
         key="brew_ratio",
         name="Brew Ratio",

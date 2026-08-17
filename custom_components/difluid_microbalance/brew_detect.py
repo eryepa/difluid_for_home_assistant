@@ -115,6 +115,17 @@ class DetectorConfig:
     # recorded shot).
     dose_min_hold_seconds: float = 10.0
 
+    # How long a load must have taken to arrive for it to count as ground onto the
+    # scale rather than set down on it.  Beans accumulate while the grinder runs;
+    # anything already in a container lands in a single sample.  Measured across
+    # every capture so far the two do not overlap at all — real doses rose over
+    # 2.7 to 10.8 s, incidental placements over 0.0 to 1.3 s.
+    #
+    # This only ever picks between competing candidates, never rejects a lone one:
+    # grinding off the scale and setting the dose down would give a rise near zero,
+    # and that must still pair.
+    dose_min_rise_seconds: float = 2.0
+
     # Pairing
     pair_window_seconds: float = 1800.0
     ratio_min: float = 1.2
@@ -144,6 +155,7 @@ TUNABLE_FIELDS = (
     "dose_min",
     "dose_max",
     "dose_min_hold_seconds",
+    "dose_min_rise_seconds",
     "yield_min",
     "yield_max",
     "pair_window_seconds",
@@ -379,10 +391,14 @@ class BrewDetector:
             # the weighing is finished.  This — not a stable reading — is what ends
             # one: a reading that stops changing may simply be a pause while the next
             # packet is opened.
-            self._last_zero_t = clean.t
             self._end_step(clean.t)
             self._settle_from_window(clean.t)
             closed = self._close_weighing()
+            # Only now.  _end_step measures rise_seconds from the zero the weighing
+            # started at, and updating it first overwrote that with the zero the
+            # weighing was ending on — which is always later than the plateau, so the
+            # rise came out as 0.0 for every weighing a removal closed.
+            self._last_zero_t = clean.t
             # Everything still in the window belongs to the weighing that just
             # ended, so it must not survive into the next one.  A lift-off throws
             # the reading across zero several times over a second or two, and each
@@ -576,15 +592,17 @@ class BrewPairer:
         kind = classify(plateau, cfg, self._pending_dose)
 
         if kind == "dose":
-            # Keep the longest-held candidate, not simply the newest.
-            #
             # Between weighing the beans and pulling the shot other things land on
-            # the scale in the same mass range — the portafilter, a cup. Those are
-            # brief; the beans sit there for the whole grind. Comparing holds within
-            # one cycle separates them without an absolute cutoff, which matters
-            # because the two populations overlap outright: over reconstructed
-            # streams a real dose measured 180 s and incidental placements 7 s,
-            # 17 s and 126 s.  Within one cycle the beans are still the longest.
+            # the scale in the same mass range — the holder going back down, a cup.
+            # Deciding which candidate is the dose is therefore a real question, and
+            # how long each was held answers it badly: on 2026-08-17 the beans were
+            # held 12.1 s and the holder set back down 10.8 s, so the right answer
+            # won by 1.3 seconds, which is luck rather than evidence.
+            #
+            # How the load *arrived* answers it properly.  Beans accumulate while
+            # the grinder runs; anything already in a container is simply put down
+            # and is there in one sample.  That distinction has no overlap in any
+            # capture so far, where hold time overlaps outright.
             #
             # dose_min_hold_seconds still applies in classify() as a floor against
             # momentary taps; this only decides which qualifying candidate wins.
@@ -593,8 +611,18 @@ class BrewPairer:
                 previous is not None
                 and plateau.t_start - previous.t_end > cfg.pair_window_seconds
             )
-            if previous is None or stale or plateau.duration > previous.duration:
+            if previous is None or stale:
                 self._pending_dose = plateau
+            else:
+                ground = plateau.rise_seconds >= cfg.dose_min_rise_seconds
+                ground_before = previous.rise_seconds >= cfg.dose_min_rise_seconds
+                if ground != ground_before:
+                    # One was ground onto the scale and the other set down on it.
+                    if ground:
+                        self._pending_dose = plateau
+                elif plateau.duration > previous.duration:
+                    # Both arrived the same way, so fall back to the longer hold.
+                    self._pending_dose = plateau
             return kind, None
 
         if kind == "yield" and self._pending_dose is not None:

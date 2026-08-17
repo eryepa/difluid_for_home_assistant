@@ -253,6 +253,48 @@ def main() -> int:
         str(events),
     )
 
+    print("\ntwo_doses.csv — the 2026-08-17 cycle with two candidates for the dose")
+    events, pairs, weighings = run(HERE / "testdata" / "two_doses.csv", detail=True)
+    ok &= check(
+        "both candidates are detected — 18.0 g ground, 19.3 g set back down",
+        ("dose", 18.0) in events and ("dose", 19.3) in events,
+        str(events),
+    )
+    # Asserted on the pairer's choice rather than on a finished pair, because this
+    # capture's pour is not detected offline at all.  It crept from 59.8 g to 60.2 g
+    # in the last half second as the crema settled, which is neither a full plateau
+    # nor a second of quiet, so it lands exactly on the stability boundary — and
+    # production, whose 5 Hz jitter put another sample or two at 59.8 inside the
+    # window, did detect it and reported 59.8 g.  Replay reconstructs holds on an
+    # even 0.2 s grid and cannot reproduce that jitter, so the two disagree here.
+    # Left as it is deliberately: moving a threshold to make this fixture pair would
+    # be tuning to the harness again, which is the mistake that cost three betas.
+    pairer = brew_detect.BrewPairer()
+    for w in weighings:
+        pairer.offer(w)
+    chosen = pairer.pending_dose
+    ok &= check(
+        "the pairer holds the beans that were ground on, not the holder put back down",
+        chosen is not None and abs(chosen.value - 18.0) < 0.1,
+        f"chose {chosen.value if chosen else None}",
+    )
+    # The margin, not just the answer.  Hold time separated these two by 1.3 s and
+    # would flip the moment the holder sat on the scale a little longer; how the
+    # load arrived separates them by 5.4 s.
+    doses = [w for w in weighings if 17.0 <= w.value <= 20.0]
+    ok &= check(
+        "the two are told apart by rise, not by a hair of hold time",
+        len(doses) == 2 and abs(doses[0].rise_seconds - doses[1].rise_seconds) > 4.0
+        and abs(doses[0].duration - doses[1].duration) < 6.0,
+        f"rise {[round(w.rise_seconds, 1) for w in doses]} "
+        f"hold {[round(w.duration, 1) for w in doses]}",
+    )
+    ok &= check(
+        "the 65 g cup tared at 19:54:41 is still not a weighing",
+        not any(60.0 <= v <= 70.0 for _, v in events),
+        str(events),
+    )
+
     print("\nOK" if ok else "\nFAILED")
     return 0 if ok else 1
 

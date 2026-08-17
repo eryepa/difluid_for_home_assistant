@@ -43,6 +43,7 @@
           "dose_min": "Dose minimum (g)",
           "dose_max": "Dose maximum (g)",
           "dose_min_hold_seconds": "Dose must be held for at least (s)",
+          "dose_min_rise_seconds": "Dose must have taken at least this long to arrive (s)",
           "yield_min": "Yield minimum (g)",
           "yield_max": "Yield maximum (g)",
           "pair_window_seconds": "Maximum dose-to-pour gap (s)",
