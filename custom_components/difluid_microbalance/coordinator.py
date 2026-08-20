@@ -63,6 +63,30 @@ _CMD_GET_AUTO_STOP   = _build_cmd(0x01, 0x02)
 # status packet (battery, charging, device_status) via GET_STATUS.
 _STATUS_POLL_INTERVAL = 1
 
+# Grams per unit of the scale's *display* setting, keyed the same way as
+# WEIGHT_UNITS.  The weight packet reports whatever unit the scale is currently
+# showing, and everything downstream of it is in grams: the weight sensor declares
+# UnitOfMass.GRAMS unconditionally, and every threshold in brew_detect (min_mass
+# 5 g, dose 12-25 g, yield 25-80 g) is a gram figure measured off real captures.
+#
+# So pressing the unit button on the scale used to break two things at once and say
+# nothing about either.  In ounces an 18 g dose arrived as 0.635, below min_mass, and
+# the detector reported nothing at all — silently and for as long as the setting
+# stayed that way.  In grains it arrived as 277.8, which is under max_mass and so
+# passes as a real weighing, but falls outside every dose and yield band, so every
+# weighing classified as "other" and no pair was ever produced.  The weight sensor
+# meanwhile published ounces labelled as grams, which the recorder keeps forever.
+#
+# Converting is the fix rather than refusing to feed the detector: the unit button
+# changes what the scale displays, not what it measured, and a user who presses it
+# is not asking for brew detection to stop.  Refusing would also leave the weight
+# sensor itself wrong, which is the part that reaches statistics.
+_GRAMS_PER_UNIT = {
+    0: 1.0,            # g
+    1: 28.349523125,   # oz (avoirdupois)
+    2: 0.06479891,     # gr (grains)
+}
+
 
 @dataclass
 class MicrobalanceData:
@@ -111,6 +135,9 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         self._no_reconnect_until: float = 0.0  # monotonic timestamp; reconnect suppressed until then
         self._last_weight_change_time: float = 0.0
         self._last_weight_value: float = 0.0
+        #: Last display unit seen in a weight packet, so a non-gram setting is
+        #: reported once instead of five times a second.  See _note_weight_unit.
+        self._last_unit_idx: Optional[int] = None
         self.data = MicrobalanceData()
 
     # ── public API for button / select / number entities ─────────────────────
@@ -502,6 +529,47 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
 
     # ── notification handler ──────────────────────────────────────────────────
 
+    def _note_weight_unit(self, unit_idx: int) -> None:
+        """Report the scale's display unit, once per change rather than per sample.
+
+        Weight packets arrive at ~5 Hz, so anything logged unconditionally here
+        produces around 18000 lines an hour and buries everything else in the log —
+        which is exactly what made the ZeroDivisionError from a zero stability window
+        so unpleasant to read.  The unit only changes when somebody presses a button
+        on the scale, so tracking the last one seen turns a flood into one line.
+
+        It is a warning and not a debug line because the reading is still converted
+        to grams and therefore still correct: without a warning there is nothing
+        anywhere to explain why the scale in the kitchen says 0.6 and Home Assistant
+        says 18.
+        """
+        if unit_idx == self._last_unit_idx:
+            return
+        previous = self._last_unit_idx
+        self._last_unit_idx = unit_idx
+        unit = WEIGHT_UNITS.get(unit_idx)
+        if unit is None:
+            _LOGGER.warning(
+                "Difluid Microbalance %s reported unknown weight unit index %s; "
+                "treating the reading as grams",
+                self.address, unit_idx,
+            )
+            return
+        if unit_idx == 0:
+            # Back to grams (or the first packet of the session) — nothing to warn
+            # about, but say so when it is a change so the log tells the whole story.
+            if previous is not None:
+                _LOGGER.info(
+                    "Difluid Microbalance %s is back in grams", self.address
+                )
+            return
+        _LOGGER.warning(
+            "Difluid Microbalance %s is displaying %s; readings are converted to "
+            "grams (x%s) for the sensors and the brew detector. Press the unit "
+            "button on the scale to switch back to grams.",
+            self.address, unit, _GRAMS_PER_UNIT.get(unit_idx, 1.0),
+        )
+
     def _on_notification(self, sender: Any, raw: bytearray) -> None:
         if len(raw) >= 2 and raw[0] == 0xDA and raw[1] == 0xDA:
             if self._auth is not None:
@@ -525,8 +593,19 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         if func == 0x03 and cmd == 0x00 and len(payload) >= 13:
             weight_raw = int.from_bytes(payload[0:4], "big", signed=True)
             unit_idx = payload[12]
+            self._note_weight_unit(unit_idx)
+            # The scale's own display setting, kept for diagnostics only — it is NOT
+            # the unit of self.data.weight, which is always grams from here down.
             self.data.weight_unit = WEIGHT_UNITS.get(unit_idx, "g")
-            self.data.weight = weight_raw / (1000.0 if unit_idx == 1 else 10.0)
+            displayed = weight_raw / (1000.0 if unit_idx == 1 else 10.0)
+            self.data.weight = displayed * _GRAMS_PER_UNIT.get(unit_idx, 1.0)
+            # Flow is deliberately left at the packet's own scaling.  Whether the
+            # scale expresses it in the displayed unit per second or always in g/s is
+            # not settled by any capture we have — every capture so far was taken in
+            # gram mode, where the two are identical — and guessing wrong here would
+            # turn a correct flow into a 28x one.  It only feeds the peak_flow
+            # tiebreak in brew_detect.classify, which affects nothing unless the dose
+            # and yield bands overlap.
             self.data.flow_rate = int.from_bytes(payload[4:6], "big", signed=True) / 10.0
             self.data.timer = int.from_bytes(payload[6:8], "big")
             # Track weight changes for auto-shutdown

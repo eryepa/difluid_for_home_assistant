@@ -8,7 +8,7 @@ from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import HomeAssistant
 
 from .brew_detect import config_from_options
-from .brew_session import async_get_session
+from .brew_session import async_get_session, async_remove_session
 from .const import (
     CONF_DEVICE_TYPE,
     CONF_IS_TI,
@@ -172,8 +172,53 @@ async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Tear down one entry's coordinator.
+
+    Deliberately leaves the shared brew session alone.  Home Assistant calls this for
+    a reload as well as for a removal, and every options change reloads the entry
+    (see _async_reload_entry), so anything cleaned up here is cleaned up several
+    times a day.  The session is what carries last_pair, brew_count and an unpaired
+    dose across those reloads — dropping it here would mean tightening a threshold
+    between weighing the beans and pulling the shot lost the dose.  Removal is
+    handled in async_remove_entry below, which only runs when the entry is deleted.
+    """
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         coordinator = hass.data[DOMAIN].pop(entry.entry_id)
         await coordinator.async_stop()
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Forget the brew session when the scale's entry is deleted.
+
+    Home Assistant calls this only on deletion, after async_unload_entry has run —
+    that is the distinction async_unload_entry cannot make for itself.
+
+    Without it, `hass.data[DOMAIN][BREW_KEY]` survived removal (unload pops only the
+    entry_id key) and the persisted Store survived along with it, so deleting the
+    integration and adding it again brought back the previous last_pair, brew_count
+    and detector config.  Reinstalling is what someone does precisely when they want
+    that state gone.
+    """
+    if entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_R2:
+        # The R2 never creates a session; it only reads the scale's.
+        return
+
+    # The session is one per Home Assistant rather than one per entry, so a second
+    # scale would still be using it.  The entry being removed is still present in the
+    # registry while this runs, so it has to be excluded by id.
+    others = [
+        other
+        for other in hass.config_entries.async_entries(DOMAIN)
+        if other.entry_id != entry.entry_id
+        and other.data.get(CONF_DEVICE_TYPE) != DEVICE_TYPE_R2
+    ]
+    if others:
+        _LOGGER.debug(
+            "Keeping the brew session: %d other scale entry/entries still use it",
+            len(others),
+        )
+        return
+
+    await async_remove_session(hass)

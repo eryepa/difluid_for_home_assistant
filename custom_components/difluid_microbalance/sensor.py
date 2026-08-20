@@ -112,10 +112,19 @@ class DifluidBrewSensorDescription(SensorEntityDescription):
 def _weigh_attrs(event) -> dict:
     if event is None:
         return {}
+    # rise_seconds is None whenever the load was already on the scale before the
+    # detector was watching — after a restart mid-session, a BLE reconnect, or a gap
+    # in the stream.  It is published as None rather than coerced to 0.0, because 0.0
+    # is not a stand-in for "unknown" here: it is the specific claim that the load
+    # was set down in one go rather than ground on, which is what tells a portafilter
+    # from a dose.  A template reading this must be able to tell the two apart, so
+    # the attribute stays present and null rather than silently becoming a number or
+    # silently disappearing.
+    rise = event.rise_seconds
     return {
         "detected_at": dt_util.utc_from_timestamp(event.at).isoformat(),
         "plateau_seconds": event.hold_seconds,
-        "rise_seconds": event.rise_seconds,
+        "rise_seconds": None if rise is None else round(float(rise), 1),
         # More than one entry means the weighing was topped up or was still
         # settling; it explains a value that looks off without a trip to the
         # recorder. A single entry is the ordinary case.

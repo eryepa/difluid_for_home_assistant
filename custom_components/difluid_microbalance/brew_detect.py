@@ -54,8 +54,21 @@ class Plateau:
     value: float
     t_start: float
     t_end: float
-    rise_seconds: float
-    peak_flow: float
+    #: How long the load took to arrive, or ``None`` when that was never observed.
+    #:
+    #: The two are different findings and must not share a value.  A rise of zero is
+    #: a positive observation — the scale was seen empty and the load was there in
+    #: the next sample, so it was set down rather than ground on.  ``None`` means the
+    #: detector never saw the scale empty before this weighing and so knows nothing
+    #: about how the load got there: it was already sitting on the scale when the
+    #: detector started, after an HA restart mid-session, after a BLE reconnect, or
+    #: after a gap in the stream reset it.
+    #:
+    #: Recording the second as the first states the opposite of what happened, and
+    #: BrewPairer.offer reads it as evidence.  That is how a portafilter set back on
+    #: the scale beat the real dose on 2026-08-17.
+    rise_seconds: Optional[float] = None
+    peak_flow: float = 0.0
     #: Every stable reading in this weighing, oldest first; the last is ``value``.
     steps: tuple[float, ...] = ()
     #: How long the final reading itself stood, as opposed to the whole weighing.
@@ -131,7 +144,25 @@ class DetectorConfig:
     ratio_min: float = 1.2
     ratio_max: float = 6.0
 
-    # Stream discontinuity
+    # Stream discontinuity: how long a hole has to be before the detector stops
+    # believing the two sides of it belong to the same weighing.
+    #
+    # Left at 15 s even though the ESPHome proxies in this deployment are known to
+    # stall for 20, which trips it every time.  That looks wrong until you price both
+    # sides.  Tripping now costs only history — feed() discards the open weighing and
+    # rebuilds it from the resumed stream, so the value and the removal are still
+    # detected, and what is lost is the earlier steps and how the load arrived (which
+    # is recorded as unknown, not invented).  Not tripping costs accuracy: nothing
+    # calls _end_step across a gap, so the hold is measured straight through the
+    # silence.  Raising this to 30 s and replaying the two gap fixtures turns a
+    # 12.4 s pour into a 37.0 s one and a 15.2 s dose into a 46.8 s one — twenty
+    # seconds of hold that nobody observed, fed straight into dose_min_hold_seconds
+    # and into the hold-time tiebreak in BrewPairer.offer.
+    #
+    # Losing history is visible and bounded; inventing hold time is neither, and it
+    # is the mistake this module's comments keep returning to.  So the default stays
+    # conservative and the field is tunable instead, for anyone whose proxies are bad
+    # enough that they would rather make the other trade knowingly.
     gap_reset_seconds: float = 15.0
 
     # How long the stream must have been free of the load cell ringing for a return
@@ -161,6 +192,11 @@ TUNABLE_FIELDS = (
     "pair_window_seconds",
     "ratio_min",
     "ratio_max",
+    # Exposed because the right value is a property of the user's BLE path, not of
+    # coffee, and nothing in the integration can measure it for them: a proxy that
+    # stalls longer than this loses the history of every weighing it interrupts, and
+    # until now there was no way to say so.  See the field for what raising it costs.
+    "gap_reset_seconds",
 )
 
 
@@ -352,11 +388,30 @@ class BrewDetector:
 
         if self._last_t is not None and sample.t - self._last_t > cfg.gap_reset_seconds:
             # A gap this long means the stream broke; nothing before it is comparable.
-            self._end_step()
-            closed = self._close_weighing()
+            #
+            # The open weighing is discarded, not emitted.  flush() states the rule
+            # this follows: a stopped stream "is not evidence that the load was ever
+            # taken off the scale", and a weighing is by definition everything from
+            # the scale being empty to the load leaving it.  Handing out what had
+            # accumulated so far would be reporting a fragment as if it were the
+            # whole, which is the same mistake as reporting a stable reading instead
+            # of a weighing — 30.0 g of a pour that was going to reach 37.0 g, paired
+            # with the waiting dose, emailed as 1:1.67.
+            #
+            # Here we know more than flush() does, and it points the same way.  The
+            # stream *resumed*: the samples after the gap say what is on the scale
+            # now, so nothing has to be guessed.  If the load really did come off
+            # during the stall the resumed stream reads ~0 and there was nothing to
+            # report anyway; if it is still there, the weighing rebuilds itself from
+            # the resumed stream and closes properly when the load finally leaves.
+            # Either way the fragment is redundant, and emitting it can only invent
+            # an event that did not happen.
+            #
+            # What is genuinely lost is the history before the gap — the earlier
+            # steps and, because no zero was observed after the reset, how the load
+            # arrived.  That last one is recorded as unknown rather than as zero; see
+            # _end_step.
             self.reset()
-            self._last_t = sample.t
-            return closed
         self._last_t = sample.t
 
         clean = self._despike(sample)
@@ -460,9 +515,18 @@ class BrewDetector:
         if not self._in_plateau:
             return
         self._in_plateau = False
-        rise = 0.0
-        if self._last_zero_t is not None and self._plateau_start > self._last_zero_t:
-            rise = self._plateau_start - self._last_zero_t
+        # None, not 0.0, when no zero was ever seen before this plateau.  _last_zero_t
+        # is cleared by reset() and only ever set by a sample at or below zero_band,
+        # so a weighing whose load was already on the scale when the detector started
+        # has nothing to measure a rise against.  "It arrived instantly" and "we did
+        # not see it arrive" are opposite findings; see Plateau.rise_seconds.
+        #
+        # A plateau that starts at or before the zero keeps 0.0, which is the honest
+        # answer there: the scale *was* observed empty, and nothing accumulated
+        # between that and the plateau's own start.
+        rise: Optional[float] = None
+        if self._last_zero_t is not None:
+            rise = max(0.0, self._plateau_start - self._last_zero_t)
         self._steps.append(
             Plateau(
                 value=self._plateau_value,
@@ -492,9 +556,28 @@ class BrewDetector:
         Deliberately not a lower `stable_seconds`.  A confirmed step keeps its full
         three seconds of evidence; this weaker rule applies only where the
         alternative is silence.
+
+        Earlier steps do not switch this off.  They used to, and that quietly undid
+        the rule for exactly the weighings it was written for: Plateau.value is "the
+        reading that stood when the load was removed", which only follows from the
+        last banked step if every increment stood for a full stable_seconds, and the
+        last one is the one most likely not to have.  A pour that reached 36.0 g,
+        stood five seconds, took the last drops to 38.4 g and was lifted 1.4 s later
+        reported 36.0 — while the identical waveform with nothing banked before it
+        reported 38.4.  The bias runs one way only, because a cup never gets lighter
+        while it settles.
+
+        What the steps gate was really guarding against is the recovery handing back
+        a reading that has already been banked, which would append the same value
+        twice and count one settling as two.  That is a question about the value, not
+        about whether any step exists: a run that agrees with the last step is the
+        same reading seen again, and a run meaningfully above it is the load having
+        grown since — new evidence by the same argument that makes removal evidence.
+        Meaningfully means stable_tol, the width at which this detector calls
+        anything movement at all.
         """
         cfg = self.cfg
-        if self._in_plateau or self._steps or len(self._window) < 2:
+        if self._in_plateau or len(self._window) < 2:
             return
 
         samples = list(self._window)
@@ -512,6 +595,11 @@ class BrewDetector:
 
         value = median([s.weight for s in run])
         if value < cfg.min_mass:
+            return
+        if self._steps and value <= self._steps[-1].value + cfg.stable_tol:
+            # The same reading the last step already recorded, or a lower one.  Not a
+            # top-up, so there is nothing here that the weighing does not already
+            # know — and appending it would report one settling as two steps.
             return
 
         self._in_plateau = True
@@ -576,6 +664,34 @@ def classify(
     return "other"
 
 
+def _arrival_rank(plateau: Plateau, cfg: DetectorConfig) -> int:
+    """Score how well this load's arrival argues that it is the dose.
+
+    Three states, not two, because ``rise_seconds`` has three:
+
+      2  ground on — the load accumulated over dose_min_rise_seconds or more, which
+         is what a grinder running onto the scale looks like and nothing else does.
+      1  unknown — no zero was observed before it, so how it arrived was never seen.
+      0  set down — the scale was observed empty and the load was there in a single
+         sample, so it came out of a container.
+
+    Unknown sits between them because it is the absence of evidence and the other two
+    are evidence pointing opposite ways.  Ranking it with "set down", which is what
+    collapsing None to 0.0 used to do, turns silence into an accusation: a dose the
+    detector picked up mid-session would be scored as a portafilter.  Ranking it with
+    "ground on" would do the reverse and let a cup that happened to be sitting there
+    at startup outrank beans we actually watched accumulate.
+
+    So a known-ground candidate still beats an unknown one, an unknown one still
+    beats a known set-down one, and two candidates in the same state are left to the
+    hold-time tiebreak below — which is a weak rule, but between two loads we know
+    equally little about it is the only one left.
+    """
+    if plateau.rise_seconds is None:
+        return 1
+    return 2 if plateau.rise_seconds >= cfg.dose_min_rise_seconds else 0
+
+
 class BrewPairer:
     """Holds the most recent unpaired dose and matches the next plausible yield."""
 
@@ -614,14 +730,16 @@ class BrewPairer:
             if previous is None or stale:
                 self._pending_dose = plateau
             else:
-                ground = plateau.rise_seconds >= cfg.dose_min_rise_seconds
-                ground_before = previous.rise_seconds >= cfg.dose_min_rise_seconds
-                if ground != ground_before:
-                    # One was ground onto the scale and the other set down on it.
-                    if ground:
+                rank = _arrival_rank(plateau, cfg)
+                rank_before = _arrival_rank(previous, cfg)
+                if rank != rank_before:
+                    # The two arrived differently, or one of them was never seen to
+                    # arrive at all.  See _arrival_rank for why that is three cases.
+                    if rank > rank_before:
                         self._pending_dose = plateau
                 elif plateau.duration > previous.duration:
-                    # Both arrived the same way, so fall back to the longer hold.
+                    # Nothing to choose between them on arrival — the same evidence,
+                    # or the same absence of it — so fall back to the longer hold.
                     self._pending_dose = plateau
             return kind, None
 

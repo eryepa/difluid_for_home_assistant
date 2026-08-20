@@ -16,6 +16,16 @@ time, so it guards against thresholds that are tuned too tight.
 
 Later episodes were captured the same way as the defects they describe turned up;
 each is documented above its own block.
+
+Episodes K, L and M are the exception: they are reconstructed rather than captured,
+because the defect they cover is a hole in the stream and a hole in the stream leaves
+nothing behind in recorder history to capture.  The block above them explains why and
+what the `gap` rows in them mean.
+
+Episodes N and O are reconstructions for the same kind of reason — nothing captured
+here carries the flow entity at all, so no capture can exercise a rule that reads it.
+The block above them says which of their numbers are derived from real captures and
+which are not.
 """
 
 from __future__ import annotations
@@ -24,6 +34,12 @@ import csv
 from pathlib import Path
 
 WEIGHT = "sensor.microbalance_304268_weight"
+#: The flow entity, spelled as replay_brew.FLOW_SUFFIX expects to find it and as
+#: fetch_history.py pulls it out of the recorder.  Written into the same three-column
+#: CSV as the weight rows and interleaved with them by timestamp, because that is what
+#: a recorder export of both entities looks like: one flat table, one row per state
+#: change, whichever entity changed.
+FLOW = "sensor.microbalance_304268_flow_rate"
 
 # (timestamp without date, weight) — date is applied per episode below.
 EPISODE_A = ("2026-08-08", [
@@ -624,6 +640,365 @@ EPISODE_J = ("2026-08-17", [
 ])
 
 
+# The three episodes below are the first in this file that carry a mid-stream gap,
+# and they are reconstructions rather than captures.  A stall in the BLE proxy leaves
+# no trace in recorder history at all — the recorder stores change points, so twenty
+# seconds of silence is byte-for-byte identical to twenty seconds of a held value,
+# which is exactly why zero_order_hold fills across it.  There is therefore no
+# captured stream that can reproduce the feed() gap path, and every fixture above
+# exercises only the terminal `unavailable` row, which is the flush() path instead.
+#
+# So the stall is written down explicitly: a row whose state is `gap` marks the
+# moment the proxy went quiet, and the test harness reconstructs the segments either
+# side of it independently instead of filling across.  The detector then sees the
+# real timestamp discontinuity that production sees.  The waveforms around it are
+# built on the same 0.2 s grid and the same shapes as the captures above — a ~2 g/s
+# grind, a ~2.5 g/s pour, the -35 g portafilter, the lift-off transient of episode F
+# — but the values are clean rather than jittery, which makes the Hampel prefilter
+# maximally strict and the assertions below correspondingly conservative.
+
+
+# K. Reconstructed from the 2026-08-19 report of "ratio 1:1.67" on an ordinary 18/37
+# shot.  Beans 18.0 g are weighed and taken off, so the pairer is holding them; the
+# pour then ramps to 30.0 g and pauses there on pre-infusion for four seconds, long
+# enough to be banked as a step.  The proxy stalls for 20.2 s, the stream comes back
+# with the cup still on the scale, and the pour finishes at 37.0 g before the cup is
+# lifted.
+#
+# One physical pour, and the gap path in feed() made two weighings of it: the 30.0 g
+# fragment was handed out as a finished weighing, paired with the waiting dose first,
+# and 1:1.67 went out by email while the real 37.0 g arrived too late to pair with
+# anything.  The stall is 20.2 s against a 15 s default because that is what these
+# proxies actually do.
+EPISODE_K = ("2026-08-19", [
+    ("07:30:00.000000", "0.0"), ("07:30:10.000000", "0.4"), ("07:30:10.200000", "0.8"),
+    ("07:30:10.400000", "1.2"), ("07:30:10.600000", "1.6"), ("07:30:10.800000", "2.0"),
+    ("07:30:11.000000", "2.4"), ("07:30:11.200000", "2.8"), ("07:30:11.400000", "3.2"),
+    ("07:30:11.600000", "3.6"), ("07:30:11.800000", "4.0"), ("07:30:12.000000", "4.4"),
+    ("07:30:12.200000", "4.8"), ("07:30:12.400000", "5.2"), ("07:30:12.600000", "5.6"),
+    ("07:30:12.800000", "6.0"), ("07:30:13.000000", "6.4"), ("07:30:13.200000", "6.8"),
+    ("07:30:13.400000", "7.2"), ("07:30:13.600000", "7.6"), ("07:30:13.800000", "8.0"),
+    ("07:30:14.000000", "8.4"), ("07:30:14.200000", "8.8"), ("07:30:14.400000", "9.2"),
+    ("07:30:14.600000", "9.6"), ("07:30:14.800000", "10.0"), ("07:30:15.000000", "10.4"),
+    ("07:30:15.200000", "10.8"), ("07:30:15.400000", "11.2"), ("07:30:15.600000", "11.6"),
+    ("07:30:15.800000", "12.0"), ("07:30:16.000000", "12.4"), ("07:30:16.200000", "12.8"),
+    ("07:30:16.400000", "13.2"), ("07:30:16.600000", "13.6"), ("07:30:16.800000", "14.0"),
+    ("07:30:17.000000", "14.4"), ("07:30:17.200000", "14.8"), ("07:30:17.400000", "15.2"),
+    ("07:30:17.600000", "15.6"), ("07:30:17.800000", "16.0"), ("07:30:18.000000", "16.4"),
+    ("07:30:18.200000", "16.8"), ("07:30:18.400000", "17.2"), ("07:30:18.600000", "17.6"),
+    ("07:30:18.800000", "18.0"), ("07:30:24.000000", "18.1"),
+    ("07:30:30.000000", "18.0"), ("07:30:37.000000", "-35.2"), ("07:30:37.200000", "-35.3"),
+    ("07:30:37.400000", "-35.2"), ("07:30:37.600000", "-35.3"), ("07:30:45.000000", "-35.2"),
+    ("07:31:20.000000", "-35.3"), ("07:31:30.000000", "0.0"), ("07:31:40.000000", "0.5"),
+    ("07:31:40.200000", "1.0"), ("07:31:40.400000", "1.5"), ("07:31:40.600000", "2.0"),
+    ("07:31:40.800000", "2.5"), ("07:31:41.000000", "3.0"), ("07:31:41.200000", "3.5"),
+    ("07:31:41.400000", "4.0"), ("07:31:41.600000", "4.5"), ("07:31:41.800000", "5.0"),
+    ("07:31:42.000000", "5.5"), ("07:31:42.200000", "6.0"), ("07:31:42.400000", "6.5"),
+    ("07:31:42.600000", "7.0"), ("07:31:42.800000", "7.5"), ("07:31:43.000000", "8.0"),
+    ("07:31:43.200000", "8.5"), ("07:31:43.400000", "9.0"), ("07:31:43.600000", "9.5"),
+    ("07:31:43.800000", "10.0"), ("07:31:44.000000", "10.5"), ("07:31:44.200000", "11.0"),
+    ("07:31:44.400000", "11.5"), ("07:31:44.600000", "12.0"), ("07:31:44.800000", "12.5"),
+    ("07:31:45.000000", "13.0"), ("07:31:45.200000", "13.5"), ("07:31:45.400000", "14.0"),
+    ("07:31:45.600000", "14.5"), ("07:31:45.800000", "15.0"), ("07:31:46.000000", "15.5"),
+    ("07:31:46.200000", "16.0"), ("07:31:46.400000", "16.5"), ("07:31:46.600000", "17.0"),
+    ("07:31:46.800000", "17.5"), ("07:31:47.000000", "18.0"), ("07:31:47.200000", "18.5"),
+    ("07:31:47.400000", "19.0"), ("07:31:47.600000", "19.5"), ("07:31:47.800000", "20.0"),
+    ("07:31:48.000000", "20.5"), ("07:31:48.200000", "21.0"), ("07:31:48.400000", "21.5"),
+    ("07:31:48.600000", "22.0"), ("07:31:48.800000", "22.5"), ("07:31:49.000000", "23.0"),
+    ("07:31:49.200000", "23.5"), ("07:31:49.400000", "24.0"), ("07:31:49.600000", "24.5"),
+    ("07:31:49.800000", "25.0"), ("07:31:50.000000", "25.5"), ("07:31:50.200000", "26.0"),
+    ("07:31:50.400000", "26.5"), ("07:31:50.600000", "27.0"), ("07:31:50.800000", "27.5"),
+    ("07:31:51.000000", "28.0"), ("07:31:51.200000", "28.5"), ("07:31:51.400000", "29.0"),
+    ("07:31:51.600000", "29.5"), ("07:31:51.800000", "30.0"), ("07:31:52.000000", "30.0"),
+    ("07:31:56.000000", "30.0"), ("07:31:56.200000", "gap"), ("07:32:16.200000", "30.0"),
+    ("07:32:20.400000", "30.0"), ("07:32:20.600000", "30.5"), ("07:32:20.800000", "31.0"),
+    ("07:32:21.000000", "31.5"), ("07:32:21.200000", "32.0"), ("07:32:21.400000", "32.5"),
+    ("07:32:21.600000", "33.0"), ("07:32:21.800000", "33.5"), ("07:32:22.000000", "34.0"),
+    ("07:32:22.200000", "34.5"), ("07:32:22.400000", "35.0"), ("07:32:22.600000", "35.5"),
+    ("07:32:22.800000", "36.0"), ("07:32:23.000000", "36.5"), ("07:32:23.200000", "37.0"),
+    ("07:32:23.400000", "37.0"), ("07:32:28.000000", "37.0"), ("07:32:28.200000", "-9.6"),
+    ("07:32:28.400000", "-92.8"), ("07:32:28.600000", "-99.8"), ("07:32:28.800000", "-99.9"),
+    ("07:32:29.600000", "-28.3"), ("07:32:29.800000", "353.1"), ("07:32:30.000000", "728.1"),
+    ("07:32:30.200000", "815.2"), ("07:32:30.400000", "unavailable"),
+])
+
+
+# L. Reconstructed from the same morning.  The stall lands while the dose is still
+# sitting on the scale rather than during the pour, which is the other half of the
+# same defect and the one that reaches the pairer.  Beans 18.0 g are ground on over
+# nine seconds, held eleven, and the proxy then stalls 20 s; the stream resumes with
+# the beans untouched, they stand another 14.8 s, and the portafilter is lifted.
+# The holder is then set back down reading 19.3 g and left there for 31 s — half a
+# minute, comfortably longer than what survived of the dose's own hold.
+#
+# Because the gap reset the detector, nothing in the resumed stream ever went through
+# zero, so how the beans arrived was never observed.  Recording that as
+# rise_seconds = 0.0 says the opposite of what happened — it claims the load was set
+# down — and the pairer, seeing two set-down candidates, fell back to the longest
+# hold and chose the holder.  37.0 / 19.3 is 1:1.92, a ratio plausible enough to be
+# emailed without anyone noticing until the dose looked wrong.
+EPISODE_L = ("2026-08-20", [
+    ("08:00:00.000000", "0.0"), ("08:00:10.000000", "0.4"), ("08:00:10.200000", "0.8"),
+    ("08:00:10.400000", "1.2"), ("08:00:10.600000", "1.6"), ("08:00:10.800000", "2.0"),
+    ("08:00:11.000000", "2.4"), ("08:00:11.200000", "2.8"), ("08:00:11.400000", "3.2"),
+    ("08:00:11.600000", "3.6"), ("08:00:11.800000", "4.0"), ("08:00:12.000000", "4.4"),
+    ("08:00:12.200000", "4.8"), ("08:00:12.400000", "5.2"), ("08:00:12.600000", "5.6"),
+    ("08:00:12.800000", "6.0"), ("08:00:13.000000", "6.4"), ("08:00:13.200000", "6.8"),
+    ("08:00:13.400000", "7.2"), ("08:00:13.600000", "7.6"), ("08:00:13.800000", "8.0"),
+    ("08:00:14.000000", "8.4"), ("08:00:14.200000", "8.8"), ("08:00:14.400000", "9.2"),
+    ("08:00:14.600000", "9.6"), ("08:00:14.800000", "10.0"), ("08:00:15.000000", "10.4"),
+    ("08:00:15.200000", "10.8"), ("08:00:15.400000", "11.2"), ("08:00:15.600000", "11.6"),
+    ("08:00:15.800000", "12.0"), ("08:00:16.000000", "12.4"), ("08:00:16.200000", "12.8"),
+    ("08:00:16.400000", "13.2"), ("08:00:16.600000", "13.6"), ("08:00:16.800000", "14.0"),
+    ("08:00:17.000000", "14.4"), ("08:00:17.200000", "14.8"), ("08:00:17.400000", "15.2"),
+    ("08:00:17.600000", "15.6"), ("08:00:17.800000", "16.0"), ("08:00:18.000000", "16.4"),
+    ("08:00:18.200000", "16.8"), ("08:00:18.400000", "17.2"), ("08:00:18.600000", "17.6"),
+    ("08:00:18.800000", "18.0"), ("08:00:23.000000", "18.1"),
+    ("08:00:30.000000", "18.0"), ("08:00:30.200000", "gap"), ("08:00:50.200000", "18.0"),
+    ("08:00:54.000000", "18.1"), ("08:01:00.000000", "18.0"), ("08:01:05.000000", "-35.2"),
+    ("08:01:05.200000", "-35.3"), ("08:01:05.400000", "-35.2"), ("08:01:05.600000", "-35.3"),
+    ("08:01:20.000000", "-35.2"), ("08:01:25.000000", "19.4"), ("08:01:25.200000", "19.3"),
+    ("08:01:40.000000", "19.3"), ("08:01:55.000000", "19.3"), ("08:01:56.000000", "-35.2"),
+    ("08:01:56.200000", "-35.3"), ("08:01:56.400000", "-35.2"), ("08:01:56.600000", "-35.3"),
+    ("08:02:05.000000", "-35.2"), ("08:02:10.000000", "0.0"), ("08:02:20.000000", "0.5"),
+    ("08:02:20.200000", "1.0"), ("08:02:20.400000", "1.5"), ("08:02:20.600000", "2.0"),
+    ("08:02:20.800000", "2.5"), ("08:02:21.000000", "3.0"), ("08:02:21.200000", "3.5"),
+    ("08:02:21.400000", "4.0"), ("08:02:21.600000", "4.5"), ("08:02:21.800000", "5.0"),
+    ("08:02:22.000000", "5.5"), ("08:02:22.200000", "6.0"), ("08:02:22.400000", "6.5"),
+    ("08:02:22.600000", "7.0"), ("08:02:22.800000", "7.5"), ("08:02:23.000000", "8.0"),
+    ("08:02:23.200000", "8.5"), ("08:02:23.400000", "9.0"), ("08:02:23.600000", "9.5"),
+    ("08:02:23.800000", "10.0"), ("08:02:24.000000", "10.5"), ("08:02:24.200000", "11.0"),
+    ("08:02:24.400000", "11.5"), ("08:02:24.600000", "12.0"), ("08:02:24.800000", "12.5"),
+    ("08:02:25.000000", "13.0"), ("08:02:25.200000", "13.5"), ("08:02:25.400000", "14.0"),
+    ("08:02:25.600000", "14.5"), ("08:02:25.800000", "15.0"), ("08:02:26.000000", "15.5"),
+    ("08:02:26.200000", "16.0"), ("08:02:26.400000", "16.5"), ("08:02:26.600000", "17.0"),
+    ("08:02:26.800000", "17.5"), ("08:02:27.000000", "18.0"), ("08:02:27.200000", "18.5"),
+    ("08:02:27.400000", "19.0"), ("08:02:27.600000", "19.5"), ("08:02:27.800000", "20.0"),
+    ("08:02:28.000000", "20.5"), ("08:02:28.200000", "21.0"), ("08:02:28.400000", "21.5"),
+    ("08:02:28.600000", "22.0"), ("08:02:28.800000", "22.5"), ("08:02:29.000000", "23.0"),
+    ("08:02:29.200000", "23.5"), ("08:02:29.400000", "24.0"), ("08:02:29.600000", "24.5"),
+    ("08:02:29.800000", "25.0"), ("08:02:30.000000", "25.5"), ("08:02:30.200000", "26.0"),
+    ("08:02:30.400000", "26.5"), ("08:02:30.600000", "27.0"), ("08:02:30.800000", "27.5"),
+    ("08:02:31.000000", "28.0"), ("08:02:31.200000", "28.5"), ("08:02:31.400000", "29.0"),
+    ("08:02:31.600000", "29.5"), ("08:02:31.800000", "30.0"), ("08:02:32.000000", "30.5"),
+    ("08:02:32.200000", "31.0"), ("08:02:32.400000", "31.5"), ("08:02:32.600000", "32.0"),
+    ("08:02:32.800000", "32.5"), ("08:02:33.000000", "33.0"), ("08:02:33.200000", "33.5"),
+    ("08:02:33.400000", "34.0"), ("08:02:33.600000", "34.5"), ("08:02:33.800000", "35.0"),
+    ("08:02:34.000000", "35.5"), ("08:02:34.200000", "36.0"), ("08:02:34.400000", "36.5"),
+    ("08:02:34.600000", "37.0"), ("08:02:35.000000", "37.0"), ("08:02:40.000000", "37.0"),
+    ("08:02:40.200000", "-9.6"), ("08:02:40.400000", "-92.8"), ("08:02:40.600000", "-99.8"),
+    ("08:02:40.800000", "-99.9"), ("08:02:41.600000", "-28.3"), ("08:02:41.800000", "353.1"),
+    ("08:02:42.000000", "728.1"), ("08:02:42.200000", "815.2"), ("08:02:42.400000", "unavailable"),
+])
+
+
+# M. Reconstructed from the 2026-08-20 report of "ratio 1:2.00" on a shot the barista
+# had weighed at 38.4 g.  The pour ramps to 36.0 g and stands there five seconds, so
+# 36.0 is banked as a step of the weighing; the last drops then take it to 38.4 g,
+# which is held only 1.8 s — about 1.4 s of that survives the spike prefilter, which
+# needs three samples to accept a 2.4 g step — and the cup is lifted.
+#
+# 1.4 s is well past settle_min_seconds and nowhere near stable_seconds, so this is
+# precisely the case _settle_from_window was added for on 2026-08-13.  It was
+# switched off anyway, because the recovery refused to run whenever any step had been
+# banked, and the weighing reported the stale 36.0 instead.  Same defect as the
+# porridge and as episode F, one increment further along: the bias only ever runs one
+# way, because a cup never gets lighter while it settles.
+#
+# Deliberately a 2.4 g top-up and not episode F's 0.3 g one.  At 0.3 g the two levels
+# are a single stable_tol apart, which is the width of the band _settle_from_window
+# walks back through, so no rule working on values could separate them — see the note
+# on settling.csv in test_detector.py.
+EPISODE_M = ("2026-08-20", [
+    ("09:00:00.000000", "0.0"), ("09:00:10.000000", "0.4"), ("09:00:10.200000", "0.8"),
+    ("09:00:10.400000", "1.2"), ("09:00:10.600000", "1.6"), ("09:00:10.800000", "2.0"),
+    ("09:00:11.000000", "2.4"), ("09:00:11.200000", "2.8"), ("09:00:11.400000", "3.2"),
+    ("09:00:11.600000", "3.6"), ("09:00:11.800000", "4.0"), ("09:00:12.000000", "4.4"),
+    ("09:00:12.200000", "4.8"), ("09:00:12.400000", "5.2"), ("09:00:12.600000", "5.6"),
+    ("09:00:12.800000", "6.0"), ("09:00:13.000000", "6.4"), ("09:00:13.200000", "6.8"),
+    ("09:00:13.400000", "7.2"), ("09:00:13.600000", "7.6"), ("09:00:13.800000", "8.0"),
+    ("09:00:14.000000", "8.4"), ("09:00:14.200000", "8.8"), ("09:00:14.400000", "9.2"),
+    ("09:00:14.600000", "9.6"), ("09:00:14.800000", "10.0"), ("09:00:15.000000", "10.4"),
+    ("09:00:15.200000", "10.8"), ("09:00:15.400000", "11.2"), ("09:00:15.600000", "11.6"),
+    ("09:00:15.800000", "12.0"), ("09:00:16.000000", "12.4"), ("09:00:16.200000", "12.8"),
+    ("09:00:16.400000", "13.2"), ("09:00:16.600000", "13.6"), ("09:00:16.800000", "14.0"),
+    ("09:00:17.000000", "14.4"), ("09:00:17.200000", "14.8"), ("09:00:17.400000", "15.2"),
+    ("09:00:17.600000", "15.6"), ("09:00:17.800000", "16.0"), ("09:00:18.000000", "16.4"),
+    ("09:00:18.200000", "16.8"), ("09:00:18.400000", "17.2"), ("09:00:18.600000", "17.6"),
+    ("09:00:18.800000", "18.0"), ("09:00:25.000000", "18.1"),
+    ("09:00:30.000000", "18.0"), ("09:00:36.000000", "-35.2"), ("09:00:36.200000", "-35.3"),
+    ("09:00:36.400000", "-35.2"), ("09:00:36.600000", "-35.3"), ("09:00:45.000000", "-35.2"),
+    ("09:00:50.000000", "0.0"), ("09:01:00.000000", "0.5"), ("09:01:00.200000", "1.0"),
+    ("09:01:00.400000", "1.5"), ("09:01:00.600000", "2.0"), ("09:01:00.800000", "2.5"),
+    ("09:01:01.000000", "3.0"), ("09:01:01.200000", "3.5"), ("09:01:01.400000", "4.0"),
+    ("09:01:01.600000", "4.5"), ("09:01:01.800000", "5.0"), ("09:01:02.000000", "5.5"),
+    ("09:01:02.200000", "6.0"), ("09:01:02.400000", "6.5"), ("09:01:02.600000", "7.0"),
+    ("09:01:02.800000", "7.5"), ("09:01:03.000000", "8.0"), ("09:01:03.200000", "8.5"),
+    ("09:01:03.400000", "9.0"), ("09:01:03.600000", "9.5"), ("09:01:03.800000", "10.0"),
+    ("09:01:04.000000", "10.5"), ("09:01:04.200000", "11.0"), ("09:01:04.400000", "11.5"),
+    ("09:01:04.600000", "12.0"), ("09:01:04.800000", "12.5"), ("09:01:05.000000", "13.0"),
+    ("09:01:05.200000", "13.5"), ("09:01:05.400000", "14.0"), ("09:01:05.600000", "14.5"),
+    ("09:01:05.800000", "15.0"), ("09:01:06.000000", "15.5"), ("09:01:06.200000", "16.0"),
+    ("09:01:06.400000", "16.5"), ("09:01:06.600000", "17.0"), ("09:01:06.800000", "17.5"),
+    ("09:01:07.000000", "18.0"), ("09:01:07.200000", "18.5"), ("09:01:07.400000", "19.0"),
+    ("09:01:07.600000", "19.5"), ("09:01:07.800000", "20.0"), ("09:01:08.000000", "20.5"),
+    ("09:01:08.200000", "21.0"), ("09:01:08.400000", "21.5"), ("09:01:08.600000", "22.0"),
+    ("09:01:08.800000", "22.5"), ("09:01:09.000000", "23.0"), ("09:01:09.200000", "23.5"),
+    ("09:01:09.400000", "24.0"), ("09:01:09.600000", "24.5"), ("09:01:09.800000", "25.0"),
+    ("09:01:10.000000", "25.5"), ("09:01:10.200000", "26.0"), ("09:01:10.400000", "26.5"),
+    ("09:01:10.600000", "27.0"), ("09:01:10.800000", "27.5"), ("09:01:11.000000", "28.0"),
+    ("09:01:11.200000", "28.5"), ("09:01:11.400000", "29.0"), ("09:01:11.600000", "29.5"),
+    ("09:01:11.800000", "30.0"), ("09:01:12.000000", "30.5"), ("09:01:12.200000", "31.0"),
+    ("09:01:12.400000", "31.5"), ("09:01:12.600000", "32.0"), ("09:01:12.800000", "32.5"),
+    ("09:01:13.000000", "33.0"), ("09:01:13.200000", "33.5"), ("09:01:13.400000", "34.0"),
+    ("09:01:13.600000", "34.5"), ("09:01:13.800000", "35.0"), ("09:01:14.000000", "35.5"),
+    ("09:01:14.200000", "36.0"), ("09:01:14.400000", "36.0"), ("09:01:19.400000", "36.0"),
+    ("09:01:19.600000", "37.2"), ("09:01:19.800000", "38.4"), ("09:01:21.400000", "38.4"),
+    ("09:01:21.600000", "-9.6"), ("09:01:21.800000", "-92.8"), ("09:01:22.000000", "-99.8"),
+    ("09:01:22.200000", "-99.9"), ("09:01:23.000000", "-28.3"), ("09:01:23.200000", "353.1"),
+    ("09:01:23.400000", "728.1"), ("09:01:23.600000", "815.2"), ("09:01:23.800000", "unavailable"),
+])
+
+
+# The two episodes below are the first in this file to carry the flow entity, and
+# they are reconstructions for much the same reason as K, L and M: no capture we hold
+# contains flow at all.  fetch_history.py has always asked the recorder for it, but
+# every episode above was written down as weight alone, so `peak_flow` came out as
+# 0.0 in every fixture in this directory while production feeds it a real flow rate
+# off the scale.  A quantity the harness pins to a constant that production varies is
+# the ZOH_PERIOD mistake wearing a different hat — see the comment on that constant in
+# replay_brew.py — and the rule it silently switched off is the overlap tiebreak in
+# brew_detect.classify: `duration >= 30.0 and peak_flow < 0.5`.
+#
+# Where the numbers come from, and where they do not:
+#
+#   * 2.0 g/s while the grinder runs and 2.5 g/s while the pour runs are the slopes of
+#     these episodes' own weight tracks (0.4 g and 0.5 g per 0.2 s sample), so the
+#     flow rows are the derivative of the weight rows beside them rather than an
+#     independent invention.  Those two slopes are the ones the captures above show
+#     and the ones episodes K to M were already built on; the 2.5 g/s pour is the same
+#     figure DetectorConfig.settle_min_seconds cites from the real shots.
+#   * 0.0 while the load stands still follows from the weight not moving.
+#   * What is NOT grounded is what the scale actually puts in that field.  No capture
+#     here contains it, and the coordinator's own comment records that even its
+#     scaling is unsettled — whether it is the displayed unit per second or always
+#     g/s is not decided by any capture we have.  So these are what the flow *should*
+#     read if the field is a plain g/s derivative, which is the most defensible thing
+#     available, and they are not a measurement.  If a capture with flow in it ever
+#     turns up, it should replace these outright.
+#
+# Both weighings sit at exactly 25.0 g because that is the only mass the shipped
+# defaults put in both ranges at once — dose_max and yield_min are both 25.0 — and
+# the tiebreak only runs where they overlap.  Nothing in either hold is allowed to
+# drift off 25.0 for that reason: one 25.1 g row and the weighing leaves the overlap,
+# classify takes an earlier branch, and the fixture goes on passing while testing
+# nothing.  test_detector.py also replays both through a widened band, which is the
+# case the branch actually exists for, so that the coverage does not rest on the
+# defaults happening to touch.
+#
+# N is the easy half.  O has to be shaped with more care, because `peak_flow` is not
+# the flow during the pour — the detector only samples flow while the reading is
+# stable, and a reading that is stable is by definition not moving, so a plateau's own
+# flow is nil.  The one moment real flow lands inside a plateau is when more liquid
+# arrives on a weighing that had already settled: the stability window tolerates a
+# tenth of itself outside tol, so the first samples of the resumed pour are still
+# inside the plateau while the scale is already reporting the flow.  That is what
+# episode O is — a cup that stood at 22.0 g for half a minute and then took the last
+# drops — and it is the same waveform as topped_up.csv, which is a shape these
+# captures show repeatedly rather than one built to order.
+
+
+# N. Reconstructed.  25.0 g of beans ground onto the scale over 12.4 s at 2.0 g/s and
+# left sitting there for 40 s while the shot is set up, then the holder is lifted off.
+# In both mass ranges at the shipped defaults, held far longer than the 30 s the
+# tiebreak asks for, and nothing was flowing while it sat there — so this is the half
+# of the rule that must come back "dose".
+EPISODE_N = ("2026-08-21", [
+    ("10:00:00.000000", "0.0"), ("10:00:10.000000", "0.2"), ("10:00:10.200000", "0.6"),
+    ("10:00:10.400000", "1.0"), ("10:00:10.600000", "1.4"), ("10:00:10.800000", "1.8"),
+    ("10:00:11.000000", "2.2"), ("10:00:11.200000", "2.6"), ("10:00:11.400000", "3.0"),
+    ("10:00:11.600000", "3.4"), ("10:00:11.800000", "3.8"), ("10:00:12.000000", "4.2"),
+    ("10:00:12.200000", "4.6"), ("10:00:12.400000", "5.0"), ("10:00:12.600000", "5.4"),
+    ("10:00:12.800000", "5.8"), ("10:00:13.000000", "6.2"), ("10:00:13.200000", "6.6"),
+    ("10:00:13.400000", "7.0"), ("10:00:13.600000", "7.4"), ("10:00:13.800000", "7.8"),
+    ("10:00:14.000000", "8.2"), ("10:00:14.200000", "8.6"), ("10:00:14.400000", "9.0"),
+    ("10:00:14.600000", "9.4"), ("10:00:14.800000", "9.8"), ("10:00:15.000000", "10.2"),
+    ("10:00:15.200000", "10.6"), ("10:00:15.400000", "11.0"), ("10:00:15.600000", "11.4"),
+    ("10:00:15.800000", "11.8"), ("10:00:16.000000", "12.2"), ("10:00:16.200000", "12.6"),
+    ("10:00:16.400000", "13.0"), ("10:00:16.600000", "13.4"), ("10:00:16.800000", "13.8"),
+    ("10:00:17.000000", "14.2"), ("10:00:17.200000", "14.6"), ("10:00:17.400000", "15.0"),
+    ("10:00:17.600000", "15.4"), ("10:00:17.800000", "15.8"), ("10:00:18.000000", "16.2"),
+    ("10:00:18.200000", "16.6"), ("10:00:18.400000", "17.0"), ("10:00:18.600000", "17.4"),
+    ("10:00:18.800000", "17.8"), ("10:00:19.000000", "18.2"), ("10:00:19.200000", "18.6"),
+    ("10:00:19.400000", "19.0"), ("10:00:19.600000", "19.4"), ("10:00:19.800000", "19.8"),
+    ("10:00:20.000000", "20.2"), ("10:00:20.200000", "20.6"), ("10:00:20.400000", "21.0"),
+    ("10:00:20.600000", "21.4"), ("10:00:20.800000", "21.8"), ("10:00:21.000000", "22.2"),
+    ("10:00:21.200000", "22.6"), ("10:00:21.400000", "23.0"), ("10:00:21.600000", "23.4"),
+    ("10:00:21.800000", "23.8"), ("10:00:22.000000", "24.2"), ("10:00:22.200000", "24.6"),
+    ("10:00:22.400000", "25.0"), ("10:00:30.000000", "25.0"), ("10:00:45.000000", "25.0"),
+    ("10:01:02.400000", "25.0"), ("10:01:02.600000", "-35.2"), ("10:01:02.800000", "-35.3"),
+    ("10:01:03.000000", "-35.2"), ("10:01:03.200000", "-35.3"), ("10:01:10.400000", "-35.2"),
+    ("10:01:11.400000", "unavailable"),
+])
+
+# Three rows, because the recorder stores change points and this flow really is a
+# step function: nothing, then a steady 2.0 g/s for as long as the grinder runs, then
+# nothing again from the sample after the last one that added weight.  Everything in
+# between is reconstructed by the same zero-order hold that reconstructs the weight.
+EPISODE_N_FLOW = [
+    ("10:00:00.000000", "0.0"), ("10:00:10.200000", "2.0"), ("10:00:22.600000", "0.0"),
+]
+
+
+# O. Reconstructed.  The same 25.0 g on the scale and the same 40 s hold, reached the
+# other way: 22.0 g of espresso at 2.5 g/s, then the cup stands for 35 s while the
+# barista steams milk, then the last drops take it to 25.0 g.  Identical to N in mass,
+# in both range memberships and in being held well past 30 s — the only thing that
+# differs is that liquid was flowing into it, so this is the half of the rule that
+# must come back "yield".
+#
+# The 35 s pause is what makes the flow reach `peak_flow` at all: it banks 22.0 g as a
+# step, and the first samples of the resumed pour are still inside that step's plateau
+# while the scale reports 2.5 g/s.  Without the pause the whole pour would be one
+# uninterrupted ramp, the plateau would form only after everything had stopped moving,
+# and peak_flow would be 0.0 for a pour just as it is for a dose.
+EPISODE_O = ("2026-08-21", [
+    ("11:00:00.000000", "0.0"), ("11:00:10.000000", "0.5"), ("11:00:10.200000", "1.0"),
+    ("11:00:10.400000", "1.5"), ("11:00:10.600000", "2.0"), ("11:00:10.800000", "2.5"),
+    ("11:00:11.000000", "3.0"), ("11:00:11.200000", "3.5"), ("11:00:11.400000", "4.0"),
+    ("11:00:11.600000", "4.5"), ("11:00:11.800000", "5.0"), ("11:00:12.000000", "5.5"),
+    ("11:00:12.200000", "6.0"), ("11:00:12.400000", "6.5"), ("11:00:12.600000", "7.0"),
+    ("11:00:12.800000", "7.5"), ("11:00:13.000000", "8.0"), ("11:00:13.200000", "8.5"),
+    ("11:00:13.400000", "9.0"), ("11:00:13.600000", "9.5"), ("11:00:13.800000", "10.0"),
+    ("11:00:14.000000", "10.5"), ("11:00:14.200000", "11.0"), ("11:00:14.400000", "11.5"),
+    ("11:00:14.600000", "12.0"), ("11:00:14.800000", "12.5"), ("11:00:15.000000", "13.0"),
+    ("11:00:15.200000", "13.5"), ("11:00:15.400000", "14.0"), ("11:00:15.600000", "14.5"),
+    ("11:00:15.800000", "15.0"), ("11:00:16.000000", "15.5"), ("11:00:16.200000", "16.0"),
+    ("11:00:16.400000", "16.5"), ("11:00:16.600000", "17.0"), ("11:00:16.800000", "17.5"),
+    ("11:00:17.000000", "18.0"), ("11:00:17.200000", "18.5"), ("11:00:17.400000", "19.0"),
+    ("11:00:17.600000", "19.5"), ("11:00:17.800000", "20.0"), ("11:00:18.000000", "20.5"),
+    ("11:00:18.200000", "21.0"), ("11:00:18.400000", "21.5"), ("11:00:18.600000", "22.0"),
+    ("11:00:25.000000", "22.0"), ("11:00:40.000000", "22.0"), ("11:00:53.600000", "22.0"),
+    # the last drops
+    ("11:00:53.800000", "22.5"), ("11:00:54.000000", "23.0"), ("11:00:54.200000", "23.5"),
+    ("11:00:54.400000", "24.0"), ("11:00:54.600000", "24.5"), ("11:00:54.800000", "25.0"),
+    ("11:01:00.000000", "25.0"), ("11:01:15.000000", "25.0"), ("11:01:34.800000", "25.0"),
+    # cup lifted, BLE drops — episode F's transient, as in K, L and M
+    ("11:01:35.000000", "-9.6"), ("11:01:35.200000", "-92.8"), ("11:01:35.400000", "-99.8"),
+    ("11:01:35.600000", "-99.9"), ("11:01:36.400000", "-28.3"), ("11:01:36.600000", "353.1"),
+    ("11:01:36.800000", "728.1"), ("11:01:37.000000", "815.2"),
+    ("11:01:37.200000", "unavailable"),
+])
+
+# Two bursts of 2.5 g/s with the pause between them, each starting at the first sample
+# whose weight step makes the rate measurable and ending at the sample after the last
+# one that moved.  The second burst is the one the tiebreak reads.
+EPISODE_O_FLOW = [
+    ("11:00:00.000000", "0.0"), ("11:00:10.200000", "2.5"), ("11:00:18.800000", "0.0"),
+    ("11:00:53.800000", "2.5"), ("11:00:55.000000", "0.0"),
+]
+
+
 def write(path: Path, rows: list[dict]) -> None:
     rows.sort(key=lambda r: r["ts"])
     with path.open("w", newline="") as fh:
@@ -634,14 +1009,26 @@ def write(path: Path, rows: list[dict]) -> None:
 
 
 def as_rows(
-    date: str, samples: list[tuple[str, str]], shift_h: int = 0, shift_m: int = 0
+    date: str,
+    samples: list[tuple[str, str]],
+    shift_h: int = 0,
+    shift_m: int = 0,
+    entity: str = WEIGHT,
 ) -> list[dict]:
+    """Turn an episode's ``(clock, value)`` pairs into recorder rows.
+
+    ``entity`` is what lets a flow track be written alongside a weight track: same
+    date, same clock arithmetic, same shift, only the entity id differs, so a flow
+    sample lands on exactly the timestamp of the weight sample it was measured from.
+    Concatenate the two calls' output and hand it to ``write``, which sorts by
+    timestamp and so interleaves them the way the recorder would have.
+    """
     out = []
     for clock, value in samples:
         hh, mm, rest = clock.split(":", 2)
         minutes = int(hh) * 60 + int(mm) + shift_h * 60 + shift_m
         stamp = f"{minutes // 60:02d}:{minutes % 60:02d}:{rest}"
-        out.append({"entity_id": WEIGHT, "ts": f"{date}T{stamp}+03:00", "state": value})
+        out.append({"entity_id": entity, "ts": f"{date}T{stamp}+03:00", "state": value})
     return out
 
 
@@ -686,6 +1073,27 @@ def main() -> None:
 
     # Two dose candidates one after the other, separated only by how they arrived.
     write(here / "two_doses.csv", as_rows(*EPISODE_J))
+
+    # The three gap fixtures.  Nothing above this line contains a discontinuity
+    # anywhere but at its very last row, so until these existed the gap branch of
+    # feed() was never executed by the suite at all.
+    write(here / "gap_pour.csv", as_rows(*EPISODE_K))
+    write(here / "gap_dose.csv", as_rows(*EPISODE_L))
+    write(here / "topped_up.csv", as_rows(*EPISODE_M))
+
+    # The two overlap fixtures, and the only ones that carry the flow entity.  Same
+    # 25.0 g held past 30 s in both, so the tiebreak in classify has nothing to go on
+    # but the flow — which is the point, and which is also why they have to be two
+    # files and not one cycle: a dose waiting to be paired short-circuits the flow
+    # branch before it is ever reached.
+    write(
+        here / "overlap_dose.csv",
+        as_rows(*EPISODE_N) + as_rows(EPISODE_N[0], EPISODE_N_FLOW, entity=FLOW),
+    )
+    write(
+        here / "overlap_pour.csv",
+        as_rows(*EPISODE_O) + as_rows(EPISODE_O[0], EPISODE_O_FLOW, entity=FLOW),
+    )
 
 
 if __name__ == "__main__":

@@ -49,9 +49,13 @@
           "pair_window_seconds": "Maximum dose-to-pour gap (s)",
           "ratio_min": "Implausible below ratio",
           "ratio_max": "Implausible above ratio",
+          "gap_reset_seconds": "Treat a hole in the stream as a break after (s)",
           "record_dataset": "Record detections to difluid_brew_dataset.jsonl"
         }
       }
+    },
+    "error": {
+      "invalid_range_order": "A minimum is above its maximum. Dose, yield and ratio each need minimum ≤ maximum, or the detector can never match anything."
     },
     "abort": {
       "no_options": "The R2 has no detector settings — open the scale's entry instead."

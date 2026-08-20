@@ -109,6 +109,78 @@ def weight_readings(rows: list[dict]):
             continue
 
 
+def flow_readings(rows: list[dict]) -> list[tuple[float, float]]:
+    """Collect ``(t, flow)`` for the flow entity, oldest first.
+
+    Separate from the weight entity because that is how the recorder stores it: two
+    entities updated from one BLE packet, written to the state machine microseconds
+    apart and therefore never landing on identical timestamps.  Keeping the readings
+    as an ordered list rather than a dict keyed on the exact instant is what makes
+    `with_flow` able to hold a value forward instead of demanding an exact match —
+    see there for why matching exactly is a trap.
+    """
+    out: list[tuple[float, float]] = []
+    for row in rows:
+        if not row["entity_id"].endswith(FLOW_SUFFIX):
+            continue
+        try:
+            out.append((parse_ts(row["ts"]), float(row["state"])))
+        except ValueError:
+            continue
+    return out
+
+
+def with_flow(stream, flows: list[tuple[float, float]]):
+    """Attach to each ``(t, weight)`` the flow rate that was current at ``t``.
+
+    Production reads weight and flow out of the same notification and hands both to
+    the detector together, so every sample it sees carries a flow rate.  Offline the
+    two arrive as separate entities, change-point-only like everything else the
+    recorder stores, and the reconstruction is the same zero-order hold that
+    `zero_order_hold` applies to weight: the last reported flow stands until the next
+    one, including across the filler samples, which have no flow row of their own by
+    construction.
+
+    Held forward rather than looked up by exact timestamp.  An exact match is the
+    same class of defect as ZOH_PERIOD was: it appears to work — the code reads the
+    flow entity, the fixture contains flow rows — while in fact almost never firing,
+    because a filler sample lands on prev_t + ZOH_PERIOD and a real recorder writes
+    the two entities a few microseconds apart.  Every flow would then silently read
+    0.0 offline while production varied it, and the peak_flow tiebreak in
+    brew_detect.classify would be exercised by nothing.
+
+    Carried across an ``unavailable`` break on purpose.  The recorder stores change
+    points, so if the flow really did change while the link was down there is a row
+    at the far side saying so; if there is none, the value genuinely did not change
+    and holding it is the honest reconstruction.
+    """
+    held = 0.0
+    idx = 0
+    for t, weight in stream:
+        while idx < len(flows) and flows[idx][0] <= t:
+            held = flows[idx][1]
+            idx += 1
+        yield t, weight, held
+
+
+def format_rise(plateau) -> str:
+    """Render ``rise_seconds`` for a human, keeping unknown distinct from zero.
+
+    ``None`` and ``0.0`` are opposite findings, not two spellings of one — see the
+    field's own comment in brew_detect — and which of the two a candidate carries is
+    what decides whether BrewPairer prefers it, so anyone reading this output to work
+    out why the wrong dose won has to be able to tell them apart at a glance.
+    Coercing None to 0.0 to keep the format string happy would erase exactly the
+    distinction the column exists to show, and would do it silently.
+
+    "unknown" is seven characters, the same width as ``f"{x:5.1f} s"``, so the
+    columns either side of it stay lined up.
+    """
+    if plateau.rise_seconds is None:
+        return "unknown"
+    return f"{plateau.rise_seconds:5.1f} s"
+
+
 def load_rows(path: str) -> list[dict]:
     with open(path, newline="") as fh:
         rows = list(csv.DictReader(fh))
@@ -144,15 +216,8 @@ def main() -> int:
     pairer = BrewPairer(cfg)
 
     rows = load_rows(args.csv_path)
-    flow_by_time: dict[float, float] = {}
-    for row in rows:
-        if row["entity_id"].endswith(FLOW_SUFFIX):
-            try:
-                flow_by_time[parse_ts(row["ts"])] = float(row["state"])
-            except ValueError:
-                continue
+    flows = flow_readings(rows)
 
-    last_flow = 0.0
     plateaus = 0
     pairs = 0
 
@@ -161,7 +226,7 @@ def main() -> int:
         if args.verbose or kind != "other":
             print(
                 f"{stamp}  {kind:>5}  {plateau.value:7.1f} g  "
-                f"hold {plateau.duration:5.1f} s  rise {plateau.rise_seconds:5.1f} s  "
+                f"hold {plateau.duration:5.1f} s  rise {format_rise(plateau)}  "
                 f"peak flow {plateau.peak_flow:4.1f}"
             )
         if pair is not None:
@@ -170,13 +235,12 @@ def main() -> int:
                 f"ratio 1:{pair.ratio:.2f}"
             )
 
-    for ts, weight in zero_order_hold(weight_readings(rows)):
+    for ts, weight, flow in with_flow(zero_order_hold(weight_readings(rows)), flows):
         if weight is None:
             closed = detector.flush()
             detector.reset()
         else:
-            last_flow = flow_by_time.get(ts, last_flow)
-            closed = detector.feed(Sample(t=ts, weight=weight, flow=last_flow))
+            closed = detector.feed(Sample(t=ts, weight=weight, flow=flow))
         if closed is not None:
             plateaus += 1
             kind, pair = pairer.offer(closed)

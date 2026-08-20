@@ -208,6 +208,100 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
 
 # ── options: brew detector thresholds ─────────────────────────────────────────
 
+#: Error surfaced when the entered values are individually in range but describe
+#: a band that runs backwards (see _misordered_pairs).
+ERROR_RANGE_ORDER = "invalid_range_order"
+
+#: Accepted range for every tunable, as (min, max) inclusive.
+#:
+#: Without this the form took any float at all, and some of them are not merely
+#: badly tuned but arithmetically impossible.  ``stable_seconds = 0`` is the worst
+#: of them: brew_detect divides the held time by it on every single sample, so a
+#: zero there raises ZeroDivisionError roughly five times a second for as long as
+#: the scale stays connected, and BrewSession.feed swallows each one — a dead
+#: detector, a flooded log, and nothing anywhere in the UI to say so.
+#:
+#: The bounds are deliberately much wider than any sensible brew setup.  This is a
+#: guard against the nonsensical, not an opinion about how anyone should tune their
+#: detector: masses cannot be negative, seconds and divisors must be positive, and a
+#: fraction of a window is by definition between 0 and 1.  Mass ceilings are kept at
+#: DetectorConfig.max_mass (500 g), above which the detector treats the reading as a
+#: cup being lifted rather than as something being weighed, so a threshold beyond it
+#: could never match anything.
+_OPTION_RANGES: dict[str, tuple[float, float]] = {
+    # Grams around the window median.  Must be > 0 or nothing is ever "within
+    # tolerance" and no reading can stabilise; the Hampel prefilter also uses it as
+    # its noise floor, where zero would restore the bug that split a bowl of oats.
+    "stable_tol": (0.01, 50.0),
+    # Divisor in `held / cfg.stable_seconds` — see the note above.
+    "stable_seconds": (0.5, 60.0),
+    # A share of the stability window, so 0-1 by construction.  The floor is not
+    # zero because a fraction of zero makes every reading "stable" instantly,
+    # including the middle of a pour.
+    "stable_time_fraction": (0.05, 1.0),
+    # A hold time, so any non-negative value is arithmetically fine; zero just means
+    # a value seen for a single sample before the lift is accepted.
+    "settle_min_seconds": (0.0, 60.0),
+    "min_mass": (0.0, 500.0),
+    "dose_min": (0.0, 500.0),
+    "dose_max": (0.0, 500.0),
+    "dose_min_hold_seconds": (0.0, 3600.0),
+    "dose_min_rise_seconds": (0.0, 3600.0),
+    "yield_min": (0.0, 500.0),
+    "yield_max": (0.0, 500.0),
+    # Nothing forces an upper bound here beyond keeping a typo from pairing a dose
+    # with a pour from a different day; 24 h is the generous end of that.
+    "pair_window_seconds": (1.0, 86400.0),
+    # Ratios are yield/dose, so strictly positive.  1:50 is far past anything
+    # drinkable and still leaves room for someone metering a very long brew.
+    "ratio_min": (0.01, 50.0),
+    "ratio_max": (0.01, 50.0),
+    # How long a hole in the stream has to be before the detector discards state.
+    # Must be > 0: at zero every sample looks like a discontinuity and the detector
+    # resets itself before it can ever accumulate a window.
+    "gap_reset_seconds": (0.5, 3600.0),
+}
+
+#: Bounds used for a tunable that brew_detect exposes but this table does not know
+#: about yet.  Every field in DetectorConfig is a mass, a duration or a ratio, and
+#: none of those is ever negative, so a non-negative floor is a safe default that
+#: still keeps a new field from being validated as "anything at all" the moment it
+#: is added to TUNABLE_FIELDS.
+_FALLBACK_RANGE = (0.0, 86400.0)
+
+#: Pairs the detector reads as a band, low first.  brew_detect compares against them
+#: with `low <= v <= high` (classify) and `ratio_min <= ratio <= ratio_max`
+#: (BrewPairer.offer), so a band entered backwards is not a bad tuning — it is a
+#: band that nothing can ever fall into, and the detector goes quiet with no
+#: complaint from anywhere.  Individual vol.Range checks cannot catch this because
+#: each value on its own is perfectly legal.
+_ORDERED_PAIRS: tuple[tuple[str, str], ...] = (
+    ("dose_min", "dose_max"),
+    ("yield_min", "yield_max"),
+    ("ratio_min", "ratio_max"),
+)
+
+
+def _field_validator(key: str):
+    """voluptuous validator for one tunable: coerce to float, then bounds-check."""
+    low, high = _OPTION_RANGES.get(key, _FALLBACK_RANGE)
+    return vol.All(vol.Coerce(float), vol.Range(min=low, max=high))
+
+
+def _misordered_pairs(values: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return the bands in `values` whose low bound is above its high bound."""
+    bad: list[tuple[str, str]] = []
+    for low_key, high_key in _ORDERED_PAIRS:
+        if low_key not in values or high_key not in values:
+            continue
+        try:
+            if float(values[low_key]) > float(values[high_key]):
+                bad.append((low_key, high_key))
+        except (TypeError, ValueError):
+            # Coercion already failed for this field; vol reports that itself.
+            continue
+    return bad
+
 
 class DifluidOptionsFlow(OptionsFlow):
     """Tune the dose/pour detector without editing code or redeploying.
@@ -221,20 +315,44 @@ class DifluidOptionsFlow(OptionsFlow):
         if self.config_entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_R2:
             return self.async_abort(reason="no_options")
 
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+        errors: dict[str, str] = {}
+        # What the form should show.  Normally the stored options; after a rejected
+        # submission the rejected input instead, so the offending value is still on
+        # screen to be corrected rather than silently reverting to the old one.
+        current: dict[str, Any] = dict(self.config_entry.options)
 
-        current = self.config_entry.options
+        if user_input is not None:
+            bad = _misordered_pairs(user_input)
+            if not bad:
+                return self.async_create_entry(title="", data=user_input)
+            errors["base"] = ERROR_RANGE_ORDER
+            # Also flag the individual fields, so the pair at fault is obvious on a
+            # form with fourteen numbers on it.
+            for low_key, high_key in bad:
+                errors[low_key] = ERROR_RANGE_ORDER
+                errors[high_key] = ERROR_RANGE_ORDER
+            current = dict(user_input)
+
         defaults = DetectorConfig()
         schema: dict[Any, Any] = {}
         for key in TUNABLE_FIELDS:
+            default = getattr(defaults, key, None)
+            if default is None:
+                # TUNABLE_FIELDS names something DetectorConfig does not have.  The
+                # two are kept side by side precisely so they cannot drift, but a
+                # half-applied edit there must not take the whole options form down
+                # with an AttributeError — the form is the only way to undo a bad
+                # threshold.
+                continue
             schema[
-                vol.Optional(key, default=current.get(key, getattr(defaults, key)))
-            ] = vol.Coerce(float)
+                vol.Optional(key, default=current.get(key, default))
+            ] = _field_validator(key)
         schema[
             vol.Optional(
                 CONF_RECORD_DATASET, default=current.get(CONF_RECORD_DATASET, False)
             )
         ] = bool
 
-        return self.async_show_form(step_id="init", data_schema=vol.Schema(schema))
+        return self.async_show_form(
+            step_id="init", data_schema=vol.Schema(schema), errors=errors
+        )
