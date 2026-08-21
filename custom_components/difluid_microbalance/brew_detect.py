@@ -126,7 +126,28 @@ class DetectorConfig:
     # compares candidates within a cycle instead.  No equivalent floor applies to
     # the pour: it is held only as long as it takes to lift the cup (5 s in one
     # recorded shot).
-    dose_min_hold_seconds: float = 10.0
+    #
+    # Was 10 s until 2026-08-21, which is a floor against momentary taps in the
+    # comment and something else entirely in practice.  That morning the beans were
+    # weighed for 7.2 s — an ordinary weighing, nothing stalled or snatched — so the
+    # 18.2 g was labelled "other", nothing was pending when the pour arrived, and a
+    # complete brew was dropped without a trace.  The failure mode is the bad one:
+    # silent, and indistinguishable from the scale simply not having been used.
+    #
+    # 3 s is the honest reading of what this field is for.  It is stable_seconds, the
+    # shortest span that can become a plateau at all, so it still rejects a tap while
+    # asserting nothing about how long a person chooses to leave beans on a scale.
+    # Every hold above it is a candidate and the choosing happens in BrewPairer, which
+    # is where the comment above already said it happens.
+    #
+    # The cost is real and worth naming: a 12-25 g object set down for seven seconds
+    # is now a dose candidate where it used to be filtered out here.  Alone in a cycle
+    # it can mispair, and _arrival_rank only sorts candidates against each other, it
+    # never rejects a lone one.  That is the trade — a wrong ratio is visible in the
+    # email and can be argued with, a dropped brew is not.  See short_dose.csv, which
+    # is the only fixture that constrains this value: at 3, 5 or 10 s every other file
+    # in testdata/ stays green.
+    dose_min_hold_seconds: float = 3.0
 
     # How long a load must have taken to arrive for it to count as ground onto the
     # scale rather than set down on it.  Beans accumulate while the grinder runs;

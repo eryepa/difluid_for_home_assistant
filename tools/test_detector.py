@@ -156,6 +156,11 @@ def main() -> int:
     )
 
     print("\nsynthetic_pair.csv — same waveforms re-timed into one brew cycle")
+    # Three rival dose candidates now, not two: dropping dose_min_hold_seconds to 3 s
+    # for short_dose.csv also let the 18.2 g through here, where 10 s had filtered it
+    # out as "other".  That is the cost of the lower floor made visible, and this block
+    # is where it gets priced — the pair below must still be the beans.  It is, on this
+    # fixture and on snatched.csv, which are the only other captures the change moved.
     events, pairs = run(HERE / "testdata" / "synthetic_pair.csv")
     ok &= check("exactly one pair", len(pairs) == 1, f"{len(pairs)}")
     if pairs:
@@ -564,6 +569,43 @@ def main() -> int:
     ok &= check("the ground-on 25.0 g is still a dose", ("dose", 25.0) in events, str(events))
     events, _ = run(HERE / "testdata" / "overlap_pour.csv", config=widened)
     ok &= check("the poured 25.0 g is still a yield", ("yield", 25.0) in events, str(events))
+
+    # The morning of 2026-08-21, whole and unedited: a real brew that reported nothing.
+    #
+    # This is the only fixture that constrains dose_min_hold_seconds.  Replaying every
+    # other file in this directory with that threshold at 3, 5 or 10 seconds leaves all
+    # of them green, so before this capture existed the rule was carried by its comment
+    # alone — and the comment said it was a floor against momentary taps while the value
+    # was rejecting a seven-second weighing of beans.
+    #
+    # The assertions below are deliberately about the whole cycle rather than the
+    # threshold: what broke was not "18.2 g scored wrong", it was a morning's coffee
+    # going unrecorded.  Assert the brew, and the threshold is covered as a consequence.
+    print("\nshort_dose.csv — the 2026-08-21 brew that sent no email")
+    events, pairs, weighings = run(HERE / "testdata" / "short_dose.csv", detail=True)
+    dose_w = next((w for w in weighings if 12.0 <= w.value <= 25.0), None)
+    ok &= check(
+        "the beans stood well under the ten seconds the shipped floor used to demand",
+        dose_w is not None and dose_w.duration < 10.0,
+        f"{round(dose_w.duration, 2) if dose_w else None} s",
+    )
+    ok &= check(
+        "and are a dose anyway — a hold this short is a habit, not a portafilter",
+        ("dose", 18.2) in events,
+        str(events),
+    )
+    ok &= check("the pour is the 40.5 g that stood when the cup left", ("yield", 40.5) in events, str(events))
+    ok &= check("one pair", len(pairs) == 1, str(len(pairs)))
+    ok &= check(
+        "pair is dose 18.2 g / yield 40.5 g, ratio about 1:2.23",
+        bool(pairs) and (pairs[0].dose, pairs[0].yield_g) == (18.2, 40.5),
+        f"dose {pairs[0].dose} yield {pairs[0].yield_g} ratio {pairs[0].ratio:.3f}" if pairs else "no pair",
+    )
+    ok &= check(
+        "the -35 g portafilter resting on the scale never became an event of its own",
+        not any(v < 0 for _, v in events),
+        str(events),
+    )
 
     print("\nOK" if ok else "\nFAILED")
     return 0 if ok else 1
