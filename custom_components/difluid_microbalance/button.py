@@ -123,12 +123,14 @@ class ResetPeriodButton(ButtonEntity):
     reachable for about five minutes a day, none of them the moment somebody decides to
     start a new month.  Same reasoning as DifluidBrewSensor.available.
 
-    No entity_category: the other two are CONFIG because they configure the scale, and
-    this configures nothing — it belongs with the statistics it resets, which carry no
-    category either.
+    DIAGNOSTIC, matching the statistics it resets.  Not because resetting a period is
+    diagnostic work, but because without a category this button is the only entity the
+    scale has that lands in the device page's Controls card — and one button is enough
+    to make that card appear.  Categorising it removes the card entirely.
     """
 
     _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_name = "Reset Period"
     _attr_icon = "mdi:backup-restore"
     _attr_should_poll = False

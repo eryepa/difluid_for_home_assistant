@@ -22,24 +22,25 @@ const CONTROL_ORDER = [
 // Control entities to hide from the card (still available on the device page).
 const EXCLUDE_CONTROLS = ["auto_disconnect", "auto_shutdown"];
 
-// The Statistics section, in display order: two odometers, two trip meters, two
-// daily rates, then the reset.  Matched as entity_id substrings, the same way every
-// other list in this file is — reading `entity_category` off `hass.entities` would
-// work today but is frontend internals, and gains nothing here.
+// The Statistics section, in display order: each quantity reads total -> period ->
+// per day, so a column of numbers can be scanned down rather than hunted through.
 //
-// Order matters and is not alphabetical: each pair reads total -> period -> per day,
-// so a column of numbers can be scanned down rather than hunted through.
+// These are entity_id *suffixes*, and they are not the `key` of the sensor
+// description they came from: entity_ids are built from the display name, so
+// key="coffee_total" name="Coffee Ground" produces `..._coffee_ground`.  Writing the
+// keys here is what put Coffee Ground and Coffee Ground (Period) in among the weight
+// and the flow rate — they matched nothing, and unmatched entities fall through to
+// the plain sensor list.
 const STATS_ORDER = [
-  "brew_count_period", "brews_per_day",
-  "coffee_total", "coffee_period", "coffee_per_day",
+  "brew_count", "brew_count_period", "brews_per_day",
+  "coffee_ground", "coffee_ground_period", "coffee_per_day",
   "reset_period",
 ];
-// "brew_count" is a prefix of "brew_count_period", so it cannot be matched by
-// substring alongside it — it is placed first explicitly.
-const STATS_FIRST = "brew_count";
 
 // The working parts of the last shot.  Present but folded away: useful when a result
-// looks wrong, noise every other day.  Mirrors where they now sit on the device page.
+// looks wrong, noise every other day.  On the device page these share the Diagnostic
+// card with the statistics above, because HA has nowhere else to put either; the split
+// between the two exists only here.
 const DIAG_ORDER = [
   "brew_dose", "brew_yield", "brew_ratio",
   "last_dose", "last_yield",
@@ -59,11 +60,22 @@ const inList = (entityId, list) => {
   return list.some((key) => id.includes(key));
 };
 
-const isStat = (entityId) =>
-  idPart(entityId).endsWith(STATS_FIRST) || inList(entityId, STATS_ORDER);
+// Statistics match on the end of the entity_id rather than anywhere inside it, which
+// the other lists here can afford to do because none of their keys is a prefix of
+// another.  "brew_count" is a prefix of "brew_count_period" and "coffee_ground" of
+// "coffee_ground_period": under a substring match each pair collapses to a single
+// rank, the sort has nothing left to decide, and the row order falls back to
+// hass.entities iteration order — the order the entities were registered in.  That
+// happens to read correctly today, which is worse than reading wrongly: it would go
+// wrong the first time a fresh install registered them in another order.
+const statRank = (entityId) => {
+  const id = idPart(entityId);
+  for (let i = 0; i < STATS_ORDER.length; i++)
+    if (id.endsWith(STATS_ORDER[i])) return i;
+  return -1;
+};
 
-const statRank = (entityId) =>
-  idPart(entityId).endsWith(STATS_FIRST) ? -1 : rank(entityId, STATS_ORDER);
+const isStat = (entityId) => statRank(entityId) >= 0;
 
 class DifluidCard extends HTMLElement {
   setConfig(config) {

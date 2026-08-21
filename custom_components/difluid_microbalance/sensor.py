@@ -267,9 +267,16 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
     ),
     # ── statistics ────────────────────────────────────────────────────────────
     # An odometer, a trip meter and a daily rate for each of two quantities: cups
-    # drunk and coffee ground.  These deliberately carry no entity_category, which
-    # is what keeps them in the plain Sensors section of the device page while the
-    # five above move to Diagnostic.
+    # drunk and coffee ground.
+    #
+    # All six carry entity_category=DIAGNOSTIC so that the device page's Sensors card
+    # holds only what the scale is reading right now — weight, flow, timer, battery,
+    # status.  Diagnostic is not a judgement about these numbers; it is the only place
+    # they can go.  That page renders exactly four cards, and which one an entity lands
+    # in is computed from its domain plus entity_category: a sensor with no category
+    # goes to Sensors, and Controls exists only for domains you can operate.  There is
+    # no "Statistics" card to ask for and no way to order the cards — that grouping
+    # lives in the difluid-card instead, where the markup is ours.
     #
     # Brew Count is the cups odometer and is not duplicated: "cups, all time" is
     # already this number, and a second sensor reporting it would be a second answer
@@ -280,6 +287,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         name="Brew Count",
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:counter",
+        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: s.brew_count,
         attrs_fn=lambda s: {
             # The average dose over the whole odometer, which is only meaningful once
@@ -297,6 +305,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         name="Brew Count (Period)",
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:counter",
+        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: s.totals.period_brews(s.brew_count),
         attrs_fn=lambda s: _period_attrs(s),
     ),
@@ -307,6 +316,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         native_unit_of_measurement="cups/d",
         suggested_display_precision=2,
         icon="mdi:chart-line",
+        entity_category=EntityCategory.DIAGNOSTIC,
         ticks=True,
         value_fn=lambda s: s.totals.per_day(
             s.totals.period_brews(s.brew_count), dt_util.utcnow().timestamp()
@@ -325,6 +335,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfMass.GRAMS,
         suggested_display_precision=0,
         icon="mdi:coffee-maker",
+        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: s.totals.total_dose_g,
         # counting_since exists because this odometer and Brew Count do not start
         # level: the count has been running since the counter was added, while nobody
@@ -347,6 +358,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfMass.GRAMS,
         suggested_display_precision=0,
         icon="mdi:coffee-maker-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: s.totals.period_dose_g(),
         attrs_fn=lambda s: _period_attrs(s),
     ),
@@ -357,6 +369,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         native_unit_of_measurement="g/d",
         suggested_display_precision=1,
         icon="mdi:chart-line",
+        entity_category=EntityCategory.DIAGNOSTIC,
         ticks=True,
         value_fn=lambda s: s.totals.per_day(
             s.totals.period_dose_g(), dt_util.utcnow().timestamp()
