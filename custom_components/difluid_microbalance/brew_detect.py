@@ -237,6 +237,140 @@ def config_from_options(options: dict) -> DetectorConfig:
     return cfg
 
 
+#: Denominator of every per-day figure below.  Named rather than inlined because the
+#: two call sites must not drift, and because 86400 on its own reads as a magic number.
+SECONDS_PER_DAY = 86400.0
+
+
+@dataclass
+class BrewTotals:
+    """Cumulative brew statistics: an odometer, a trip meter, and a daily rate.
+
+    Lives here rather than in brew_session for the same reason everything else in this
+    module does — no Home Assistant imports, so the arithmetic can be exercised offline
+    in test_detector.py instead of only by watching the dashboard for a week.
+
+    Only the *odometers* are stored.  The trip figures are derived by subtracting a
+    snapshot taken at the last reset, and that is the whole design: a second counter
+    with its own ``+= 1`` can fall out of step with the first — one missed event, one
+    field that failed to restore — and once it has, nothing brings the two back
+    together.  Subtraction cannot disagree with the number it subtracts from.  It is
+    also literally how a car's trip meter works, which is what was asked for.
+
+    The count of brews is deliberately *not* a field here.  BrewSession.brew_count
+    already owns it and feeds a TOTAL_INCREASING sensor whose accidental reset is
+    permanent (see BrewSession.async_load); a copy kept alongside would be a second
+    answer to a question that must only have one.  The methods that need it take it as
+    an argument.
+    """
+
+    #: Grams of coffee ground, all time.  Counts only doses that became a pair — a
+    #: dose with no pour after it is either an aborted brew or a misdetection, and
+    #: either way no cup came of it.  So this and brew_count always describe the same
+    #: population, and dividing one by the other gives the average dose.
+    total_dose_g: float = 0.0
+    #: When the current period began, POSIX.  0.0 means "never started", which is what
+    #: state stored by a version before this field looks like; the session seeds it on
+    #: load.  Not defaulted to the epoch: a period that began in 1970 would report a
+    #: daily average of zero forever, and would do it without looking wrong.
+    period_started: float = 0.0
+    #: The two odometers as they read at the last reset.  Trip = now minus these.
+    brews_at_period_start: int = 0
+    dose_at_period_start: float = 0.0
+
+    def add(self, dose_g: float) -> None:
+        """Record one completed brew's dose against the odometer.
+
+        Rounded on every step rather than once at the end: the odometer is written to
+        Store and read back thousands of times over its life, and unrounded float
+        addition would let it drift into 1234.5600000000002 and publish that.
+        """
+        self.total_dose_g = round(self.total_dose_g + float(dose_g), 2)
+
+    def reset_period(self, now: float, brew_count: int) -> None:
+        """Start a new period — the trip-meter button.
+
+        Snapshots the odometers instead of zeroing anything, so a reset can never cost
+        a brew: the all-time figures are untouched by construction, not by care.
+        """
+        self.period_started = now
+        self.brews_at_period_start = brew_count
+        self.dose_at_period_start = self.total_dose_g
+
+    def period_brews(self, brew_count: int) -> int:
+        """Brews since the last reset.
+
+        Clamped at zero.  The subtraction can only go negative if the stored snapshot
+        outruns the counter — a half-restored Store, or a brew_count that was reset to
+        0 by the recovery path in BrewSession.  A negative count on a TOTAL_INCREASING
+        sensor is not a number anyone can act on, and zero at least says "the period
+        has nothing in it yet", which after that kind of failure is true.
+        """
+        return max(0, brew_count - self.brews_at_period_start)
+
+    def period_dose_g(self) -> float:
+        return max(0.0, round(self.total_dose_g - self.dose_at_period_start, 2))
+
+    def elapsed_days(self, now: float) -> float:
+        """Length of the current period in days, floored at one.
+
+        The floor is what keeps the first morning honest.  Two cups three hours after a
+        reset is 0.125 days, and dividing by that publishes "16 brews per day" — an
+        extrapolation from a single morning, printed with the same authority as a
+        figure averaged over a month.  Flooring reports 2/day on day one and converges
+        to the truth as the period grows, which is the direction an average should
+        approach from.
+        """
+        return max((now - self.period_started) / SECONDS_PER_DAY, 1.0)
+
+    def per_day(self, value: float, now: float) -> float:
+        """`value` averaged over the current period."""
+        return round(value / self.elapsed_days(now), 2)
+
+    #: How each field is coerced when read back out of storage.  Spelled out rather
+    #: than derived from ``dataclasses.fields``: under ``from __future__ import
+    #: annotations`` a field's ``type`` is the *string* "float", not the callable.
+    #: Adding a field to this dataclass means adding it here — test_detector.py fails
+    #: if the two ever disagree, because a field missing from this map would be
+    #: silently dropped on every restart and the symptom is an odometer that appears
+    #: to reset itself.
+    STORED_FIELDS = {
+        "total_dose_g": float,
+        "period_started": float,
+        "brews_at_period_start": int,
+        "dose_at_period_start": float,
+    }
+
+    @classmethod
+    def from_stored(cls, stored: object) -> tuple["BrewTotals", list[tuple[str, object]]]:
+        """Rebuild from a stored dict, keeping every field that can still be read.
+
+        Deliberately forgiving, field by field, rather than ``cls(**stored)``: an
+        unknown key from a newer version, a missing key from an older one, or a single
+        unparseable value costs only that field instead of the whole odometer.  The
+        asymmetry against the other stored records is the point — for last_dose,
+        "drop it and wait for the next shot" is a complete recovery; for a cumulative
+        total it is not a recovery at all, and one field added in a later version
+        would otherwise be enough to wipe it.
+
+        Returns the totals plus the fields that could not be read, so the caller can
+        log them.  Reporting rather than logging keeps this module free of Home
+        Assistant and free of logging policy, and makes the behaviour testable.
+        """
+        totals = cls()
+        problems: list[tuple[str, object]] = []
+        if not isinstance(stored, dict):
+            return totals, problems
+        for name, coerce in cls.STORED_FIELDS.items():
+            if name not in stored:
+                continue
+            try:
+                setattr(totals, name, coerce(stored[name]))
+            except (TypeError, ValueError):
+                problems.append((name, stored[name]))
+        return totals, problems
+
+
 def _mad(values: list[float], centre: float) -> float:
     """Median absolute deviation — the scale-free spread Hampel needs."""
     return median([abs(v - centre) for v in values])

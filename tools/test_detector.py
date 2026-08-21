@@ -607,8 +607,149 @@ def main() -> int:
         str(events),
     )
 
+    ok &= check_totals()
+
     print("\nOK" if ok else "\nFAILED")
     return 0 if ok else 1
+
+
+def check_totals() -> bool:
+    """BrewTotals — the odometer, the trip meter and the daily rate.
+
+    Not a fixture: there is no stream involved, and none of this depends on the
+    detector.  It lives here because it is the only place the statistics arithmetic
+    can be executed without Home Assistant, which is the whole reason BrewTotals was
+    put in brew_detect rather than in brew_session next to the sensors that read it.
+
+    Every case below is one that produced a wrong number on paper while the design was
+    being written, not a restatement of the code.
+    """
+    print("\nBrewTotals — odometer, trip meter, daily rate")
+    ok = True
+    day = brew_detect.SECONDS_PER_DAY
+    t0 = 1_700_000_000.0  # fixed, so nothing here depends on when it is run
+
+    t = brew_detect.BrewTotals(period_started=t0)
+    for dose in (18.2, 17.9, 18.0):
+        t.add(dose)
+
+    ok &= check(
+        "the odometer is the plain sum of the doses",
+        t.total_dose_g == 54.1,
+        f"{t.total_dose_g} g",
+    )
+    ok &= check(
+        "float drift never reaches the stored value — 18.2 + 17.9 + 18.0 is not 54.099999",
+        repr(t.total_dose_g) == "54.1",
+        repr(t.total_dose_g),
+    )
+    ok &= check(
+        "an untouched period holds everything, because it began before any of it",
+        (t.period_brews(3), t.period_dose_g()) == (3, 54.1),
+        f"{t.period_brews(3)} brews / {t.period_dose_g()} g",
+    )
+
+    # Day one: three brews inside four hours.
+    ok &= check(
+        "day one reports 3/day, not the 18/day that extrapolating four hours gives",
+        t.per_day(t.period_brews(3), t0 + 4 * 3600) == 3.0,
+        str(t.per_day(t.period_brews(3), t0 + 4 * 3600)),
+    )
+    ok &= check(
+        "after ten days the same three brews average 0.3/day",
+        t.per_day(t.period_brews(3), t0 + 10 * day) == 0.3,
+        str(t.per_day(t.period_brews(3), t0 + 10 * day)),
+    )
+
+    # The reset, seven days in, with the odometers at 3 brews / 54.1 g.
+    t.reset_period(t0 + 7 * day, 3)
+    ok &= check(
+        "reset empties the trip meter",
+        (t.period_brews(3), t.period_dose_g()) == (0, 0.0),
+        f"{t.period_brews(3)} brews / {t.period_dose_g()} g",
+    )
+    ok &= check(
+        "and leaves both odometers exactly where they were",
+        t.total_dose_g == 54.1,
+        f"{t.total_dose_g} g",
+    )
+    ok &= check(
+        "an empty period averages zero rather than dividing by no days",
+        t.per_day(t.period_brews(3), t0 + 7 * day) == 0.0,
+        str(t.per_day(t.period_brews(3), t0 + 7 * day)),
+    )
+
+    t.add(18.0)
+    ok &= check(
+        "the next brew lands in both: trip 18 g, odometer 72.1 g",
+        (t.period_dose_g(), t.total_dose_g) == (18.0, 72.1),
+        f"trip {t.period_dose_g()} g / total {t.total_dose_g} g",
+    )
+    ok &= check(
+        "the trip count follows the odometer without a counter of its own",
+        t.period_brews(4) == 1,
+        str(t.period_brews(4)),
+    )
+
+    # brew_count going backwards is not hypothetical: BrewSession restarts it at 0
+    # when the stored value is unreadable, and the snapshot here would then outrun it.
+    ok &= check(
+        "a brew_count that fell behind the snapshot reads as an empty period, not a negative one",
+        (t.period_brews(0), t.per_day(t.period_brews(0), t0 + 8 * day)) == (0, 0.0),
+        str(t.period_brews(0)),
+    )
+
+    # ── the Store round-trip ──────────────────────────────────────────────────
+    # A field that is not in STORED_FIELDS is silently dropped on every restart, and
+    # the symptom is an odometer that appears to reset itself — a slow, quiet failure
+    # of exactly the number that cannot be rebuilt from anything else.
+    import dataclasses
+
+    declared = {f.name for f in dataclasses.fields(brew_detect.BrewTotals)}
+    stored_names = set(brew_detect.BrewTotals.STORED_FIELDS)
+    ok &= check(
+        "every field of BrewTotals is one that survives a restart",
+        declared == stored_names,
+        f"only in one of the two: {declared ^ stored_names or 'none'}",
+    )
+
+    round_tripped, problems = brew_detect.BrewTotals.from_stored(
+        dataclasses.asdict(t)
+    )
+    ok &= check(
+        "a clean snapshot comes back identical and complains about nothing",
+        (round_tripped, problems) == (t, []),
+        f"{round_tripped} / {problems}",
+    )
+
+    # Two versions apart in both directions, in one dict: an unknown key from a newer
+    # build, and total_dose_g absent as it is in every record written before this
+    # version.  Neither may cost the fields that are readable.
+    partial, problems = brew_detect.BrewTotals.from_stored(
+        {"period_started": t0, "brews_at_period_start": 5, "future_field": "?"}
+    )
+    ok &= check(
+        "an unknown key and a missing one cost nothing that was readable",
+        (partial.period_started, partial.brews_at_period_start, problems)
+        == (t0, 5, []),
+        f"{partial} / {problems}",
+    )
+
+    broken, problems = brew_detect.BrewTotals.from_stored(
+        {"total_dose_g": "not a number", "brews_at_period_start": 5}
+    )
+    ok &= check(
+        "one unreadable value is reported and does not take the rest of the record with it",
+        (broken.brews_at_period_start, [n for n, _ in problems]) == (5, ["total_dose_g"]),
+        f"{broken} / {problems}",
+    )
+
+    ok &= check(
+        "state with no totals at all — every record written before this version — loads as zeros",
+        brew_detect.BrewTotals.from_stored(None) == (brew_detect.BrewTotals(), []),
+        str(brew_detect.BrewTotals.from_stored(None)),
+    )
+    return ok
 
 
 if __name__ == "__main__":

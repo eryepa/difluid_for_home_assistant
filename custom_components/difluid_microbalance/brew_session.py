@@ -22,6 +22,7 @@ from .brew_detect import (
     BrewDetector,
     BrewPair,
     BrewPairer,
+    BrewTotals,
     DetectorConfig,
     Plateau,
     Sample,
@@ -132,12 +133,19 @@ class BrewSession:
         # that happen to land on the same ratio, and "the yield changed" fires for
         # anything at all put on the scale — it emailed about a bowl of porridge.
         self.brew_count: int = 0
+        # Odometer + trip meter.  brew_count stays the sole owner of the brew count;
+        # see BrewTotals for why the trip figures are derived rather than counted.
+        self.totals = BrewTotals()
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     async def async_load(self) -> None:
         data = await self._store.async_load()
         if not data:
+            # Nothing stored: this is a first install, so the period starts now rather
+            # than at the epoch.  Done here as well as below so that the two paths
+            # cannot disagree about what an unstarted period means.
+            self.totals.period_started = time.time()
             return
         # Every stored field is restored independently, and that is the whole point
         # of the four calls below rather than one try block around all of them.
@@ -156,6 +164,19 @@ class BrewSession:
         self.last_yield = self._restore(WeighEvent, data, "last_yield")
         self.last_pair = self._restore(BrewPair, data, "last_pair")
         self.brew_count = self._restore_count(data)
+        # Its own call for the same reason as brew_count's, and field-by-field rather
+        # than through _restore: the odometer of ground coffee cannot be rebuilt from
+        # anything else.  last_dose and last_pair are replaced by the next shot, so
+        # dropping one of those wholesale on a TypeError is cheap; dropping the
+        # odometer is permanent, and one field added to BrewTotals in a later version
+        # would be enough to do it.  _restore_totals keeps whatever it recognises.
+        self.totals = self._restore_totals(data)
+        if not self.totals.period_started:
+            # Either a first run, or state written before this field existed.  Starting
+            # the period now is the only defensible reading: the alternative — leaving
+            # it at 0.0 — makes elapsed_days ~20000 and publishes a daily average of
+            # zero indefinitely, which looks like a working sensor reporting no coffee.
+            self.totals.period_started = time.time()
 
     @staticmethod
     def _restore(factory, data: dict[str, Any], key: str):  # noqa: N805 - staticmethod
@@ -199,6 +220,25 @@ class BrewSession:
             return 0
         return count
 
+    @staticmethod
+    def _restore_totals(data: dict[str, Any]) -> BrewTotals:
+        """Rebuild the odometers, keeping every field that can still be read.
+
+        The recovery itself lives in BrewTotals.from_stored, which is pure and
+        therefore testable offline; this only turns what it could not read into log
+        lines.  Warning rather than debug for the same reason _restore does: a total
+        that quietly drops back to a default is indistinguishable from one that was
+        never counting.
+        """
+        totals, problems = BrewTotals.from_stored(data.get("totals"))
+        for name, value in problems:
+            _LOGGER.warning(
+                "Stored brew total %s is unreadable (%r); keeping its default of %r. "
+                "Cumulative figures will under-report from here",
+                name, value, getattr(totals, name),
+            )
+        return totals
+
     def apply_config(self, config: DetectorConfig, record_dataset: bool) -> None:
         """Swap thresholds at runtime — the options flow calls this."""
         self.cfg = config
@@ -223,6 +263,11 @@ class BrewSession:
         self.last_yield = None
         self.last_pair = None
         self.brew_count = 0
+        # A fresh period rather than BrewTotals(): this only runs when the config entry
+        # is deleted, and the next install must not inherit a period that started
+        # before it existed.  async_load reseeds it too, but only when there is no
+        # stored state to load — and there is none precisely because of the line below.
+        self.totals = BrewTotals(period_started=time.time())
         await self._store.async_remove()
 
     def add_listener(self, callback) -> None:
@@ -231,6 +276,24 @@ class BrewSession:
     def remove_listener(self, callback) -> None:
         if callback in self._listeners:
             self._listeners.remove(callback)
+
+    def reset_period(self) -> None:
+        """Start a new statistics period — what the Reset Period button calls.
+
+        Note what this does *not* touch: brew_count, totals.total_dose_g, or anything
+        the detector holds.  Only the trip snapshot moves, so a mis-pressed button
+        costs the period and nothing else.  Named apart from reset() above, which is
+        the BLE-disconnect path and an entirely different operation — the two must
+        never be confused at a call site.
+        """
+        self.totals.reset_period(time.time(), self.brew_count)
+        _LOGGER.info(
+            "Brew statistics period reset at %d brews / %.1f g total",
+            self.brew_count, self.totals.total_dose_g,
+        )
+        self._save()
+        for callback in list(self._listeners):
+            callback()
 
     def reset(self) -> None:
         """Stream broke — flush any finished weighing, then drop detector state.
@@ -407,6 +470,12 @@ class BrewSession:
         if pair is not None:
             self.last_pair = pair
             self.brew_count += 1
+            # Only paired doses count towards the odometer, so it and brew_count always
+            # describe the same population and total_dose_g / brew_count is the average
+            # dose.  A dose with no pour after it is an aborted brew or a misdetection;
+            # either way no cup came of it, and adding it would make the two disagree
+            # by an amount nothing records.
+            self.totals.add(pair.dose)
             _LOGGER.info(
                 "Brew pair: dose %.1f g -> yield %.1f g (1:%.2f)",
                 pair.dose, pair.yield_g, pair.ratio,
@@ -476,6 +545,7 @@ class BrewSession:
             "last_yield": asdict(self.last_yield) if self.last_yield else None,
             "last_pair": asdict(self.last_pair) if self.last_pair else None,
             "brew_count": self.brew_count,
+            "totals": asdict(self.totals),
         }
 
     def _append_dataset(

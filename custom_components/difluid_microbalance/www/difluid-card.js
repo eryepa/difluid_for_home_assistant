@@ -22,11 +22,48 @@ const CONTROL_ORDER = [
 // Control entities to hide from the card (still available on the device page).
 const EXCLUDE_CONTROLS = ["auto_disconnect", "auto_shutdown"];
 
+// The Statistics section, in display order: two odometers, two trip meters, two
+// daily rates, then the reset.  Matched as entity_id substrings, the same way every
+// other list in this file is — reading `entity_category` off `hass.entities` would
+// work today but is frontend internals, and gains nothing here.
+//
+// Order matters and is not alphabetical: each pair reads total -> period -> per day,
+// so a column of numbers can be scanned down rather than hunted through.
+const STATS_ORDER = [
+  "brew_count_period", "brews_per_day",
+  "coffee_total", "coffee_period", "coffee_per_day",
+  "reset_period",
+];
+// "brew_count" is a prefix of "brew_count_period", so it cannot be matched by
+// substring alongside it — it is placed first explicitly.
+const STATS_FIRST = "brew_count";
+
+// The working parts of the last shot.  Present but folded away: useful when a result
+// looks wrong, noise every other day.  Mirrors where they now sit on the device page.
+const DIAG_ORDER = [
+  "brew_dose", "brew_yield", "brew_ratio",
+  "last_dose", "last_yield",
+  "integration_version",
+];
+
+const idPart = (entityId) => entityId.split(".")[1] || entityId;
+
 const rank = (entityId, order) => {
-  const id = entityId.split(".")[1] || entityId;
+  const id = idPart(entityId);
   for (let i = 0; i < order.length; i++) if (id.includes(order[i])) return i;
   return order.length + 1;
 };
+
+const inList = (entityId, list) => {
+  const id = idPart(entityId);
+  return list.some((key) => id.includes(key));
+};
+
+const isStat = (entityId) =>
+  idPart(entityId).endsWith(STATS_FIRST) || inList(entityId, STATS_ORDER);
+
+const statRank = (entityId) =>
+  idPart(entityId).endsWith(STATS_FIRST) ? -1 : rank(entityId, STATS_ORDER);
 
 class DifluidCard extends HTMLElement {
   setConfig(config) {
@@ -94,6 +131,26 @@ class DifluidCard extends HTMLElement {
       .row .label { flex:1; color: var(--primary-text-color); }
       .row .value { color: var(--primary-text-color); font-weight:500; text-align:right; }
       .divider { height:1px; background:var(--divider-color); margin:8px 0; }
+      .section {
+        display:flex; align-items:center; gap:8px;
+        margin:12px 0 2px; color: var(--secondary-text-color);
+        font-size:12px; font-weight:500; text-transform:uppercase; letter-spacing:.06em;
+      }
+      .section::after {
+        content:""; flex:1; height:1px; background:var(--divider-color);
+      }
+      details.diag > summary {
+        list-style:none; cursor:pointer; outline:none;
+        display:flex; align-items:center; gap:8px;
+        margin:12px 0 2px; color: var(--secondary-text-color);
+        font-size:12px; font-weight:500; text-transform:uppercase; letter-spacing:.06em;
+      }
+      details.diag > summary::-webkit-details-marker { display:none; }
+      details.diag > summary::before { content:"\\25B8"; font-size:10px; }
+      details.diag[open] > summary::before { content:"\\25BE"; }
+      details.diag > summary::after {
+        content:""; flex:1; height:1px; background:var(--divider-color);
+      }
       button.df-btn {
         background: var(--primary-color); color: var(--text-primary-color,#fff);
         border:none; border-radius:16px; padding:6px 16px; cursor:pointer; font-size:14px;
@@ -110,12 +167,26 @@ class DifluidCard extends HTMLElement {
     `;
     card.appendChild(style);
 
+    // Three groups, partitioned before anything is ranked: statistics and diagnostics
+    // are claimed first, and whatever is left is a live reading or a control.  Doing
+    // it in that order is what keeps a new entity from silently landing in the plain
+    // sensor list — the card enumerates every entity the device has, so anything not
+    // deliberately placed ends up in the middle of the weight and the flow rate.
     const ids = this._deviceEntities();
+    const stats = ids
+      .filter(isStat)
+      .sort((a, b) => statRank(a) - statRank(b));
+    const diagnostics = ids
+      .filter((id) => !isStat(id) && inList(id, DIAG_ORDER))
+      .sort((a, b) => rank(a, DIAG_ORDER) - rank(b, DIAG_ORDER));
+    const claimed = new Set([...stats, ...diagnostics]);
+
     const sensors = ids
-      .filter((id) => id.startsWith("sensor."))
+      .filter((id) => id.startsWith("sensor.") && !claimed.has(id))
       .sort((a, b) => rank(a, SENSOR_ORDER) - rank(b, SENSOR_ORDER));
     const controls = ids
       .filter((id) => /^(button|select|number|switch)\./.test(id))
+      .filter((id) => !claimed.has(id))
       .filter((id) => !EXCLUDE_CONTROLS.some((x) => id.includes(x)))
       .sort((a, b) => rank(a, CONTROL_ORDER) - rank(b, CONTROL_ORDER));
 
@@ -129,7 +200,26 @@ class DifluidCard extends HTMLElement {
     }
     for (const id of controls) body.appendChild(this._controlRow(id));
 
-    if (!sensors.length && !controls.length) {
+    if (stats.length) {
+      body.appendChild(this._sectionHeader("Statistics"));
+      for (const id of stats) {
+        body.appendChild(
+          id.startsWith("sensor.") ? this._sensorRow(id) : this._controlRow(id)
+        );
+      }
+    }
+
+    if (diagnostics.length) {
+      const details = document.createElement("details");
+      details.className = "diag";
+      const summary = document.createElement("summary");
+      summary.textContent = "Diagnostic";
+      details.appendChild(summary);
+      for (const id of diagnostics) details.appendChild(this._sensorRow(id));
+      body.appendChild(details);
+    }
+
+    if (!sensors.length && !controls.length && !stats.length && !diagnostics.length) {
       const empty = document.createElement("div");
       empty.className = "row label";
       empty.textContent = this._config.device
@@ -153,6 +243,13 @@ class DifluidCard extends HTMLElement {
         ? st.attributes.friendly_name.replace(`${this._deviceName()} `, "")
         : id)
     );
+  }
+
+  _sectionHeader(text) {
+    const el = document.createElement("div");
+    el.className = "section";
+    el.textContent = text;
+    return el;
   }
 
   _sensorRow(id) {
@@ -186,10 +283,19 @@ class DifluidCard extends HTMLElement {
     if (domain === "button") {
       control = document.createElement("button");
       control.className = "df-btn value";
-      control.textContent = "Press";
-      control.addEventListener("click", () =>
-        this._hass.callService("button", "press", { entity_id: id })
-      );
+      // Reset is the one button here that destroys something: Tare and Start/Stop are
+      // undone by pressing them again, while a period, once ended, cannot be restored
+      // — the odometers survive but the trip figures do not. It also sits in the same
+      // column as five sensor rows, so a mis-tap is a realistic way to lose a month.
+      const isReset = idPart(id).includes("reset_period");
+      control.textContent = isReset ? "Reset" : "Press";
+      control.addEventListener("click", () => {
+        if (isReset && !window.confirm(
+          "Start a new statistics period? The all-time totals are kept, " +
+          "but the current period cannot be restored."
+        )) return;
+        this._hass.callService("button", "press", { entity_id: id });
+      });
     } else if (domain === "switch") {
       control = document.createElement("button");
       control.className = "df-btn value";

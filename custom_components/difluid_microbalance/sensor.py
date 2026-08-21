@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Callable
 
 from homeassistant.components.sensor import (
@@ -11,9 +12,10 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfMass, UnitOfTemperature, UnitOfTime
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
@@ -107,6 +109,11 @@ MICROBALANCE_SENSORS: tuple[DifluidSensorDescription, ...] = (
 class DifluidBrewSensorDescription(SensorEntityDescription):
     value_fn: Callable = lambda _: None
     attrs_fn: Callable | None = None
+    #: Set on the two per-day figures.  Their numerator only changes when a brew is
+    #: detected, but their *denominator* grows continuously, so unlike every other
+    #: sensor here they go stale on their own and need a clock.  See
+    #: DifluidBrewRateSensor.
+    ticks: bool = False
 
 
 def _weigh_attrs(event) -> dict:
@@ -132,9 +139,44 @@ def _weigh_attrs(event) -> dict:
     }
 
 
+def _iso(timestamp: float) -> str | None:
+    """A POSIX timestamp as an ISO string, or None if it was never set."""
+    return dt_util.utc_from_timestamp(timestamp).isoformat() if timestamp else None
+
+
+def _period_attrs(session) -> dict:
+    """When the current period began and how long it has been running.
+
+    Shared by every period sensor so that a reset is legible from any of them: without
+    it, "3 brews" and "1.5 cups/d" are two numbers with no visible relationship to each
+    other or to when the button was last pressed.
+
+    elapsed_days is the raw age, deliberately *not* the floored value the averages
+    divide by — on the first day those two differ, and the honest way to explain a
+    daily average that looks low is to show the real age next to it rather than the
+    one the formula used.  See BrewTotals.elapsed_days for why the floor exists.
+    """
+    started = session.totals.period_started
+    if not started:
+        return {}
+    now = dt_util.utcnow().timestamp()
+    return {
+        "period_started": _iso(started),
+        "elapsed_days": round(max(0.0, now - started) / 86400.0, 2),
+    }
+
+
 # state_class = MEASUREMENT on all three: it is what makes Home Assistant keep
 # long-term statistics for them (permanent, unlike the recorder's ~10 days) and it
 # gives the Prometheus exporter a numeric series to publish.
+#
+# entity_category = DIAGNOSTIC on the five "last shot" sensors moves them into the
+# Diagnostic panel of the device page and out of the way of the statistics below,
+# which is what they are: the working parts of one brew, useful when a result looks
+# wrong and noise the rest of the time.  It changes *only* their grouping — entity_id
+# is assigned at first registration and does not depend on the category, so the
+# Prometheus rules and the notification email keep resolving, and both recorder
+# history and long-term statistics carry on uninterrupted.
 BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
     DifluidBrewSensorDescription(
         key="last_dose",
@@ -144,6 +186,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfMass.GRAMS,
         suggested_display_precision=1,
         icon="mdi:coffee-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: s.last_dose.value if s.last_dose else None,
         attrs_fn=lambda s: _weigh_attrs(s.last_dose),
     ),
@@ -155,6 +198,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfMass.GRAMS,
         suggested_display_precision=1,
         icon="mdi:cup-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: s.last_yield.value if s.last_yield else None,
         attrs_fn=lambda s: _weigh_attrs(s.last_yield),
     ),
@@ -177,6 +221,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfMass.GRAMS,
         suggested_display_precision=1,
         icon="mdi:coffee",
+        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: round(s.last_pair.dose, 2) if s.last_pair else None,
         attrs_fn=lambda s: (
             {"paired_at": dt_util.utc_from_timestamp(s.last_pair.yield_at).isoformat()}
@@ -192,6 +237,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfMass.GRAMS,
         suggested_display_precision=1,
         icon="mdi:cup",
+        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: round(s.last_pair.yield_g, 2) if s.last_pair else None,
         attrs_fn=lambda s: (
             {"paired_at": dt_util.utc_from_timestamp(s.last_pair.yield_at).isoformat()}
@@ -205,6 +251,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=2,
         icon="mdi:scale-unbalanced",
+        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: round(s.last_pair.ratio, 2) if s.last_pair else None,
         attrs_fn=lambda s: (
             {
@@ -218,12 +265,103 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
             else {}
         ),
     ),
+    # ── statistics ────────────────────────────────────────────────────────────
+    # An odometer, a trip meter and a daily rate for each of two quantities: cups
+    # drunk and coffee ground.  These deliberately carry no entity_category, which
+    # is what keeps them in the plain Sensors section of the device page while the
+    # five above move to Diagnostic.
+    #
+    # Brew Count is the cups odometer and is not duplicated: "cups, all time" is
+    # already this number, and a second sensor reporting it would be a second answer
+    # to a question that must have one.  It stays exactly as it was, including its
+    # entity_id — the Prometheus rules and the email read it.
     DifluidBrewSensorDescription(
         key="brew_count",
         name="Brew Count",
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:counter",
         value_fn=lambda s: s.brew_count,
+        attrs_fn=lambda s: {
+            # The average dose over the whole odometer, which is only meaningful once
+            # both counters have seen the same brews — see Coffee Ground below for why
+            # they start out of step.
+            "average_dose": (
+                round(s.totals.total_dose_g / s.brew_count, 2)
+                if s.brew_count and s.totals.total_dose_g
+                else None
+            ),
+        },
+    ),
+    DifluidBrewSensorDescription(
+        key="brew_count_period",
+        name="Brew Count (Period)",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        icon="mdi:counter",
+        value_fn=lambda s: s.totals.period_brews(s.brew_count),
+        attrs_fn=lambda s: _period_attrs(s),
+    ),
+    DifluidBrewSensorDescription(
+        key="brews_per_day",
+        name="Brews per Day",
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement="cups/d",
+        suggested_display_precision=2,
+        icon="mdi:chart-line",
+        ticks=True,
+        value_fn=lambda s: s.totals.per_day(
+            s.totals.period_brews(s.brew_count), dt_util.utcnow().timestamp()
+        ),
+        attrs_fn=lambda s: _period_attrs(s),
+    ),
+    # Grams rather than kilograms as the native unit, because that is what the scale
+    # reports and what every other weight here is in.  Home Assistant offers kg as a
+    # display unit on a WEIGHT sensor, so the choice stays with whoever is reading it
+    # once the numbers get big.
+    DifluidBrewSensorDescription(
+        key="coffee_total",
+        name="Coffee Ground",
+        device_class=SensorDeviceClass.WEIGHT,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        native_unit_of_measurement=UnitOfMass.GRAMS,
+        suggested_display_precision=0,
+        icon="mdi:coffee-maker",
+        value_fn=lambda s: s.totals.total_dose_g,
+        # counting_since exists because this odometer and Brew Count do not start
+        # level: the count has been running since the counter was added, while nobody
+        # was summing doses until this version, so the first reading here is 0 against
+        # a count of 29.  The alternative — seeding it with 29 x the current dose —
+        # would put a number nobody weighed into an odometer whose only job is to hold
+        # numbers that were weighed.  The attribute says when the count began, so the
+        # gap can be read rather than guessed at.
+        attrs_fn=lambda s: {
+            "counting_since": _iso(s.totals.period_started)
+            if not s.totals.total_dose_g
+            else None,
+        },
+    ),
+    DifluidBrewSensorDescription(
+        key="coffee_period",
+        name="Coffee Ground (Period)",
+        device_class=SensorDeviceClass.WEIGHT,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        native_unit_of_measurement=UnitOfMass.GRAMS,
+        suggested_display_precision=0,
+        icon="mdi:coffee-maker-outline",
+        value_fn=lambda s: s.totals.period_dose_g(),
+        attrs_fn=lambda s: _period_attrs(s),
+    ),
+    DifluidBrewSensorDescription(
+        key="coffee_per_day",
+        name="Coffee per Day",
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement="g/d",
+        suggested_display_precision=1,
+        icon="mdi:chart-line",
+        ticks=True,
+        value_fn=lambda s: s.totals.per_day(
+            s.totals.period_dose_g(), dt_util.utcnow().timestamp()
+        ),
+        attrs_fn=lambda s: _period_attrs(s),
     ),
 )
 
@@ -303,7 +441,9 @@ async def async_setup_entry(
     session: BrewSession | None = hass.data.get(DOMAIN, {}).get(BREW_KEY)
     if session is not None:
         entities += [
-            DifluidBrewSensor(session, desc, entry, device_info)
+            (DifluidBrewRateSensor if desc.ticks else DifluidBrewSensor)(
+                session, desc, entry, device_info
+            )
             for desc in BREW_SENSORS
         ]
 
@@ -406,6 +546,33 @@ class DifluidBrewSensor(SensorEntity):
     def extra_state_attributes(self) -> dict:
         attrs_fn = self.entity_description.attrs_fn
         return attrs_fn(self._session) if attrs_fn else {}
+
+
+class DifluidBrewRateSensor(DifluidBrewSensor):
+    """A per-day average, which goes stale without anyone touching the scale.
+
+    Every other sensor here changes only when the session does, so a listener is all
+    they need.  These two divide by the age of the period, and that age grows whether
+    or not coffee is being made — left to the session's own updates, the figure shown
+    on a quiet Sunday would be the one computed at the last brew on Friday.
+
+    An hour is the coarsest tick that never looks wrong: the denominator is in days, so
+    an hour moves a daily average by at most ~4% of itself, and it costs 24 recorder
+    rows a day instead of the 8,640 a five-minute tick would.  The timer is registered
+    through async_on_remove, so it is torn down with the entity — which matters because
+    BrewSession deliberately survives entry reloads and would otherwise accumulate one
+    live timer per reload, every options change adding another.
+    """
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            async_track_time_interval(self.hass, self._tick, timedelta(hours=1))
+        )
+
+    @callback
+    def _tick(self, _now) -> None:
+        self.async_write_ha_state()
 
 
 class DifluidVersionSensor(SensorEntity):

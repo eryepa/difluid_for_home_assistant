@@ -7,6 +7,7 @@ from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .brew_session import BREW_KEY, BrewSession
 from .const import CONF_DEVICE_TYPE, CONF_IS_TI, DEVICE_TYPE_R2, DOMAIN
 from .coordinator import DifluidMicrobalanceCoordinator
 from .coordinator_r2 import DifluidR2Coordinator
@@ -48,10 +49,14 @@ async def async_setup_entry(
             manufacturer="Difluid",
             model="Microbalance Ti" if is_ti else "Microbalance",
         )
-        async_add_entities([
+        buttons: list[ButtonEntity] = [
             TareButton(coordinator, entry, device_info),
             TimerStartStopButton(coordinator, entry, device_info),
-        ])
+        ]
+        session = hass.data.get(DOMAIN, {}).get(BREW_KEY)
+        if session is not None:
+            buttons.append(ResetPeriodButton(session, entry, device_info))
+        async_add_entities(buttons)
 
 
 # ── base classes ───────────────────────────────────────────────────────────────
@@ -106,6 +111,39 @@ class TimerStartStopButton(_MicrobalanceButton):
 
     async def async_press(self) -> None:
         await self.coordinator.async_send_command(_CMD_TIMER_START)
+
+
+class ResetPeriodButton(ButtonEntity):
+    """Start a new statistics period — the trip-meter reset.
+
+    Deliberately not a _MicrobalanceButton.  The other two send a BLE command, so it is
+    right that they grey out when the scale is off; this one only moves a snapshot in
+    the session, and the scale is off almost all the time — it auto-disconnects five
+    minutes after a pour.  Tying availability to the link would make the button
+    reachable for about five minutes a day, none of them the moment somebody decides to
+    start a new month.  Same reasoning as DifluidBrewSensor.available.
+
+    No entity_category: the other two are CONFIG because they configure the scale, and
+    this configures nothing — it belongs with the statistics it resets, which carry no
+    category either.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Reset Period"
+    _attr_icon = "mdi:backup-restore"
+    _attr_should_poll = False
+
+    def __init__(self, session: BrewSession, entry: ConfigEntry, device_info: DeviceInfo):
+        self._session = session
+        self._attr_unique_id = f"{entry.entry_id}_reset_period"
+        self._attr_device_info = device_info
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    async def async_press(self) -> None:
+        self._session.reset_period()
 
 
 # ── R2 buttons ─────────────────────────────────────────────────────────────────
