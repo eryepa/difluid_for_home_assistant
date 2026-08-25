@@ -47,6 +47,72 @@ const DIAG_ORDER = [
   "integration_version",
 ];
 
+// ── pour curve ──────────────────────────────────────────────────────────────
+// Seconds of the hold to keep after the pour stops.  Enough to show the reading
+// settle, short enough to stay clear of what ends it — see pourWindow.
+const POUR_TAIL_SECONDS = 4;
+//: Seconds of flat line before the rise, so a pour does not start at the y-axis.
+const POUR_LEAD_SECONDS = 2;
+
+/**
+ * The window of the last pour, from the attributes Last Yield publishes.
+ *
+ * Deliberately ends before `detected_at` rather than at it.  The detector confirms a
+ * plateau after the fact, and what makes it confirm is the load coming off the scale
+ * — so the moment it names is the moment the cup was already being lifted, and the
+ * samples just before it are the lift: this install's last brew ends
+ * -200.4, -142.7, 160.0, 685.4, 831.6 g inside a 37 g pour.  Drawing to detected_at
+ * means drawing that.
+ *
+ * Returns null when rise_seconds is null, which is its documented value for a load
+ * that was already on the scale before the detector was watching — after a restart or
+ * a BLE gap.  There is no rise to plot in that case, and inventing one from a default
+ * would draw a pour that never happened.
+ */
+const pourWindow = (attrs) => {
+  if (!attrs) return null;
+  const detected = Date.parse(attrs.detected_at);
+  const plateau = Number(attrs.plateau_seconds);
+  const rise = attrs.rise_seconds;
+  if (!Number.isFinite(detected) || !Number.isFinite(plateau)) return null;
+  if (rise === null || rise === undefined || !Number.isFinite(Number(rise))) return null;
+  const riseSeconds = Number(rise);
+  if (riseSeconds <= 0) return null;
+  const pourEnd = detected - plateau * 1000;
+  const riseStart = pourEnd - riseSeconds * 1000;
+  return {
+    start: riseStart - POUR_LEAD_SECONDS * 1000,
+    end: pourEnd + Math.min(plateau, POUR_TAIL_SECONDS) * 1000,
+    riseStart,
+    pourEnd,
+    riseSeconds,
+  };
+};
+
+/**
+ * Drop samples that are not part of the pour.
+ *
+ * The scale reports a knock, a lean or a lift as a reading like any other, and the
+ * detector filters those with a Hampel window it does not expose.  A chart cannot
+ * borrow that, but it does not need to: it knows what the pour weighed.  Anything far
+ * outside that is not a data point about this pour, and keeping it costs the whole
+ * y-axis — one -200 g sample flattens a 37 g curve into a line along the bottom.
+ *
+ * The band is generous on purpose.  This throws away what cannot belong, not what
+ * looks unusual: a pour that overshoots, stalls or gets topped up stays on the chart,
+ * because that is exactly what somebody opens this to see.
+ */
+const cleanSamples = (samples, expected) => {
+  const ceiling = Number.isFinite(expected) && expected > 0 ? expected * 2 + 20 : Infinity;
+  return samples.filter(
+    (s) => Number.isFinite(s.v) && s.v >= -2 && s.v <= ceiling
+  );
+};
+
+/** An SVG path through points already mapped to chart coordinates. */
+const linePath = (pts) =>
+  pts.length ? pts.map((p, i) => `${i ? "L" : "M"}${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join("") : "";
+
 const idPart = (entityId) => entityId.split(".")[1] || entityId;
 
 const rank = (entityId, order) => {
@@ -472,8 +538,280 @@ class DifluidCardEditor extends HTMLElement {
   }
 }
 
+/**
+ * The last pour, as weight and flow against seconds since it started.
+ *
+ * A separate card rather than a section of DifluidCard: a chart wants its own height
+ * and its own place on the dashboard, and somebody who only wants the numbers should
+ * not have to carry it.
+ *
+ * While the scale is connected it draws what is happening now, straight from the state
+ * machine — the weight sensor updates on every BLE packet, so the card's own hass
+ * setter is already being called five times a second and there is nothing to poll.
+ * When the scale goes away it falls back to the recorder, which by then holds the brew
+ * that just finished.
+ */
+class DifluidPourCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    //: Live samples, newest last.  Cleared whenever the scale disconnects, so a
+    //: reconnect never draws a line across the gap between two different brews.
+    this._live = [];
+    this._history = null;
+    this._fetchedFor = null;
+    this._fetching = false;
+  }
+
+  setConfig(config) {
+    if (!config || !config.device) throw new Error("Choose a DiFluid device");
+    this._config = config;
+  }
+
+  getCardSize() {
+    return 6;
+  }
+
+  static getConfigElement() {
+    return document.createElement("difluid-card-editor");
+  }
+
+  static getStubConfig(hass) {
+    return DifluidCard.getStubConfig(hass);
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    const ids = this._entityIds();
+    if (!ids) return;
+
+    const weight = hass.states[ids.weight];
+    const connected = weight && weight.state !== "unavailable";
+
+    if (connected) {
+      const t = Date.parse(weight.last_updated);
+      const v = Number(weight.state);
+      const last = this._live[this._live.length - 1];
+      if (Number.isFinite(t) && Number.isFinite(v) && (!last || last.t !== t)) {
+        const flow = Number((hass.states[ids.flow] || {}).state);
+        this._live.push({ t, v, f: Number.isFinite(flow) ? flow : 0 });
+        // A pour is under a minute; anything older is a previous trip to the scale.
+        const cutoff = t - 120000;
+        while (this._live.length && this._live[0].t < cutoff) this._live.shift();
+      }
+    } else if (this._live.length) {
+      this._live = [];
+      this._fetchedFor = null; // re-read the recorder: it now has the finished brew
+    }
+
+    this._maybeFetch(ids);
+    this._render(ids);
+  }
+
+  _cluster() {
+    return DifluidCard.prototype._clusterIds.call(this);
+  }
+
+  _entityIds() {
+    if (!this._hass || !this._config) return null;
+    const cluster = this._cluster();
+    const found = {};
+    for (const [entityId, ent] of Object.entries(this._hass.entities || {})) {
+      if (!cluster.has(ent.device_id)) continue;
+      const id = idPart(entityId);
+      if (id.endsWith("_weight")) found.weight = entityId;
+      else if (id.endsWith("_flow_rate")) found.flow = entityId;
+      else if (id.endsWith("_last_yield")) found.lastYield = entityId;
+      else if (id.endsWith("_brew_ratio")) found.ratio = entityId;
+    }
+    return found.weight ? found : null;
+  }
+
+  async _maybeFetch(ids) {
+    if (this._live.length || !ids.lastYield || this._fetching) return;
+    const attrs = (this._hass.states[ids.lastYield] || {}).attributes;
+    const win = pourWindow(attrs);
+    if (!win) {
+      this._history = null;
+      return;
+    }
+    if (this._fetchedFor === attrs.detected_at) return;
+
+    this._fetching = true;
+    this._fetchedFor = attrs.detected_at;
+    try {
+      const entity_ids = [ids.weight];
+      if (ids.flow) entity_ids.push(ids.flow);
+      const res = await this._hass.callWS({
+        type: "history/history_during_period",
+        start_time: new Date(win.start).toISOString(),
+        end_time: new Date(win.end).toISOString(),
+        entity_ids,
+        minimal_response: true,
+        no_attributes: true,
+        // The detector runs on every sample and so does this chart; the recorder's
+        // idea of a significant change would drop most of the rise.
+        significant_changes_only: false,
+      });
+      this._history = { win, rows: res || {} };
+    } catch (err) {
+      // Most likely the window has aged out of the recorder's retention.
+      this._history = null;
+      console.warn("difluid-pour-card: history fetch failed", err);
+    } finally {
+      this._fetching = false;
+      this._render(ids);
+    }
+  }
+
+  // The compressed history format uses `lu` (epoch seconds) and `s`; be tolerant of
+  // the uncompressed one too, since which arrives depends on the request flags.
+  _rowsToSamples(rows) {
+    return (rows || []).map((r) => ({
+      t: Number.isFinite(r.lu)
+        ? r.lu * 1000
+        : Date.parse(r.last_updated || r.last_changed),
+      v: Number(r.s !== undefined ? r.s : r.state),
+    }));
+  }
+
+  _series(ids) {
+    if (this._live.length >= 2) {
+      const t0 = this._live[0].t;
+      const peak = Math.max(...this._live.map((s) => s.v));
+      return {
+        live: true,
+        t0,
+        weight: cleanSamples(this._live, peak),
+        flow: this._live.map((s) => ({ t: s.t, v: s.f })),
+      };
+    }
+    if (!this._history) return null;
+    const { win, rows } = this._history;
+    const expected = Number((this._hass.states[ids.lastYield] || {}).state);
+    const weight = cleanSamples(this._rowsToSamples(rows[ids.weight]), expected).filter(
+      (s) => s.t >= win.start && s.t <= win.end
+    );
+    if (weight.length < 2) return null;
+    const flow = ids.flow
+      ? this._rowsToSamples(rows[ids.flow]).filter(
+          (s) => Number.isFinite(s.v) && s.t >= win.start && s.t <= win.end
+        )
+      : [];
+    return { live: false, t0: win.riseStart, weight, flow, riseSeconds: win.riseSeconds };
+  }
+
+  _render(ids) {
+    const series = this._series(ids);
+    const root = this.shadowRoot;
+    if (!series) {
+      root.innerHTML = `
+        <ha-card header="Pour">
+          <div class="empty">No pour recorded yet.</div>
+          ${DifluidPourCard.STYLE}
+        </ha-card>`;
+      return;
+    }
+
+    const W = 480, H = 210;
+    const padL = 34, padR = 34, padT = 12, padB = 24;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+
+    const secs = (s) => (s.t - series.t0) / 1000;
+    const xMax = Math.max(1, ...series.weight.map(secs));
+    const yMax = Math.max(1, ...series.weight.map((s) => s.v)) * 1.1;
+    const fMax = Math.max(0.5, ...series.flow.map((s) => s.v)) * 1.15;
+
+    const X = (t) => padL + (Math.min(Math.max(secs({ t }), 0), xMax) / xMax) * innerW;
+    const Yw = (v) => padT + innerH - (Math.min(v, yMax) / yMax) * innerH;
+    const Yf = (v) => padT + innerH - (Math.min(v, fMax) / fMax) * innerH;
+
+    const wPts = series.weight.map((s) => ({ x: X(s.t), y: Yw(s.v) }));
+    const fPts = series.flow
+      .filter((s) => s.t >= series.t0)
+      .map((s) => ({ x: X(s.t), y: Yf(s.v) }));
+
+    const area = wPts.length
+      ? `${linePath(wPts)}L${wPts[wPts.length - 1].x.toFixed(1)} ${(padT + innerH).toFixed(1)}L${wPts[0].x.toFixed(1)} ${(padT + innerH).toFixed(1)}Z`
+      : "";
+
+    const gridY = [0, 0.25, 0.5, 0.75, 1].map((f) => {
+      const y = padT + innerH - f * innerH;
+      return `<line class="grid" x1="${padL}" y1="${y}" x2="${padL + innerW}" y2="${y}"/>
+              <text class="tick w" x="${padL - 5}" y="${y + 3}">${(yMax * f).toFixed(0)}</text>
+              <text class="tick f" x="${padL + innerW + 5}" y="${y + 3}">${(fMax * f).toFixed(1)}</text>`;
+    }).join("");
+
+    const secTicks = [];
+    const step = xMax > 45 ? 15 : xMax > 20 ? 10 : 5;
+    for (let s = 0; s <= xMax; s += step) {
+      secTicks.push(
+        `<text class="tick x" x="${X(series.t0 + s * 1000)}" y="${H - 6}">${s}s</text>`
+      );
+    }
+
+    const last = series.weight[series.weight.length - 1];
+    const ratio = (this._hass.states[ids.ratio] || {}).state;
+    const dose = ((this._hass.states[ids.ratio] || {}).attributes || {}).dose;
+    const caption = series.live
+      ? `${last.v.toFixed(1)} g · ${secs(last).toFixed(0)}s`
+      : [
+          dose !== undefined ? `${dose} g` : null,
+          `${last.v.toFixed(1)} g`,
+          ratio && ratio !== "unknown" ? `1:${ratio}` : null,
+          `${series.riseSeconds.toFixed(0)}s`,
+        ].filter(Boolean).join(" · ");
+
+    root.innerHTML = `
+      <ha-card header="${series.live ? "Pouring" : "Last pour"}">
+        <div class="body">
+          <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
+               aria-label="Pour curve: weight and flow over time">
+            ${gridY}
+            <path class="area" d="${area}"/>
+            <path class="weight" d="${linePath(wPts)}"/>
+            <path class="flow" d="${linePath(fPts)}"/>
+            ${secTicks.join("")}
+          </svg>
+          <div class="legend">
+            <span class="k weight"></span>Weight
+            <span class="k flow"></span>Flow
+            <span class="cap">${caption}</span>
+          </div>
+        </div>
+        ${DifluidPourCard.STYLE}
+      </ha-card>`;
+  }
+}
+
+DifluidPourCard.STYLE = `
+  <style>
+    .body { padding: 4px 12px 12px; }
+    .empty { padding: 24px 16px; color: var(--secondary-text-color); }
+    svg { width: 100%; height: 210px; display: block; }
+    .grid { stroke: var(--divider-color); stroke-width: 1; }
+    .area { fill: var(--state-icon-color, #44739e); opacity: .12; stroke: none; }
+    .weight { fill: none; stroke: var(--state-icon-color, #44739e); stroke-width: 2;
+              stroke-linejoin: round; stroke-linecap: round; }
+    .flow { fill: none; stroke: var(--warning-color, #ffa726); stroke-width: 1.5;
+            stroke-dasharray: 3 3; stroke-linejoin: round; }
+    .tick { font-size: 9px; fill: var(--secondary-text-color); }
+    .tick.w { text-anchor: end; }
+    .tick.f { text-anchor: start; }
+    .tick.x { text-anchor: middle; }
+    .legend { display: flex; align-items: center; gap: 6px; font-size: 12px;
+              color: var(--secondary-text-color); padding-top: 2px; }
+    .legend .k { width: 10px; height: 2px; display: inline-block; }
+    .legend .k.weight { background: var(--state-icon-color, #44739e); }
+    .legend .k.flow { background: var(--warning-color, #ffa726); }
+    .legend .cap { margin-left: auto; color: var(--primary-text-color); font-weight: 500; }
+  </style>`;
+
 if (!customElements.get("difluid-card")) {
   customElements.define("difluid-card", DifluidCard);
+}
+if (!customElements.get("difluid-pour-card")) {
+  customElements.define("difluid-pour-card", DifluidPourCard);
 }
 if (!customElements.get("difluid-card-editor")) {
   customElements.define("difluid-card-editor", DifluidCardEditor);
@@ -486,6 +824,17 @@ if (!window.customCards.some((c) => c.type === "difluid-card")) {
     name: "DiFluid Microbalance / R2",
     description:
       "Ordered sensors + controls for a DiFluid scale or R2 refractometer.",
+    preview: true,
+    documentationURL:
+      "https://github.com/eryepa/difluid_for_home_assistant",
+  });
+}
+if (!window.customCards.some((c) => c.type === "difluid-pour-card")) {
+  window.customCards.push({
+    type: "difluid-pour-card",
+    name: "DiFluid Pour Curve",
+    description:
+      "Weight and flow against seconds, for the pour happening now or the last one.",
     preview: true,
     documentationURL:
       "https://github.com/eryepa/difluid_for_home_assistant",

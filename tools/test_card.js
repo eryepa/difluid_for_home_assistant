@@ -39,7 +39,8 @@ function loadCardHelpers() {
   vm.runInContext(
     src.slice(0, cut) +
       "\n;globalThis.__exported = { SENSOR_ORDER, CONTROL_ORDER, EXCLUDE_CONTROLS," +
-      " STATS_ORDER, DIAG_ORDER, rank, inList, isStat, statRank, DOMAIN };",
+      " STATS_ORDER, DIAG_ORDER, rank, inList, isStat, statRank, DOMAIN," +
+      " pourWindow, cleanSamples, linePath };",
     sandbox,
     { filename: CARD }
   );
@@ -243,6 +244,124 @@ check(
   "configured either way, the card draws the same 22 entities",
   entitiesFor(DETECTOR).length,
   entitiesFor(SCALE).length
+);
+
+// ── the pour curve ──────────────────────────────────────────────────────────
+// The 2026-08-25 19:26 brew, as Home Assistant recorded it: 17.8 g in, 37.4 g out
+// over 16.3 s. Trimmed to the samples that decide something — the start of the rise,
+// a few points along it, the top, and every reading that is not part of the pour.
+console.log("\ndifluid-pour-card — the last pour\n");
+
+const YIELD_ATTRS = {
+  detected_at: "2026-08-25T16:27:05.061624+00:00",
+  plateau_seconds: 9.8,
+  rise_seconds: 16.3,
+  steps: [37.4],
+};
+
+const t = (iso) => Date.parse(iso);
+const REAL_WEIGHT = [
+  // Recorded at 16:26:35 and then nothing until the rise: a state is written when it
+  // changes, so an idle scale produces no samples at all.  The baseline the chart
+  // draws from does not come from here — see the carried-forward row below.
+  { t: t("2026-08-25T16:26:35.000Z"), v: 0.0 },
+  { t: t("2026-08-25T16:26:38.543Z"), v: 0.5 },   // rise starts
+  { t: t("2026-08-25T16:26:46.425Z"), v: 12.2 },
+  { t: t("2026-08-25T16:26:55.034Z"), v: 36.8 },
+  { t: t("2026-08-25T16:26:55.231Z"), v: 37.0 },
+  { t: t("2026-08-25T16:26:55.584Z"), v: -102.2 },  // knock, mid-pour
+  { t: t("2026-08-25T16:26:55.784Z"), v: 37.3 },
+  { t: t("2026-08-25T16:26:56.505Z"), v: 37.4 },   // settled
+  { t: t("2026-08-25T16:27:04.652Z"), v: -200.4 }, // cup coming off
+  { t: t("2026-08-25T16:27:04.861Z"), v: -142.7 },
+  { t: t("2026-08-25T16:27:05.504Z"), v: 160.0 },
+  { t: t("2026-08-25T16:27:05.706Z"), v: 685.4 },
+  { t: t("2026-08-25T16:27:05.905Z"), v: 831.6 },
+];
+
+const win = h.pourWindow(YIELD_ATTRS);
+const POUR_LEAD = 2;  // seconds of lead-in the card asks for; see POUR_LEAD_SECONDS
+
+// detected_at is when the detector *decided*, and what makes it decide is the cup
+// being lifted. Ending the chart there means drawing the lift.
+check(
+  "the window ends when the pour stops, not when the detector says so",
+  [
+    new Date(win.pourEnd).toISOString(),
+    new Date(win.end).toISOString() < YIELD_ATTRS.detected_at,
+  ],
+  ["2026-08-25T16:26:55.261Z", true]
+);
+
+check(
+  "the rise is the 16.3 s the detector measured, with a lead-in before it",
+  [(win.pourEnd - win.riseStart) / 1000, (win.riseStart - win.start) / 1000],
+  [16.3, 2]
+);
+
+// What history_during_period actually returns for this window: the state carried
+// forward to the window's start, then every change inside it.  The 16:26:35 reading
+// is nearly four seconds before the window and is not one of them — it arrives as
+// that carried-forward row instead, which is where the flat baseline comes from.
+const carried = [
+  { t: win.start, v: 0.0 },
+  ...REAL_WEIGHT.filter((s) => s.t >= win.start && s.t <= win.end),
+];
+
+// Everything after the pour ends is the cup being taken away.
+check(
+  "the lift never enters the window",
+  carried.map((s) => s.v),
+  [0, 0.5, 12.2, 36.8, 37, -102.2, 37.3, 37.4]
+);
+
+check(
+  "the curve opens on a flat baseline rather than mid-rise",
+  [(carried[1].t - carried[0].t) / 1000 <= POUR_LEAD, carried[0].v],
+  [true, 0]
+);
+
+// The knock at -102.2 g survives the window, and it is the one that matters: a single
+// negative sample sets the y-axis floor and flattens the curve against it.
+const cleaned = h.cleanSamples(carried, 37.4);
+check(
+  "the mid-pour knock is dropped, and nothing else is",
+  cleaned.map((s) => s.v),
+  [0, 0.5, 12.2, 36.8, 37, 37.3, 37.4]
+);
+
+check(
+  "the y-axis is set by the pour, not by the knock",
+  [Math.min(...cleaned.map((s) => s.v)), Math.max(...cleaned.map((s) => s.v))],
+  [0, 37.4]
+);
+
+// A pour that overshoots or gets topped up is the reason somebody opens this card;
+// the filter must not tidy those away along with the knocks.
+check(
+  "an overshoot well past the final yield is kept",
+  h.cleanSamples([{ t: 0, v: 52 }, { t: 1, v: 37.4 }], 37.4).map((s) => s.v),
+  [52, 37.4]
+);
+
+// rise_seconds is null whenever the load was already on the scale — after a restart
+// or a BLE gap. There is no rise to draw, and a default would draw a fiction.
+check(
+  "no window is offered when the rise was never seen",
+  h.pourWindow({ ...YIELD_ATTRS, rise_seconds: null }),
+  null
+);
+
+check(
+  "nor from attributes that are missing altogether",
+  [h.pourWindow(null), h.pourWindow({})],
+  [null, null]
+);
+
+check(
+  "an empty series produces no path rather than a broken one",
+  h.linePath([]),
+  ""
 );
 
 console.log(ok ? "\nOK" : "\nFAILED");
