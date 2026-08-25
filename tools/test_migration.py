@@ -35,6 +35,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from custom_components.difluid_microbalance.const import (  # noqa: E402
+    CONF_DETECTOR_IMPORTED as CONF_DETECTOR_IMPORTED_KEY,
     CONF_DEVICE_TYPE,
     CONF_SCALE_ENTRY,
     CONF_UID_PREFIX,
@@ -316,6 +317,72 @@ async def _unload_all(hass: HomeAssistant) -> None:
     for entry in hass.config_entries.async_entries(DOMAIN):
         await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
+
+
+async def test_a_detector_set_up_before_its_scale_recovers_when_the_scale_arrives(
+    hass: HomeAssistant,
+) -> None:
+    """The load-order path, end to end — which nothing checked until it broke.
+
+    Home Assistant sets entries up concurrently, so which of the two goes first is not
+    ours to decide, and on this install the detector went first after a restart: it
+    raised ConfigEntryNotReady and stayed in setup_retry with all thirteen entities
+    missing.  The wake-up meant to prevent that had been written on the detector's
+    side, subscribing to a signal just before raising — and Home Assistant runs an
+    entry's async_on_unload callbacks when its setup raises, so the subscription was
+    gone before the signal was sent.  It failed silently and looked like a broken
+    upgrade.
+
+    The version that shipped that bug passed every other test in this file, because
+    every one of them either set the scale up first or never set it up at all.
+    """
+    from homeassistant.config_entries import ConfigEntryState
+
+    scale = MockConfigEntry(
+        domain=DOMAIN,
+        title="Microbalance 304268",
+        data={CONF_DEVICE_TYPE: DEVICE_TYPE_MICROBALANCE, "address": "AA:BB:CC:DD:EE:FF"},
+    )
+    scale.add_to_hass(hass)
+    detector = MockConfigEntry(
+        domain=DOMAIN,
+        title="Brew Detector",
+        data={
+            CONF_DEVICE_TYPE: DEVICE_TYPE_DETECTOR,
+            CONF_SCALE_ENTRY: scale.entry_id,
+            CONF_UID_PREFIX: scale.entry_id,
+            CONF_DETECTOR_IMPORTED_KEY: True,
+        },
+    )
+    detector.add_to_hass(hass)
+
+    # The order cannot be forced by setting one entry up first: doing that sets the
+    # component up, and the component sets up every entry of its domain.  So both are
+    # brought up, then the race is reproduced from the other end — the scale goes away
+    # and the detector is reloaded without it, which is the state a restart left this
+    # install in.
+    await hass.config_entries.async_setup(detector.entry_id)
+    await hass.async_block_till_done()
+    assert scale.state is ConfigEntryState.LOADED
+
+    await hass.config_entries.async_unload(scale.entry_id)
+    await hass.async_block_till_done()
+    await hass.config_entries.async_reload(detector.entry_id)
+    await hass.async_block_till_done()
+    assert detector.state is ConfigEntryState.SETUP_RETRY, (
+        "a detector with no scale should wait, not claim to be working"
+    )
+
+    # The scale turns up.
+    await hass.config_entries.async_setup(scale.entry_id)
+    await hass.async_block_till_done()
+
+    assert detector.state is ConfigEntryState.LOADED, (
+        "the detector never recovered from losing the load-order race; on a real "
+        "install that is every brew statistic missing until something reloads it"
+    )
+
+    await _unload_all(hass)
 
 
 def _session(tmp_key="difluid_microbalance.test"):

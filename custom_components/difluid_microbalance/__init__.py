@@ -3,15 +3,11 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
+from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.dispatcher import (
-    async_dispatcher_connect,
-    async_dispatcher_send,
-)
 from homeassistant.helpers.event import async_track_state_change_event
 
 from .brew_detect import config_from_options
@@ -44,9 +40,31 @@ PLATFORMS = [Platform.SENSOR, Platform.BUTTON, Platform.NUMBER, Platform.SELECT]
 DETECTOR_PLATFORMS = [Platform.SENSOR, Platform.BUTTON]
 
 
-def _scale_ready_signal(scale_entry_id: str) -> str:
-    """Dispatcher signal fired once a scale's coordinator is in hass.data."""
-    return f"{DOMAIN}_scale_ready_{scale_entry_id}"
+def _async_wake_waiting_detectors(hass: HomeAssistant, scale_entry: ConfigEntry) -> None:
+    """Reload any detector that gave up waiting for this scale.
+
+    A detector set up before its scale raises ConfigEntryNotReady, and Home Assistant
+    answers that with a retry on a backoff that grows to minutes.  Nothing is broken
+    in the meantime, but nothing is being detected either, purely because of the order
+    the two entries happened to be set up in.
+
+    The nudge runs from the scale rather than from the detector, and that is the whole
+    point.  1.6.0-beta.1 had the detector subscribe to a dispatcher signal before
+    raising — which does not work, and fails silently: Home Assistant runs an entry's
+    async_on_unload callbacks when its setup raises, so the subscription was torn down
+    a moment after being made and the signal arrived to nobody.  On this install the
+    detector sat in setup_retry with every statistic missing until something reloaded
+    it by hand.  A caller that owns nothing and simply reloads has no such lifecycle
+    to get wrong.
+    """
+    for other in hass.config_entries.async_entries(DOMAIN):
+        if (
+            other.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_DETECTOR
+            and other.data.get(CONF_SCALE_ENTRY) == scale_entry.entry_id
+            and other.state is ConfigEntryState.SETUP_RETRY
+        ):
+            _LOGGER.info("Scale is up; reloading the brew detector that was waiting")
+            hass.config_entries.async_schedule_reload(other.entry_id)
 
 # Lovelace card bundled with the integration.  We serve the whole www/
 # directory (a directory static path is more reliable than a single-file one)
@@ -178,12 +196,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     if isinstance(coordinator, DifluidMicrobalanceCoordinator):
-        # Tell any detector waiting on this scale that its coordinator now exists.
-        # Without this a detector that lost the load-order race would sit in
-        # ConfigEntryNotReady backoff for up to a couple of minutes after a restart,
-        # not detecting anything, for no reason other than the order HA happened to
-        # set the two entries up in.
-        async_dispatcher_send(hass, _scale_ready_signal(entry.entry_id))
+        _async_wake_waiting_detectors(hass, entry)
         await _async_import_detector(hass, entry)
 
     # async_start never raises — if device is off it silently waits for BLE advertisement.
@@ -198,15 +211,9 @@ async def _async_setup_detector(hass: HomeAssistant, entry: ConfigEntry) -> bool
     scale_entry_id = entry.data.get(CONF_SCALE_ENTRY)
     coordinator = hass.data.setdefault(DOMAIN, {}).get(scale_entry_id)
     if not isinstance(coordinator, DifluidMicrobalanceCoordinator):
-        # The scale is not set up yet — or at all.  Retry on backoff, and also wake
-        # up the moment the scale announces itself, whichever comes first.
-        entry.async_on_unload(
-            async_dispatcher_connect(
-                hass,
-                _scale_ready_signal(scale_entry_id),
-                lambda: hass.config_entries.async_schedule_reload(entry.entry_id),
-            )
-        )
+        # The scale is not set up yet — or at all.  Home Assistant retries on a
+        # backoff, and the scale reloads us the moment it finishes its own setup; see
+        # _async_wake_waiting_detectors for why the waking is done from that side.
         raise ConfigEntryNotReady(
             f"Waiting for the scale ({scale_entry_id}) this detector reads"
         )
