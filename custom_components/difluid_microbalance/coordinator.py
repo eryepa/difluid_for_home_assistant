@@ -111,14 +111,19 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         is_ti: bool = False,
         license_key: str = "",
         model: str = "",
-        brew: Optional["BrewSession"] = None,
     ) -> None:
         super().__init__(hass, _LOGGER, name=f"{DOMAIN}_{address}", update_interval=None)
         self.address = address
         self.is_ti = is_ti
         self.license_key = license_key
         self.model = model
-        self.brew = brew
+        #: Detector sessions reading this scale's weight stream.
+        #:
+        #: A list rather than the single `brew` slot it replaces, because the scale
+        #: entry no longer creates the session — a detector entry does, and it can
+        #: load after this coordinator, before it, or be added and removed while the
+        #: scale keeps streaming.  A list makes all three the same case.
+        self._brew_consumers: list["BrewSession"] = []
         self._preferred_char_uuid = (
             CHARACTERISTIC_UUID_MICROBALANCE_TI if is_ti else CHARACTERISTIC_UUID_MICROBALANCE
         )
@@ -139,6 +144,29 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         #: reported once instead of five times a second.  See _note_weight_unit.
         self._last_unit_idx: Optional[int] = None
         self.data = MicrobalanceData()
+
+    # ── detector entries reading this scale ──────────────────────────────────
+
+    def add_brew_consumer(self, session: "BrewSession") -> Callable[[], None]:
+        """Feed `session` this scale's weight stream.  Returns an unsubscribe.
+
+        The stream is handed over as a direct call from the BLE notification handler
+        rather than through the state machine.  It arrives at roughly 5 Hz, and while
+        the weight sensor does write a state per packet anyway, routing the detector
+        through that would tie its timing to the recorder's and put a hop between a
+        sample and the code deciding whether the pour has stopped.
+
+        The caller passes the returned callable to `entry.async_on_unload`, so a
+        detector that is reloaded — which every threshold change does — stops being
+        fed before its replacement starts.
+        """
+        self._brew_consumers.append(session)
+
+        def _remove() -> None:
+            if session in self._brew_consumers:
+                self._brew_consumers.remove(session)
+
+        return _remove
 
     # ── public API for button / select / number entities ─────────────────────
 
@@ -457,8 +485,8 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         self.data.connected = False
         self.async_set_updated_data(self.data)
         # The stream is gone; samples either side of the gap are not comparable.
-        if self.brew is not None:
-            self.brew.reset()
+        for session in self._brew_consumers:
+            session.reset()
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
         if _time.monotonic() < self._no_reconnect_until:
@@ -613,8 +641,8 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
                 self._last_weight_change_time = asyncio.get_event_loop().time()
                 self._last_weight_value = self.data.weight
             # Feed the dose/pour detector.  Never raises — see BrewSession.feed.
-            if self.brew is not None:
-                self.brew.feed(self.data.weight, self.data.flow_rate)
+            for session in self._brew_consumers:
+                session.feed(self.data.weight, self.data.flow_rate)
             updated = True
 
         elif func == 0x03 and cmd == 0x05 and len(payload) >= 3:

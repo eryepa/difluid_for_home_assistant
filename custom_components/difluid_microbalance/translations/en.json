@@ -1,16 +1,32 @@
 {
   "config": {
     "step": {
-      "bluetooth_confirm": {
-        "title": "DiFluid Device Found",
-        "description": "Add **{name}** to Home Assistant?"
-      },
       "user": {
+        "title": "Add DiFluid Device",
+        "description": "Add another Bluetooth device, or add the brew detector that reads your scale.",
+        "menu_options": {
+          "device": "Bluetooth device (scale or refractometer)",
+          "detector": "Brew detector"
+        }
+      },
+      "device": {
         "title": "Add DiFluid Device",
         "description": "Select a nearby DiFluid device, or choose **Enter MAC address manually** if nothing appears.",
         "data": {
           "address": "Device"
         }
+      },
+      "detector": {
+        "title": "Add Brew Detector",
+        "description": "The brew detector watches a scale's weight stream and works out doses, pours and shot ratios. It owns the brew statistics and appears as its own device.\n\nThe refractometer is optional and is not used yet.",
+        "data": {
+          "scale_entry": "Scale",
+          "r2_entry": "Refractometer (optional)"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "DiFluid Device Found",
+        "description": "Add **{name}** to Home Assistant?"
       },
       "mac": {
         "title": "Add DiFluid Device (MAC)",
@@ -26,7 +42,8 @@
     },
     "abort": {
       "already_configured": "This device is already configured.",
-      "not_supported": "This device is not supported."
+      "not_supported": "This device is not supported.",
+      "no_scale": "Add a scale first — the brew detector has nothing to read without one."
     }
   },
   "options": {
@@ -58,33 +75,69 @@
       "invalid_range_order": "A minimum is above its maximum. Dose, yield and ratio each need minimum ≤ maximum, or the detector can never match anything."
     },
     "abort": {
-      "no_options": "The R2 has no detector settings — open the scale's entry instead."
+      "no_options": "Nothing to configure here. The brew detector's thresholds live on the Brew Detector entry."
     }
   },
   "entity": {
     "sensor": {
-      "weight": { "name": "Weight" },
-      "flow_rate": { "name": "Flow Rate" },
-      "timer": { "name": "Timer" },
-      "battery": { "name": "Battery" },
-      "device_status": { "name": "Device Status" },
-      "last_dose": { "name": "Last Dose" },
-      "last_yield": { "name": "Last Yield" },
-      "brew_ratio": { "name": "Brew Ratio" },
-      "integration_version": { "name": "Integration Version" },
-      "concentration": { "name": "Concentration (TDS)" },
-      "refractive_index": { "name": "Refractive Index" },
-      "prism_temperature": { "name": "Prism Temperature" },
-      "sample_temperature": { "name": "Sample Temperature" },
-      "test_status": { "name": "Test Status" }
+      "weight": {
+        "name": "Weight"
+      },
+      "flow_rate": {
+        "name": "Flow Rate"
+      },
+      "timer": {
+        "name": "Timer"
+      },
+      "battery": {
+        "name": "Battery"
+      },
+      "device_status": {
+        "name": "Device Status"
+      },
+      "last_dose": {
+        "name": "Last Dose"
+      },
+      "last_yield": {
+        "name": "Last Yield"
+      },
+      "brew_ratio": {
+        "name": "Brew Ratio"
+      },
+      "integration_version": {
+        "name": "Integration Version"
+      },
+      "concentration": {
+        "name": "Concentration (TDS)"
+      },
+      "refractive_index": {
+        "name": "Refractive Index"
+      },
+      "prism_temperature": {
+        "name": "Prism Temperature"
+      },
+      "sample_temperature": {
+        "name": "Sample Temperature"
+      },
+      "test_status": {
+        "name": "Test Status"
+      }
     },
     "button": {
-      "tare": { "name": "Tare" },
-      "timer_start": { "name": "Start/Stop" },
-      "test": { "name": "Start Test" }
+      "tare": {
+        "name": "Tare"
+      },
+      "timer_start": {
+        "name": "Start/Stop"
+      },
+      "test": {
+        "name": "Start Test"
+      }
     },
     "number": {
-      "auto_shutdown": { "name": "Auto-disconnect Bluetooth" }
+      "auto_shutdown": {
+        "name": "Auto-disconnect Bluetooth"
+      }
     },
     "select": {
       "mode": {

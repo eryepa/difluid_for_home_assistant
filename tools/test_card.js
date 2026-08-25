@@ -39,40 +39,83 @@ function loadCardHelpers() {
   vm.runInContext(
     src.slice(0, cut) +
       "\n;globalThis.__exported = { SENSOR_ORDER, CONTROL_ORDER, EXCLUDE_CONTROLS," +
-      " STATS_ORDER, DIAG_ORDER, rank, inList, isStat, statRank };",
+      " STATS_ORDER, DIAG_ORDER, rank, inList, isStat, statRank, DOMAIN };",
     sandbox,
     { filename: CARD }
   );
   return sandbox.__exported;
 }
 
-// The scale's 22 entities, in registry order, as ha_get_device reports them.  Registry
-// order matters: it is the tie-breaker the sort falls back on, so a fixture that
-// silently sorted them would hide the very ambiguity worth catching.
-const IDS = [
-  "sensor.microbalance_304268_weight",
-  "sensor.microbalance_304268_flow_rate",
-  "sensor.microbalance_304268_timer",
-  "sensor.microbalance_304268_battery",
-  "sensor.microbalance_304268_device_status",
-  "button.microbalance_304268_tare",
-  "number.microbalance_304268_auto_shutdown",
-  "select.microbalance_304268_mode",
-  "button.microbalance_304268_timer_start",
-  "sensor.kitchen_microbalance_304268_last_dose",
-  "sensor.kitchen_microbalance_304268_last_yield",
-  "sensor.kitchen_microbalance_304268_brew_ratio",
-  "sensor.kitchen_microbalance_304268_integration_version",
-  "sensor.kitchen_microbalance_304268_brew_count",
-  "sensor.kitchen_microbalance_304268_brew_dose",
-  "sensor.kitchen_microbalance_304268_brew_yield",
-  "sensor.kitchen_microbalance_304268_brew_count_period",
-  "sensor.kitchen_microbalance_304268_brews_per_day",
-  "sensor.kitchen_microbalance_304268_coffee_ground",
-  "sensor.kitchen_microbalance_304268_coffee_ground_period",
-  "sensor.kitchen_microbalance_304268_coffee_per_day",
-  "button.kitchen_microbalance_304268_reset_period",
+// _clusterIds is a method on the card class, so it cannot be lifted out of the file
+// the way the pure helpers above are.  It is read out of the source and called with a
+// hand-made `this` instead — which still fails if someone edits it, and that is the
+// point: a reimplementation here would pass forever.
+function loadClusterFn() {
+  const src = fs.readFileSync(CARD, "utf8");
+  const start = src.indexOf("  _clusterIds() {");
+  if (start < 0) throw new Error("no _clusterIds() in the card — did it get renamed?");
+  const end = src.indexOf("\n  }", start);
+  const body = src.slice(src.indexOf("{", start) + 1, end);
+  return new Function("DOMAIN", `return function () {${body}\n};`)(DOMAIN_NAME);
+}
+
+const DOMAIN_NAME = "difluid_microbalance";
+
+// Device ids.  SCALE is the real one this install has; DETECTOR is the service device
+// the brew statistics moved onto in 1.5.0, hung off the scale with via_device; R2 is
+// the refractometer, which is linked to neither and must therefore stay out.
+const SCALE = "4a94644ad88667b1c30c138cdfd3164f";
+const DETECTOR = "d3tec70000000000000000000000000f";
+const R2 = "12f1u1d12f1u1d12f1u1d12f1u1d1200";
+
+const DEVICES = {
+  [SCALE]: { id: SCALE, name: "Kitchen Microbalance 304268",
+             identifiers: [[DOMAIN_NAME, "scale-entry"]] },
+  [DETECTOR]: { id: DETECTOR, name: "Brew Detector", via_device_id: SCALE,
+                identifiers: [[DOMAIN_NAME, "detector-entry"]] },
+  [R2]: { id: R2, name: "DiFluid R2 301055",
+          identifiers: [[DOMAIN_NAME, "r2-entry"]] },
+  // Hung off the scale by a different integration — a Bluetooth proxy or a power
+  // monitor plugged into the same socket will do this.  via_device_id alone would
+  // sweep it in, so the identifiers check in _clusterIds is what keeps it out.
+  "ffff": {
+    id: "ffff",
+    name: "Some other integration's device",
+    via_device_id: SCALE,
+    identifiers: [["zha", "x"]],
+  },
+};
+
+// The 22 entities, in registry order, as ha_get_device reports them, each with the
+// device that owns it after the split.  Registry order matters: it is the tie-breaker
+// the sort falls back on, so a fixture that silently sorted them would hide the very
+// ambiguity worth catching.
+const ENTITIES = [
+  ["sensor.microbalance_304268_weight", SCALE],
+  ["sensor.microbalance_304268_flow_rate", SCALE],
+  ["sensor.microbalance_304268_timer", SCALE],
+  ["sensor.microbalance_304268_battery", SCALE],
+  ["sensor.microbalance_304268_device_status", SCALE],
+  ["button.microbalance_304268_tare", SCALE],
+  ["number.microbalance_304268_auto_shutdown", SCALE],
+  ["select.microbalance_304268_mode", SCALE],
+  ["button.microbalance_304268_timer_start", SCALE],
+  ["sensor.kitchen_microbalance_304268_last_dose", DETECTOR],
+  ["sensor.kitchen_microbalance_304268_last_yield", DETECTOR],
+  ["sensor.kitchen_microbalance_304268_brew_ratio", DETECTOR],
+  ["sensor.kitchen_microbalance_304268_integration_version", SCALE],
+  ["sensor.kitchen_microbalance_304268_brew_count", DETECTOR],
+  ["sensor.kitchen_microbalance_304268_brew_dose", DETECTOR],
+  ["sensor.kitchen_microbalance_304268_brew_yield", DETECTOR],
+  ["sensor.kitchen_microbalance_304268_brew_count_period", DETECTOR],
+  ["sensor.kitchen_microbalance_304268_brews_per_day", DETECTOR],
+  ["sensor.kitchen_microbalance_304268_coffee_ground", DETECTOR],
+  ["sensor.kitchen_microbalance_304268_coffee_ground_period", DETECTOR],
+  ["sensor.kitchen_microbalance_304268_coffee_per_day", DETECTOR],
+  ["button.kitchen_microbalance_304268_reset_period", DETECTOR],
 ];
+
+const IDS = ENTITIES.map(([id]) => id);
 
 // The partition from _build(), kept in the same order — statistics and diagnostics
 // claim their rows first, and what is left is a live reading or a control.
@@ -153,6 +196,53 @@ check(
   "every entity is placed exactly once, bar the excluded auto-disconnect",
   stats.length + diagnostics.length + sensors.length + controls.length,
   IDS.length - 1
+);
+
+// ── the device cluster ──────────────────────────────────────────────────────
+// The rows above only exist if the card looks at both devices.  Before 1.5.0 it
+// filtered on a single device_id, which after the split would have shown a card of
+// weight and flow with no statistics — or, configured on the detector, statistics
+// with no weight.
+const clusterFn = loadClusterFn();
+const clusterFrom = (device) =>
+  [...clusterFn.call({ _hass: { devices: DEVICES }, _config: { device } })].sort();
+
+const both = [SCALE, DETECTOR].sort();
+
+check(
+  "a card configured on the scale reaches the detector hanging off it",
+  clusterFrom(SCALE),
+  both
+);
+
+// The direction that keeps existing dashboards working: every card config written
+// before the split names the scale, but a card added after it may well name the
+// detector, and the two must produce the same rows.
+check(
+  "a card configured on the detector reaches back up to the scale",
+  clusterFrom(DETECTOR),
+  both
+);
+
+// The R2 has no via_device link to either, so it must not be swept in — its TDS rows
+// are iteration 2, and until then a card silently growing three temperature readings
+// would be a surprise, not a feature.
+check(
+  "the R2 and other integrations' devices stay out of the cluster",
+  clusterFrom(R2),
+  [R2]
+);
+
+// What the picker offers on a fresh card.  Reached through the same source, so a
+// rename of via_device handling breaks this too.
+const entitiesFor = (device) => {
+  const cluster = clusterFn.call({ _hass: { devices: DEVICES }, _config: { device } });
+  return ENTITIES.filter(([, dev]) => cluster.has(dev)).map(([id]) => id);
+};
+check(
+  "configured either way, the card draws the same 22 entities",
+  entitiesFor(DETECTOR).length,
+  entitiesFor(SCALE).length
 );
 
 console.log(ok ? "\nOK" : "\nFAILED");

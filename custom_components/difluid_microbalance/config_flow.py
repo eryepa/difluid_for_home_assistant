@@ -17,12 +17,18 @@ from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import callback
 
 from .brew_detect import TUNABLE_FIELDS, DetectorConfig
+from .brew_session import DEFAULT_STORE_KEY
 from .const import (
     CONF_DEVICE_TYPE,
     CONF_IS_TI,
     CONF_LICENSE_KEY,
     CONF_MODEL,
+    CONF_R2_ENTRY,
     CONF_RECORD_DATASET,
+    CONF_SCALE_ENTRY,
+    CONF_STORE_KEY,
+    CONF_UID_PREFIX,
+    DEVICE_TYPE_DETECTOR,
     DEVICE_TYPE_MICROBALANCE,
     DEVICE_TYPE_R2,
     DOMAIN,
@@ -30,6 +36,11 @@ from .const import (
     SERVICE_UUID_MICROBALANCE_TI,
     SERVICE_UUID_R2,
 )
+
+
+#: Sentinel for "no refractometer" in the detector form.  vol.In needs a real key,
+#: and None is not selectable in a dropdown.
+_R2_NONE = "none"
 
 
 def _device_type(service_uuids: list[str]) -> str | None:
@@ -113,9 +124,104 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
             description_placeholders={"name": info.name or info.address},
         )
 
+    # ── entries of a given kind, for the detector's two selectors ─────────────
+
+    def _entries_of_type(self, device_type: str) -> dict[str, str]:
+        """entry_id -> title, for every loaded entry of one device type."""
+        return {
+            entry.entry_id: entry.title
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+            if entry.data.get(CONF_DEVICE_TYPE, DEVICE_TYPE_MICROBALANCE) == device_type
+        }
+
     # ── user-initiated flow ────────────────────────────────────────────────────
 
     async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        # The fork only exists once there is a scale to attach a detector to.  Before
+        # that there is exactly one sensible thing to add, and a menu offering an
+        # option that immediately aborts is worse than no menu.
+        if self._entries_of_type(DEVICE_TYPE_MICROBALANCE):
+            return self.async_show_menu(
+                step_id="user", menu_options=["device", "detector"]
+            )
+        return await self.async_step_device()
+
+    async def async_step_detector(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Add the brew detector: which scale to read, and optionally which R2."""
+        scales = self._entries_of_type(DEVICE_TYPE_MICROBALANCE)
+        if not scales:
+            return self.async_abort(reason="no_scale")
+
+        if user_input is not None:
+            scale_id = user_input[CONF_SCALE_ENTRY]
+            # One detector per scale.  Two of them would race for the same weight
+            # stream and — worse — for the same stored brew_count.
+            await self.async_set_unique_id(
+                f"{DEVICE_TYPE_DETECTOR}_{scale_id}", raise_on_progress=False
+            )
+            self._abort_if_unique_id_configured()
+            r2_id = user_input.get(CONF_R2_ENTRY) or None
+            if r2_id == _R2_NONE:
+                r2_id = None
+            # CONF_UID_PREFIX and CONF_STORE_KEY are deliberately not set here: both
+            # derive from this entry's own entry_id, which Home Assistant assigns
+            # after the flow returns.  __init__ seeds them on first setup.
+            return self.async_create_entry(
+                title="Brew Detector",
+                data={
+                    CONF_DEVICE_TYPE: DEVICE_TYPE_DETECTOR,
+                    CONF_SCALE_ENTRY: scale_id,
+                    CONF_R2_ENTRY: r2_id,
+                },
+            )
+
+        r2s = {_R2_NONE: "None", **self._entries_of_type(DEVICE_TYPE_R2)}
+        return self.async_show_form(
+            step_id="detector",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_SCALE_ENTRY, default=next(iter(scales))
+                    ): vol.In(scales),
+                    vol.Optional(CONF_R2_ENTRY, default=_R2_NONE): vol.In(r2s),
+                }
+            ),
+        )
+
+    async def async_step_import(
+        self, import_data: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """Create the detector entry for an install that predates it.
+
+        Started by the scale's own setup when it finds detector thresholds still
+        sitting in its options and no detector referencing it.  The two keys that
+        matter are carried in rather than derived: CONF_UID_PREFIX is the scale's
+        entry_id, so the seven statistics entities keep the unique_ids they already
+        have and stay the same entities, and CONF_STORE_KEY is the singleton's old
+        key, so brew_count and the last pair come across with them.
+        """
+        scale_id = import_data[CONF_SCALE_ENTRY]
+        await self.async_set_unique_id(
+            f"{DEVICE_TYPE_DETECTOR}_{scale_id}", raise_on_progress=False
+        )
+        self._abort_if_unique_id_configured()
+        return self.async_create_entry(
+            title="Brew Detector",
+            data={
+                CONF_DEVICE_TYPE: DEVICE_TYPE_DETECTOR,
+                CONF_SCALE_ENTRY: scale_id,
+                CONF_R2_ENTRY: import_data.get(CONF_R2_ENTRY),
+                CONF_UID_PREFIX: scale_id,
+                CONF_STORE_KEY: DEFAULT_STORE_KEY,
+            },
+            options=import_data.get("options", {}),
+        )
+
+    async def async_step_device(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         current = self._async_current_ids()
@@ -158,7 +264,7 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
         }
         choices["manual"] = "Enter MAC address manually…"
         return self.async_show_form(
-            step_id="user",
+            step_id="device",
             data_schema=vol.Schema(
                 {vol.Required(CONF_ADDRESS, default="manual"): vol.In(choices)}
             ),
@@ -306,13 +412,15 @@ def _misordered_pairs(values: dict[str, Any]) -> list[tuple[str, str]]:
 class DifluidOptionsFlow(OptionsFlow):
     """Tune the dose/pour detector without editing code or redeploying.
 
-    Only exposed for the scale — the R2 entry has nothing to tune here.
+    Only exposed for the detector entry.  It used to hang off the scale, which was
+    the only entry that existed to hang it on; now the thresholds live with the
+    thing they configure, and neither BLE entry has anything to tune here.
     """
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        if self.config_entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_R2:
+        if self.config_entry.data.get(CONF_DEVICE_TYPE) != DEVICE_TYPE_DETECTOR:
             return self.async_abort(reason="no_options")
 
         errors: dict[str, str] = {}

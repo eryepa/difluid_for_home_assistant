@@ -2,9 +2,17 @@
 
 Holds the most recent dose, pour and paired shot, survives restarts and BLE drops,
 and fires a bus event so results are visible in Developer Tools -> Events without
-any UI.  One instance per Home Assistant, kept in `hass.data[DOMAIN][BREW_KEY]`, so
-the R2 coordinator can read the pair in iteration 2 without reaching into the scale
-coordinator.
+any UI.
+
+One instance per detector config entry, owned by that entry and kept in
+`hass.data[DOMAIN][entry.entry_id]` alongside the coordinators.  It used to be a
+singleton under a `BREW_KEY` bucket, on the theory that the R2 would one day read
+the pair without reaching into the scale coordinator.  That day never came, and the
+singleton cost more than it saved: the session's entities were registered against
+the *scale's* device because the scale entry was the only thing that could register
+them, and unloading an entry could not tell whether anyone else still needed the
+session.  Giving the detector its own entry answers both — the owner is explicit,
+and the entities belong to a device that is the detector rather than the scale.
 """
 
 from __future__ import annotations
@@ -31,12 +39,18 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-BREW_KEY = "brew"
 EVENT_BREW_DETECTED = f"{DOMAIN}_brew_detected"
 EVENT_PLATEAU_DETECTED = f"{DOMAIN}_plateau_detected"
 
 _STORE_VERSION = 1
-_STORE_KEY = f"{DOMAIN}.brew"
+
+#: Where the one and only session stored itself back when there was one and only
+#: session.  A detector entry created by importing an existing install keeps this
+#: key, which is the whole reason brew_count and the last pair survive the move to
+#: a config entry of their own; a detector created from scratch gets a key derived
+#: from its entry_id.  Either way the key is decided once, at entry creation, and
+#: stored in entry.data as CONF_STORE_KEY — see const.py.
+DEFAULT_STORE_KEY = f"{DOMAIN}.brew"
 _SAVE_DELAY = 5  # seconds; the scale streams fast, no need to hit disk per event
 
 DATASET_FILENAME = "difluid_brew_dataset.jsonl"
@@ -111,12 +125,17 @@ class WeighEvent:
 class BrewSession:
     """Detects dose/pour plateaus on the weight stream and remembers the last pair."""
 
-    def __init__(self, hass: HomeAssistant, config: Optional[DetectorConfig] = None):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config: Optional[DetectorConfig] = None,
+        store_key: str = DEFAULT_STORE_KEY,
+    ):
         self.hass = hass
         self.cfg = config or DetectorConfig()
         self._detector = BrewDetector(self.cfg)
         self._pairer = BrewPairer(self.cfg)
-        self._store: Store = Store(hass, _STORE_VERSION, _STORE_KEY)
+        self._store: Store = Store(hass, _STORE_VERSION, store_key)
         self._listeners: list = []
         self._recent: list[Sample] = []
         self.record_dataset = False
@@ -249,8 +268,8 @@ class BrewSession:
     async def async_remove(self) -> None:
         """Forget everything, in memory and on disk.
 
-        Only ever called when the config entry is being removed, never on a reload —
-        see async_remove_session.
+        Only ever called when the detector's config entry is being removed, never on a
+        reload — see async_remove_entry in __init__.py.
 
         Store.async_remove cancels the pending delayed save before deleting the file,
         which matters here: _save schedules a write five seconds out, so without that
@@ -539,6 +558,24 @@ class BrewSession:
     def _save(self) -> None:
         self._store.async_delay_save(self._snapshot, _SAVE_DELAY)
 
+    async def async_flush(self) -> None:
+        """Write the pending snapshot now instead of in _SAVE_DELAY seconds.
+
+        Called when the detector entry is unloaded.  Every write goes through
+        async_delay_save, which is right while the scale is streaming — five samples a
+        second must not be five disk writes a second — but it means up to five seconds
+        of state is only in memory at any moment.
+
+        That was free when the session was a singleton: an entry reload dropped the
+        entry, never the session object, so the unwritten snapshot was still there
+        afterwards.  Now the entry owns the session and a reload rebuilds it from
+        disk — and a reload is exactly what changing a threshold does.  Without this
+        flush, tightening a threshold in the seconds after weighing the beans would
+        drop the dose, which is the specific failure the old singleton comment warned
+        about and the one it was shaped to avoid.
+        """
+        await self._store.async_save(self._snapshot())
+
     def _snapshot(self) -> dict[str, Any]:
         return {
             "last_dose": asdict(self.last_dose) if self.last_dose else None,
@@ -589,40 +626,39 @@ class BrewSession:
             _LOGGER.warning("Could not append brew dataset to %s: %s", path, err)
 
 
-async def async_get_session(
-    hass: HomeAssistant, config: DetectorConfig, record_dataset: bool
+def detector_device_info(entry) -> "DeviceInfo":
+    """The device a detector entry's entities belong to.
+
+    A service device rather than a physical one, hung off the scale with via_device so
+    the relationship is visible in the UI and the card can find one from the other.
+
+    It exists because Home Assistant's device page renders exactly four cards and
+    decides which one an entity lands in from its domain plus entity_category — there
+    is no "statistics" card to ask for, and no way to order them.  On the scale's page
+    the statistics could only ever be squeezed in beside the weight and the flow rate,
+    or hidden under Diagnostic.  On a page of their own they are simply what the
+    device reads, which is what they are.
+    """
+    from homeassistant.helpers.device_registry import DeviceEntryType
+    from homeassistant.helpers.entity import DeviceInfo
+
+    from .const import CONF_SCALE_ENTRY
+
+    return DeviceInfo(
+        identifiers={(DOMAIN, entry.entry_id)},
+        name="Brew Detector",
+        manufacturer="Difluid",
+        model="Brew Detector",
+        entry_type=DeviceEntryType.SERVICE,
+        via_device=(DOMAIN, entry.data[CONF_SCALE_ENTRY]),
+    )
+
+
+async def async_create_session(
+    hass: HomeAssistant, config: DetectorConfig, record_dataset: bool, store_key: str
 ) -> BrewSession:
-    """Return the shared session, creating and loading it on first use."""
-    bucket = hass.data.setdefault(DOMAIN, {})
-    session: Optional[BrewSession] = bucket.get(BREW_KEY)
-    if session is None:
-        session = BrewSession(hass, config)
-        await session.async_load()
-        bucket[BREW_KEY] = session
+    """Build a detector entry's session and restore whatever it stored last time."""
+    session = BrewSession(hass, config, store_key)
+    await session.async_load()
     session.apply_config(config, record_dataset)
     return session
-
-
-async def async_remove_session(hass: HomeAssistant) -> None:
-    """Drop the shared session and its stored state.
-
-    Call this only when a scale's config entry is being *removed*, never when it is
-    merely unloaded.  Home Assistant unloads an entry for a reload as well — which
-    every options change triggers — and the session is deliberately shared and
-    deliberately outlives that: it is what carries last_pair, brew_count and an
-    in-flight pending dose across a threshold change made between weighing the beans
-    and pulling the shot.
-
-    Without this the session survived removal too: `hass.data[DOMAIN][BREW_KEY]`
-    stayed put while only the entry_id key was popped, so deleting the integration
-    and adding it again resurrected the old last_pair, the old brew_count and the old
-    detector config — a "clean" reinstall that was not clean.
-    """
-    bucket = hass.data.get(DOMAIN)
-    if not bucket:
-        return
-    session: Optional[BrewSession] = bucket.pop(BREW_KEY, None)
-    if session is None:
-        return
-    await session.async_remove()
-    _LOGGER.info("Removed the shared brew session and its stored state")

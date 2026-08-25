@@ -7,8 +7,15 @@ from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .brew_session import BREW_KEY, BrewSession
-from .const import CONF_DEVICE_TYPE, CONF_IS_TI, DEVICE_TYPE_R2, DOMAIN
+from .brew_session import BrewSession, detector_device_info
+from .const import (
+    CONF_DEVICE_TYPE,
+    CONF_IS_TI,
+    CONF_UID_PREFIX,
+    DEVICE_TYPE_DETECTOR,
+    DEVICE_TYPE_R2,
+    DOMAIN,
+)
 from .coordinator import DifluidMicrobalanceCoordinator
 from .coordinator_r2 import DifluidR2Coordinator
 
@@ -30,11 +37,24 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    is_r2 = entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_R2
+    device_type = entry.data.get(CONF_DEVICE_TYPE)
     is_ti = entry.data.get(CONF_IS_TI, False)
     coordinator = hass.data[DOMAIN][entry.entry_id]
 
-    if is_r2:
+    if device_type == DEVICE_TYPE_DETECTOR:
+        session: BrewSession = coordinator
+        async_add_entities(
+            [
+                ResetPeriodButton(
+                    session,
+                    entry.data.get(CONF_UID_PREFIX) or entry.entry_id,
+                    detector_device_info(entry),
+                )
+            ]
+        )
+        return
+
+    if device_type == DEVICE_TYPE_R2:
         device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
             name=entry.title,
@@ -49,14 +69,12 @@ async def async_setup_entry(
             manufacturer="Difluid",
             model="Microbalance Ti" if is_ti else "Microbalance",
         )
-        buttons: list[ButtonEntity] = [
-            TareButton(coordinator, entry, device_info),
-            TimerStartStopButton(coordinator, entry, device_info),
-        ]
-        session = hass.data.get(DOMAIN, {}).get(BREW_KEY)
-        if session is not None:
-            buttons.append(ResetPeriodButton(session, entry, device_info))
-        async_add_entities(buttons)
+        async_add_entities(
+            [
+                TareButton(coordinator, entry, device_info),
+                TimerStartStopButton(coordinator, entry, device_info),
+            ]
+        )
 
 
 # ── base classes ───────────────────────────────────────────────────────────────
@@ -123,21 +141,23 @@ class ResetPeriodButton(ButtonEntity):
     reachable for about five minutes a day, none of them the moment somebody decides to
     start a new month.  Same reasoning as DifluidBrewSensor.available.
 
-    DIAGNOSTIC, matching the statistics it resets.  Not because resetting a period is
-    diagnostic work, but because without a category this button is the only entity the
-    scale has that lands in the device page's Controls card — and one button is enough
-    to make that card appear.  Categorising it removes the card entirely.
+    No entity_category, so it lands in the Controls card next to the statistics it
+    resets.  1.4.0-beta.13 marked it DIAGNOSTIC, which was not a claim about the
+    button: on the scale's device page it was the sole entity without a category, and
+    one such entity is enough to make a Controls card appear there for a button that
+    has nothing to do with the scale.  On the detector's own page that card is exactly
+    where it belongs.
     """
 
     _attr_has_entity_name = True
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_name = "Reset Period"
     _attr_icon = "mdi:backup-restore"
     _attr_should_poll = False
 
-    def __init__(self, session: BrewSession, entry: ConfigEntry, device_info: DeviceInfo):
+    def __init__(self, session: BrewSession, uid_prefix: str, device_info: DeviceInfo):
         self._session = session
-        self._attr_unique_id = f"{entry.entry_id}_reset_period"
+        # Same prefix rule as the brew sensors — see DifluidBrewSensor.__init__.
+        self._attr_unique_id = f"{uid_prefix}_reset_period"
         self._attr_device_info = device_info
 
     @property

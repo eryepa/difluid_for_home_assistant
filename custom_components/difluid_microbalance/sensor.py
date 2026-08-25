@@ -19,8 +19,15 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .brew_session import BREW_KEY, BrewSession
-from .const import CONF_DEVICE_TYPE, CONF_IS_TI, DEVICE_TYPE_R2, DOMAIN
+from .brew_session import BrewSession, detector_device_info
+from .const import (
+    CONF_DEVICE_TYPE,
+    CONF_IS_TI,
+    CONF_UID_PREFIX,
+    DEVICE_TYPE_DETECTOR,
+    DEVICE_TYPE_R2,
+    DOMAIN,
+)
 from .coordinator import DifluidMicrobalanceCoordinator, MicrobalanceData
 from .coordinator_r2 import DifluidR2Coordinator, R2Data
 
@@ -171,11 +178,11 @@ def _period_attrs(session) -> dict:
 # gives the Prometheus exporter a numeric series to publish.
 #
 # entity_category = DIAGNOSTIC on the five "last shot" sensors moves them into the
-# Diagnostic panel of the device page and out of the way of the statistics below,
-# which is what they are: the working parts of one brew, useful when a result looks
-# wrong and noise the rest of the time.  It changes *only* their grouping — entity_id
-# is assigned at first registration and does not depend on the category, so the
-# Prometheus rules and the notification email keep resolving, and both recorder
+# Diagnostic panel of the detector's device page and out of the way of the statistics
+# below, which is what they are: the working parts of one brew, useful when a result
+# looks wrong and noise the rest of the time.  It changes *only* their grouping —
+# entity_id is assigned at first registration and does not depend on the category, so
+# the Prometheus rules and the notification email keep resolving, and both recorder
 # history and long-term statistics carry on uninterrupted.
 BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
     DifluidBrewSensorDescription(
@@ -269,14 +276,13 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
     # An odometer, a trip meter and a daily rate for each of two quantities: cups
     # drunk and coffee ground.
     #
-    # All six carry entity_category=DIAGNOSTIC so that the device page's Sensors card
-    # holds only what the scale is reading right now — weight, flow, timer, battery,
-    # status.  Diagnostic is not a judgement about these numbers; it is the only place
-    # they can go.  That page renders exactly four cards, and which one an entity lands
-    # in is computed from its domain plus entity_category: a sensor with no category
-    # goes to Sensors, and Controls exists only for domains you can operate.  There is
-    # no "Statistics" card to ask for and no way to order the cards — that grouping
-    # lives in the difluid-card instead, where the markup is ours.
+    # No entity_category on any of the six, deliberately.  1.4.0-beta.13 marked them
+    # DIAGNOSTIC to keep them out of the Sensors card, which on the scale's device page
+    # was the only way to stop them crowding out the weight and the flow rate — that
+    # page renders exactly four cards and picks one from domain plus entity_category,
+    # with no "statistics" card to ask for.  They are not on the scale's page any more.
+    # On the detector's own page nothing competes with them, so they belong in Sensors
+    # for the plain reason that they are what it reads.
     #
     # Brew Count is the cups odometer and is not duplicated: "cups, all time" is
     # already this number, and a second sensor reporting it would be a second answer
@@ -287,7 +293,6 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         name="Brew Count",
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:counter",
-        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: s.brew_count,
         attrs_fn=lambda s: {
             # The average dose over the whole odometer, which is only meaningful once
@@ -305,7 +310,6 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         name="Brew Count (Period)",
         state_class=SensorStateClass.TOTAL_INCREASING,
         icon="mdi:counter",
-        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: s.totals.period_brews(s.brew_count),
         attrs_fn=lambda s: _period_attrs(s),
     ),
@@ -316,7 +320,6 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         native_unit_of_measurement="cups/d",
         suggested_display_precision=2,
         icon="mdi:chart-line",
-        entity_category=EntityCategory.DIAGNOSTIC,
         ticks=True,
         value_fn=lambda s: s.totals.per_day(
             s.totals.period_brews(s.brew_count), dt_util.utcnow().timestamp()
@@ -335,7 +338,6 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfMass.GRAMS,
         suggested_display_precision=0,
         icon="mdi:coffee-maker",
-        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: s.totals.total_dose_g,
         # counting_since exists because this odometer and Brew Count do not start
         # level: the count has been running since the counter was added, while nobody
@@ -358,7 +360,6 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfMass.GRAMS,
         suggested_display_precision=0,
         icon="mdi:coffee-maker-outline",
-        entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda s: s.totals.period_dose_g(),
         attrs_fn=lambda s: _period_attrs(s),
     ),
@@ -369,7 +370,6 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         native_unit_of_measurement="g/d",
         suggested_display_precision=1,
         icon="mdi:chart-line",
-        entity_category=EntityCategory.DIAGNOSTIC,
         ticks=True,
         value_fn=lambda s: s.totals.per_day(
             s.totals.period_dose_g(), dt_util.utcnow().timestamp()
@@ -431,16 +431,29 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator = hass.data[DOMAIN][entry.entry_id]
+    held = hass.data[DOMAIN][entry.entry_id]
+    device_type = entry.data.get(CONF_DEVICE_TYPE)
 
-    if entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_R2:
+    if device_type == DEVICE_TYPE_DETECTOR:
+        session: BrewSession = held
+        prefix = entry.data.get(CONF_UID_PREFIX) or entry.entry_id
+        device_info = detector_device_info(entry)
         async_add_entities(
-            DifluidR2Sensor(coordinator, desc, entry) for desc in R2_SENSORS
+            (DifluidBrewRateSensor if desc.ticks else DifluidBrewSensor)(
+                session, desc, prefix, device_info
+            )
+            for desc in BREW_SENSORS
+        )
+        return
+
+    if device_type == DEVICE_TYPE_R2:
+        async_add_entities(
+            DifluidR2Sensor(held, desc, entry) for desc in R2_SENSORS
         )
         return
 
     entities: list = [
-        DifluidMicrobalanceSensor(coordinator, desc, entry)
+        DifluidMicrobalanceSensor(held, desc, entry)
         for desc in MICROBALANCE_SENSORS
     ]
 
@@ -450,16 +463,6 @@ async def async_setup_entry(
         manufacturer="Difluid",
         model="Microbalance Ti" if entry.data.get(CONF_IS_TI) else "Microbalance",
     )
-
-    session: BrewSession | None = hass.data.get(DOMAIN, {}).get(BREW_KEY)
-    if session is not None:
-        entities += [
-            (DifluidBrewRateSensor if desc.ticks else DifluidBrewSensor)(
-                session, desc, entry, device_info
-            )
-            for desc in BREW_SENSORS
-        ]
-
     entities.append(await DifluidVersionSensor.async_create(hass, entry, device_info))
     async_add_entities(entities)
 
@@ -528,12 +531,16 @@ class DifluidBrewSensor(SensorEntity):
         self,
         session: BrewSession,
         description: DifluidBrewSensorDescription,
-        entry: ConfigEntry,
+        uid_prefix: str,
         device_info: DeviceInfo,
     ) -> None:
         self._session = session
         self.entity_description = description
-        self._attr_unique_id = f"{entry.entry_id}_{description.key}"
+        # The prefix is the detector entry's CONF_UID_PREFIX, not its entry_id — see
+        # const.py.  On an install that predates the detector entry it is the scale's
+        # entry_id, which is what lets these entities keep the registry rows, and the
+        # entity_ids and history, they had when the scale owned them.
+        self._attr_unique_id = f"{uid_prefix}_{description.key}"
         self._attr_device_info = device_info
 
     async def async_added_to_hass(self) -> None:

@@ -99,19 +99,50 @@ class DifluidCard extends HTMLElement {
   }
 
   static getStubConfig(hass) {
-    const dev = Object.values(hass.devices || {}).find((d) =>
+    const ours = Object.values(hass.devices || {}).filter((d) =>
       (d.identifiers || []).some((ident) => ident[0] === DOMAIN)
     );
+    // Prefer a device nothing else hangs off: the scale, not the detector service
+    // device that hangs off it and not the R2, which is linked to neither.  Any of
+    // them resolves to the same cluster, but the scale is the one whose name reads
+    // like a heading.
+    const parents = new Set(ours.map((d) => d.via_device_id).filter(Boolean));
+    const dev = ours.find((d) => parents.has(d.id)) || ours[0];
     return { type: "custom:difluid-card", device: dev ? dev.id : "" };
   }
 
   // ── entity resolution ─────────────────────────────────────────────────────
+
+  // The devices this card draws from: the configured one plus anything linked to it
+  // by via_device, followed in both directions.
+  //
+  // A card used to be one device's worth of rows, which stopped being true when the
+  // brew detector moved onto a service device of its own: the scale holds the weight
+  // and the flow rate, the detector holds every statistic, and a card showing one
+  // without the other is half a card.  Following the link in both directions means a
+  // config pointing at either device produces the same rows, so the configs people
+  // already have keep working — they point at the scale, which is where all of this
+  // used to live.
+  _clusterIds() {
+    const devices = this._hass.devices || {};
+    const root = this._config.device;
+    const isOurs = (d) => (d.identifiers || []).some((ident) => ident[0] === DOMAIN);
+    const cluster = new Set([root]);
+    for (const [id, dev] of Object.entries(devices)) {
+      if (!isOurs(dev)) continue;
+      if (dev.via_device_id === root) cluster.add(id);          // children of root
+      const rootDev = devices[root];
+      if (rootDev && rootDev.via_device_id === id) cluster.add(id);  // root's parent
+    }
+    return cluster;
+  }
+
   _deviceEntities() {
     const hass = this._hass;
-    const deviceId = this._config.device;
+    const cluster = this._clusterIds();
     const ids = [];
     for (const [entityId, ent] of Object.entries(hass.entities || {})) {
-      if (ent.device_id !== deviceId) continue;
+      if (!cluster.has(ent.device_id)) continue;
       if (ent.disabled_by) continue;
       if (!(entityId in hass.states)) continue;
       ids.push(entityId);
@@ -120,7 +151,12 @@ class DifluidCard extends HTMLElement {
   }
 
   _deviceName() {
-    const dev = (this._hass.devices || {})[this._config.device];
+    const devices = this._hass.devices || {};
+    // Name the card after the physical device even when it is configured on the
+    // detector: "Brew Detector" is a poor heading for a card whose first row is the
+    // live weight.
+    const own = devices[this._config.device];
+    const dev = (own && own.via_device_id && devices[own.via_device_id]) || own;
     return (dev && (dev.name_by_user || dev.name)) || "DiFluid";
   }
 
