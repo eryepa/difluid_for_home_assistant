@@ -213,6 +213,96 @@ async def test_seeding_never_overwrites_an_imported_prefix(
         )
 
 
+async def test_a_scale_on_default_thresholds_is_migrated_too(
+    hass: HomeAssistant,
+) -> None:
+    """The failure 1.5.0-beta.1 shipped, as a test.
+
+    That version decided an install needed migrating by looking for detector
+    thresholds in the scale's options.  Options are only written when somebody opens
+    the options form and changes a value, so a scale running on the defaults has none
+    — `entry.options == {}` — and the check said "already migrated, nothing to do".
+
+    It said that on an install where the scale had, in the same release, stopped
+    creating the statistics entities.  Seven sensors went unavailable, registry rows
+    orphaned, and the log said nothing at all because the function returned before its
+    first line of logging.
+
+    Empty options is the *ordinary* case, which is what makes it worth pinning: the
+    version that broke it passed every other test in this file.
+    """
+    from custom_components.difluid_microbalance import _async_import_detector
+    from custom_components.difluid_microbalance.const import CONF_DETECTOR_IMPORTED
+
+    scale = MockConfigEntry(
+        domain=DOMAIN,
+        title="Microbalance 304268",
+        data={CONF_DEVICE_TYPE: DEVICE_TYPE_MICROBALANCE, "address": "AA:BB:CC:DD:EE:FF"},
+        options={},  # never touched the options form — the state this install was in
+    )
+    scale.add_to_hass(hass)
+
+    await _async_import_detector(hass, scale)
+    await hass.async_block_till_done()
+
+    detectors = [
+        e
+        for e in hass.config_entries.async_entries(DOMAIN)
+        if e.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_DETECTOR
+    ]
+    assert len(detectors) == 1, (
+        "a scale left on default thresholds got no detector, so its seven statistics "
+        "entities have no owner and read unavailable"
+    )
+    assert detectors[0].data[CONF_UID_PREFIX] == scale.entry_id
+    assert scale.data.get(CONF_DETECTOR_IMPORTED) is True
+
+    # Runs on every restart, so it must not keep creating them.
+    await _async_import_detector(hass, scale)
+    await hass.async_block_till_done()
+    assert (
+        len(
+            [
+                e
+                for e in hass.config_entries.async_entries(DOMAIN)
+                if e.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_DETECTOR
+            ]
+        )
+        == 1
+    )
+
+
+async def test_a_deliberately_deleted_detector_does_not_come_back(
+    hass: HomeAssistant,
+) -> None:
+    """The flag is the only thing separating "migrate once" from "recreate forever".
+
+    Dropping the options check made the condition "a scale with no detector pointing
+    at it", which is true again the moment somebody deletes theirs on purpose.
+    """
+    from custom_components.difluid_microbalance import _async_import_detector
+    from custom_components.difluid_microbalance.const import CONF_DETECTOR_IMPORTED
+
+    scale = MockConfigEntry(
+        domain=DOMAIN,
+        title="Microbalance 304268",
+        data={
+            CONF_DEVICE_TYPE: DEVICE_TYPE_MICROBALANCE,
+            "address": "AA:BB:CC:DD:EE:FF",
+            CONF_DETECTOR_IMPORTED: True,  # migrated at some point, detector since removed
+        },
+    )
+    scale.add_to_hass(hass)
+
+    await _async_import_detector(hass, scale)
+    await hass.async_block_till_done()
+    assert not [
+        e
+        for e in hass.config_entries.async_entries(DOMAIN)
+        if e.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_DETECTOR
+    ]
+
+
 async def test_the_import_flow_carries_the_prefix_store_key_and_thresholds(
     hass: HomeAssistant,
 ) -> None:

@@ -55,6 +55,21 @@ CONF_R2_ENTRY = "r2_entry"
 #: when the entry is created, read forever after.
 CONF_UID_PREFIX = "uid_prefix"
 
+#: Set on a *scale* entry once its detector has been split out into an entry of its
+#: own, so the migration runs exactly once per scale.
+#:
+#: 1.5.0-beta.1 tried to recognise a not-yet-migrated install by the detector
+#: thresholds still sitting in the scale's options, which was a proxy and not the
+#: fact: options are only written when somebody opens the options form and changes a
+#: threshold, so an install running entirely on defaults had none, the migration never
+#: fired, and — because that version had already stopped the scale from creating the
+#: statistics entities — all seven went unavailable with no detector to claim them.
+#:
+#: The real condition is "a scale with no detector pointing at it".  This flag is what
+#: keeps that from meaning "recreate the detector every restart" after somebody
+#: deliberately deletes one.
+CONF_DETECTOR_IMPORTED = "detector_imported"
+
 #: Storage key for this detector's BrewSession, stored for the same reason and
 #: seeded by the same rule: an imported detector keeps `difluid_microbalance.brew`,
 #: which is where brew_count and the last pair already live, and a detector created

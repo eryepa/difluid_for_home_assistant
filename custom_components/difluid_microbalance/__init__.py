@@ -12,9 +12,10 @@ from homeassistant.helpers.dispatcher import (
     async_dispatcher_send,
 )
 
-from .brew_detect import TUNABLE_FIELDS, config_from_options
+from .brew_detect import config_from_options
 from .brew_session import DEFAULT_STORE_KEY, async_create_session
 from .const import (
+    CONF_DETECTOR_IMPORTED,
     CONF_DEVICE_TYPE,
     CONF_IS_TI,
     CONF_LICENSE_KEY,
@@ -246,21 +247,35 @@ def _async_seed_detector_identity(hass: HomeAssistant, entry: ConfigEntry) -> No
 
 
 async def _async_import_detector(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Give an install that predates the detector entry one, without asking.
+    """Give a scale that has no detector one, once.
 
-    Recognised by the scale still carrying detector thresholds in its options: those
-    only ever got there through the old options flow, which was attached to the
-    scale.  Nothing is moved by hand — the import flow creates the entry carrying the
-    scale's entry_id as the unique_id prefix, and the entities re-register themselves
-    against it on the next setup, keeping their entity_ids.
+    The condition is exactly that — a scale with nothing pointing at it — and the flag
+    is what makes it happen only once, so deleting a detector on purpose does not
+    bring it back on the next restart.
+
+    1.5.0-beta.1 asked a different question: does the scale still carry detector
+    thresholds in its options?  That looked equivalent and was not.  Options are
+    written only when someone opens the form and changes a value, so an install left
+    on the defaults had none, and on that install the migration silently did nothing
+    while the scale had already stopped creating the statistics entities.  Seven
+    sensors went unavailable, their registry rows orphaned but intact.
+
+    Nothing is moved by hand here either way: the flow creates the entry carrying the
+    scale's entry_id as the unique_id prefix, and the entities re-register against it,
+    which is what keeps their entity_ids and their history.
     """
-    if not any(key in entry.options for key in TUNABLE_FIELDS):
+    if entry.data.get(CONF_DETECTOR_IMPORTED):
         return
     if any(
         other.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_DETECTOR
         and other.data.get(CONF_SCALE_ENTRY) == entry.entry_id
         for other in hass.config_entries.async_entries(DOMAIN)
     ):
+        # Already has one — from a previous run, or added by hand.  Mark it so this
+        # never runs again for this scale.
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_DETECTOR_IMPORTED: True}
+        )
         return
 
     r2 = next(
@@ -275,10 +290,13 @@ async def _async_import_detector(hass: HomeAssistant, entry: ConfigEntry) -> Non
         "Moving the brew detector off the scale entry and onto one of its own; "
         "entity_ids and brew_count are preserved"
     )
-    # The options are copied into the flow's data here, before they are cleared below.
     flow_data = {
         CONF_SCALE_ENTRY: entry.entry_id,
         CONF_R2_ENTRY: r2,
+        # Whatever was tuned through the old options form, if anything.  Left in place
+        # on the scale rather than cleared: it is dead weight there now, but if this
+        # migration ever goes wrong again the thresholds are still written down
+        # somewhere, and the options flow refuses to open on a scale entry anyway.
         "options": dict(entry.options),
     }
     # Not awaited: creating an entry sets it up, and that setup reaches back into
@@ -289,8 +307,9 @@ async def _async_import_detector(hass: HomeAssistant, entry: ConfigEntry) -> Non
             DOMAIN, context={"source": SOURCE_IMPORT}, data=flow_data
         )
     )
-    # Drop the thresholds from the scale so the import runs once and only once.
-    hass.config_entries.async_update_entry(entry, options={})
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_DETECTOR_IMPORTED: True}
+    )
 
 
 async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
