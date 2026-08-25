@@ -60,6 +60,52 @@ _DATASET_WINDOW_SECONDS = 180.0
 _DATASET_MAX_SAMPLES = 400
 
 
+#: How many measured brews to keep.  One point per refractometer reading, and nobody
+#: measures every shot, so this is months of them; the chart plots the tail of it.
+MAX_MEASUREMENTS = 50
+
+
+@dataclass
+class BrewMeasurement:
+    """One brew that was put under the refractometer.
+
+    Kept rather than read live, because the R2 is a handheld that spends almost all of
+    its life switched off: its sensors go `unavailable` minutes after a reading, so a
+    chart that read the sensor would be empty except in the moments right after a
+    measurement — which is exactly when you are not looking at a dashboard.
+
+    `ext` is stored alongside the inputs it comes from even though it is derived.  It
+    costs one float and it means a point plotted a month from now is the number that
+    was true then, rather than the number this version's formula would produce today.
+    """
+
+    #: yield_at of the brew this belongs to; also the identity of the point, so a
+    #: second reading of the same brew replaces the first instead of adding a twin.
+    at: float
+    dose: float
+    yield_g: float
+    tds: float
+    #: Extraction percentage: TDS × yield / dose.  The same figure the DiFluid app
+    #: plots, and the one its ratio diagonals are drawn for — a 1:2 line is TDS = EXT/2.
+    ext: float
+    measured_at: float
+
+    @property
+    def ratio(self) -> float:
+        return self.yield_g / self.dose if self.dose else 0.0
+
+    @classmethod
+    def build(cls, pair: BrewPair, tds: float, measured_at: float) -> "BrewMeasurement":
+        return cls(
+            at=pair.yield_at,
+            dose=pair.dose,
+            yield_g=pair.yield_g,
+            tds=tds,
+            ext=round(tds * pair.ratio, 2),
+            measured_at=measured_at,
+        )
+
+
 @dataclass
 class WeighEvent:
     value: float
@@ -155,6 +201,8 @@ class BrewSession:
         # Odometer + trip meter.  brew_count stays the sole owner of the brew count;
         # see BrewTotals for why the trip figures are derived rather than counted.
         self.totals = BrewTotals()
+        #: Brews that were measured on the refractometer, oldest first.
+        self.measurements: list[BrewMeasurement] = []
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -190,6 +238,12 @@ class BrewSession:
         # odometer is permanent, and one field added to BrewTotals in a later version
         # would be enough to do it.  _restore_totals keeps whatever it recognises.
         self.totals = self._restore_totals(data)
+        # Per-record rather than all-or-nothing, and for the same reason the fields
+        # above are restored separately: these are the only copy.  A refractometer
+        # reading cannot be recovered from anywhere else — the R2 keeps its own log,
+        # but nothing here can re-associate it with the brew it belonged to — so one
+        # record written by a future version must not discard the months before it.
+        self.measurements = self._restore_measurements(data)
         if not self.totals.period_started:
             # Either a first run, or state written before this field existed.  Starting
             # the period now is the only defensible reading: the alternative — leaving
@@ -217,6 +271,26 @@ class BrewSession:
                 key, stored, err,
             )
             return None
+
+    @staticmethod
+    def _restore_measurements(data: dict[str, Any]) -> list["BrewMeasurement"]:
+        """Rebuild the measured brews, keeping every record that still reads."""
+        stored = data.get("measurements")
+        if not isinstance(stored, list):
+            return []
+        kept: list[BrewMeasurement] = []
+        dropped = 0
+        for record in stored:
+            try:
+                kept.append(BrewMeasurement(**record))
+            except (TypeError, ValueError):
+                dropped += 1
+        if dropped:
+            _LOGGER.warning(
+                "Dropped %d unreadable measured brew(s); kept %d", dropped, len(kept)
+            )
+        kept.sort(key=lambda m: m.at)
+        return kept[-MAX_MEASUREMENTS:]
 
     @staticmethod
     def _restore_count(data: dict[str, Any]) -> int:
@@ -287,7 +361,52 @@ class BrewSession:
         # before it existed.  async_load reseeds it too, but only when there is no
         # stored state to load — and there is none precisely because of the line below.
         self.totals = BrewTotals(period_started=time.time())
+        self.measurements = []
         await self._store.async_remove()
+
+    def record_measurement(self, tds: float) -> Optional[BrewMeasurement]:
+        """Attach a refractometer reading to the most recent brew.
+
+        Always the most recent one, with no time window — measuring is something you
+        do after pulling a shot, and a window would only ever be a guess about how
+        long you took to get round to it.
+
+        Re-measuring replaces that brew's point rather than adding a second: the rule
+        is one reading per brew, and a stirred-and-remeasured sample is a correction,
+        not a second cup.  A reading taken before any brew was ever detected has
+        nothing to attach to and is dropped.
+        """
+        if self.last_pair is None:
+            _LOGGER.info(
+                "Refractometer read %.2f%% with no brew to attach it to; ignoring", tds
+            )
+            return None
+
+        point = BrewMeasurement.build(self.last_pair, tds, time.time())
+        replaced = False
+        for i, existing in enumerate(self.measurements):
+            if existing.at == point.at:
+                self.measurements[i] = point
+                replaced = True
+                break
+        if not replaced:
+            self.measurements.append(point)
+            self.measurements.sort(key=lambda m: m.at)
+            del self.measurements[:-MAX_MEASUREMENTS]
+
+        _LOGGER.info(
+            "Brew measured: %.1f g in, %.1f g out, TDS %.2f%%, extraction %.2f%% (%s)",
+            point.dose, point.yield_g, point.tds, point.ext,
+            "re-measured" if replaced else "new",
+        )
+        self._save()
+        for callback in list(self._listeners):
+            callback()
+        return point
+
+    @property
+    def last_measurement(self) -> Optional[BrewMeasurement]:
+        return self.measurements[-1] if self.measurements else None
 
     def add_listener(self, callback) -> None:
         self._listeners.append(callback)
@@ -583,6 +702,7 @@ class BrewSession:
             "last_pair": asdict(self.last_pair) if self.last_pair else None,
             "brew_count": self.brew_count,
             "totals": asdict(self.totals),
+            "measurements": [asdict(m) for m in self.measurements],
         }
 
     def _append_dataset(

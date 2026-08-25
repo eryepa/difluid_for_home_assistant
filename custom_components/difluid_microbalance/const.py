@@ -83,6 +83,17 @@ DEFAULT_MODEL_MICROBALANCE = "DFT-S101"
 DEFAULT_MODEL_MICROBALANCE_TI = "DFT-S102"
 DEFAULT_MODEL_R2 = "DFT-R102"
 
+#: Test Status values that mean a sample was just measured.
+#:
+#: "Calibration Finished" is deliberately absent.  Calibrating is putting distilled
+#: water on the prism, and it ends in a finished state like any other test — but the
+#: reading belongs to the water, not to the coffee, and every refractometer reading is
+#: attached to the last brew.  Without this distinction, zeroing the R2 after a shot
+#: would plot the shot at 0% TDS.
+R2_SAMPLE_FINISHED = frozenset(
+    {"Test Finished", "Average Test Finished", "Loop Test Finished"}
+)
+
 R2_STATUS_MAP = {
     0: "Test Finished",
     1: "Calibration Finished",

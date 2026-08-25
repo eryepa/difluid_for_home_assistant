@@ -113,6 +113,71 @@ const cleanSamples = (samples, expected) => {
 const linePath = (pts) =>
   pts.length ? pts.map((p, i) => `${i ? "L" : "M"}${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join("") : "";
 
+// ── brewing control chart ───────────────────────────────────────────────────
+// TDS against extraction, with a diagonal per brew ratio.  The relationship the whole
+// chart rests on is EXT = TDS x yield / dose, so on these axes a ratio r is the line
+// TDS = EXT / r — which is why a brew always sits on its own ratio diagonal and TDS
+// alone decides where along it.
+//
+// Two frames, because espresso and filter do not share an axis: at 10% TDS a filter
+// frame has nothing on it, and at 1.3% an espresso frame has everything in the bottom
+// pixel.  Which one applies is decided by the coffee, not configured.
+const CONTROL_FRAMES = {
+  espresso: { x0: 14, x1: 26, y0: 4, y1: 16, box: [18, 22, 8, 12], ratios: [1, 2, 3, 4, 5, 6] },
+  filter:   { x0: 14, x1: 26, y0: 0.8, y1: 1.8, box: [18, 22, 1.15, 1.45], ratios: [12, 14, 16, 18, 20] },
+};
+
+//: Above this TDS the cup is an espresso.  Nothing sane lands between 1.8 and 4.
+const ESPRESSO_TDS = 3;
+
+/**
+ * The frame to draw, widened if need be so that no measured brew falls off it.
+ *
+ * A point outside the axes is the one worth seeing — it is the shot that went wrong —
+ * so the frame gives way rather than the data.
+ */
+const controlFrame = (points, override) => {
+  const last = points.length ? points[points.length - 1] : null;
+  const base = { ...(last && last.tds < ESPRESSO_TDS
+    ? CONTROL_FRAMES.filter
+    : CONTROL_FRAMES.espresso) };
+  if (override && override.length === 4) base.box = override.slice();
+  for (const p of points) {
+    if (!Number.isFinite(p.ext) || !Number.isFinite(p.tds)) continue;
+    base.x0 = Math.min(base.x0, Math.floor(p.ext - 1));
+    base.x1 = Math.max(base.x1, Math.ceil(p.ext + 1));
+    base.y0 = Math.min(base.y0, p.tds - (base.y1 - base.y0) * 0.08);
+    base.y1 = Math.max(base.y1, p.tds + (base.y1 - base.y0) * 0.08);
+  }
+  return base;
+};
+
+/**
+ * Where a ratio diagonal enters and leaves the frame, or null if it misses entirely.
+ *
+ * Clipped rather than drawn and hidden, so a label can sit at the end of a line that
+ * is actually on the chart — the app puts 1:2 and 1:3 on the right edge and 1:1 at the
+ * top, because that is where each of those lines happens to leave.
+ */
+const ratioSegment = (ratio, frame) => {
+  const tdsAt = (ext) => ext / ratio;
+  const extAt = (tds) => tds * ratio;
+  const pts = [];
+  const push = (ext, tds) => {
+    if (ext >= frame.x0 - 1e-9 && ext <= frame.x1 + 1e-9 &&
+        tds >= frame.y0 - 1e-9 && tds <= frame.y1 + 1e-9) pts.push({ ext, tds });
+  };
+  push(frame.x0, tdsAt(frame.x0));
+  push(frame.x1, tdsAt(frame.x1));
+  push(extAt(frame.y0), frame.y0);
+  push(extAt(frame.y1), frame.y1);
+  if (pts.length < 2) return null;
+  pts.sort((a, b) => a.ext - b.ext);
+  const [from, to] = [pts[0], pts[pts.length - 1]];
+  if (Math.abs(to.ext - from.ext) < 1e-6) return null;
+  return { from, to };
+};
+
 const idPart = (entityId) => entityId.split(".")[1] || entityId;
 
 const rank = (entityId, order) => {
@@ -807,8 +872,184 @@ DifluidPourCard.STYLE = `
     .legend .cap { margin-left: auto; color: var(--primary-text-color); font-weight: 500; }
   </style>`;
 
+/**
+ * The brewing control chart: every measured brew as a dot on TDS against extraction.
+ *
+ * Reads the series off the Extraction sensor's `points` attribute rather than the
+ * refractometer's own entities.  The R2 is a handheld and is switched off almost all
+ * of the time, so its sensors are `unavailable` whenever anybody is actually looking
+ * at a dashboard; the detector stores each reading against the brew it belonged to,
+ * and that store is what this draws.
+ */
+class DifluidControlCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+  }
+
+  setConfig(config) {
+    if (!config || !config.device) throw new Error("Choose a DiFluid device");
+    if (config.box && (!Array.isArray(config.box) || config.box.length !== 4)) {
+      throw new Error("box must be [ext_low, ext_high, tds_low, tds_high]");
+    }
+    this._config = config;
+  }
+
+  getCardSize() {
+    return 8;
+  }
+
+  static getConfigElement() {
+    return document.createElement("difluid-card-editor");
+  }
+
+  static getStubConfig(hass) {
+    return DifluidCard.getStubConfig(hass);
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    this._render();
+  }
+
+  _extractionEntity() {
+    const cluster = DifluidCard.prototype._clusterIds.call(this);
+    for (const [entityId, ent] of Object.entries(this._hass.entities || {})) {
+      if (cluster.has(ent.device_id) && idPart(entityId).endsWith("_extraction")) {
+        return entityId;
+      }
+    }
+    return null;
+  }
+
+  _points() {
+    const id = this._extractionEntity();
+    if (!id) return [];
+    const attrs = (this._hass.states[id] || {}).attributes || {};
+    return (attrs.points || [])
+      .map(([at, ext, tds, ratio]) => ({ at, ext, tds, ratio }))
+      .filter((p) => Number.isFinite(p.ext) && Number.isFinite(p.tds));
+  }
+
+  _render() {
+    if (!this._hass || !this._config) return;
+    const points = this._points();
+    const root = this.shadowRoot;
+
+    if (!points.length) {
+      root.innerHTML = `
+        <ha-card header="Extraction">
+          <div class="empty">
+            No brew measured yet. Pull a shot, then measure it on the refractometer —
+            the reading attaches to the last brew.
+          </div>
+          ${DifluidControlCard.STYLE}
+        </ha-card>`;
+      return;
+    }
+
+    const f = controlFrame(points, this._config.box);
+    const W = 520, H = 380;
+    const padL = 38, padR = 40, padT = 16, padB = 30;
+    const iW = W - padL - padR, iH = H - padT - padB;
+
+    const X = (ext) => padL + ((ext - f.x0) / (f.x1 - f.x0)) * iW;
+    const Y = (tds) => padT + iH - ((tds - f.y0) / (f.y1 - f.y0)) * iH;
+
+    // Grid + axis labels.  Whole numbers on EXT; TDS steps depend on the frame, since
+    // an espresso axis counts in percent and a filter one in tenths.
+    const xStep = (f.x1 - f.x0) > 16 ? 2 : 1;
+    const yStep = (f.y1 - f.y0) > 4 ? 1 : 0.1;
+    const grid = [];
+    for (let e = Math.ceil(f.x0); e <= f.x1; e += xStep) {
+      grid.push(`<line class="grid" x1="${X(e)}" y1="${padT}" x2="${X(e)}" y2="${padT + iH}"/>
+                 <text class="tick x" x="${X(e)}" y="${H - 10}">${e}</text>`);
+    }
+    for (let t = Math.ceil(f.y0 / yStep) * yStep; t <= f.y1 + 1e-9; t += yStep) {
+      const label = yStep < 1 ? t.toFixed(2) : t.toFixed(0);
+      grid.push(`<line class="grid" x1="${padL}" y1="${Y(t)}" x2="${padL + iW}" y2="${Y(t)}"/>
+                 <text class="tick y" x="${padL - 6}" y="${Y(t) + 3}">${label}</text>`);
+    }
+
+    const diagonals = f.ratios.map((r) => {
+      const seg = ratioSegment(r, f);
+      if (!seg) return "";
+      const atRightEdge = seg.to.ext >= f.x1 - 1e-6;
+      return `<line class="ratio" x1="${X(seg.from.ext)}" y1="${Y(seg.from.tds)}"
+                    x2="${X(seg.to.ext)}" y2="${Y(seg.to.tds)}"/>
+              <text class="rlabel ${atRightEdge ? "r" : "t"}"
+                    x="${X(seg.to.ext) + (atRightEdge ? 4 : 0)}"
+                    y="${Y(seg.to.tds) + (atRightEdge ? 3 : -4)}">1:${r}</text>`;
+    }).join("");
+
+    const [bx0, bx1, by0, by1] = f.box;
+    const box = `<rect class="ideal" x="${X(bx0)}" y="${Y(by1)}"
+                       width="${X(bx1) - X(bx0)}" height="${Y(by0) - Y(by1)}"/>`;
+
+    // Oldest faintest, so the drift is legible as a direction and not just a cloud.
+    const dots = points.map((p, i) => {
+      const last = i === points.length - 1;
+      const age = points.length > 1 ? i / (points.length - 1) : 1;
+      return `<circle class="${last ? "dot last" : "dot"}"
+                      cx="${X(p.ext)}" cy="${Y(p.tds)}" r="${last ? 6 : 4}"
+                      opacity="${last ? 1 : (0.25 + age * 0.45).toFixed(2)}"/>`;
+    }).join("");
+
+    const p = points[points.length - 1];
+    const inBox = p.ext >= bx0 && p.ext <= bx1 && p.tds >= by0 && p.tds <= by1;
+
+    root.innerHTML = `
+      <ha-card header="Extraction">
+        <div class="body">
+          <svg viewBox="0 0 ${W} ${H}" role="img"
+               aria-label="Brewing control chart: TDS against extraction">
+            ${grid.join("")}
+            ${box}
+            ${diagonals}
+            ${dots}
+            <text class="axis" x="${padL - 6}" y="${padT - 4}">TDS</text>
+            <text class="axis end" x="${padL + iW}" y="${H - 10}">EXT %</text>
+          </svg>
+          <div class="legend">
+            <span class="cap">EXT ${p.ext.toFixed(2)}% · TDS ${p.tds.toFixed(2)}% · 1:${p.ratio.toFixed(1)}</span>
+            <span class="verdict ${inBox ? "good" : "off"}">${inBox ? "in the box" : "outside"}</span>
+          </div>
+        </div>
+        ${DifluidControlCard.STYLE}
+      </ha-card>`;
+  }
+}
+
+DifluidControlCard.STYLE = `
+  <style>
+    .body { padding: 4px 12px 12px; }
+    .empty { padding: 24px 16px; color: var(--secondary-text-color); line-height: 1.5; }
+    svg { width: 100%; height: auto; display: block; }
+    .grid { stroke: var(--divider-color); stroke-width: .5; }
+    .ratio { stroke: var(--secondary-text-color); stroke-width: 1; opacity: .55; }
+    .ideal { fill: none; stroke: var(--primary-text-color); stroke-width: 1.5; opacity: .8; }
+    .dot { fill: var(--state-icon-color, #44739e); }
+    .dot.last { fill: var(--error-color, #db4437); }
+    .tick, .rlabel, .axis { font-size: 10px; fill: var(--secondary-text-color); }
+    .tick.x, .rlabel.t { text-anchor: middle; }
+    .tick.y { text-anchor: end; }
+    .rlabel.r { text-anchor: start; }
+    .axis.end { text-anchor: end; }
+    .legend { display: flex; align-items: center; gap: 8px; font-size: 12px;
+              padding-top: 4px; color: var(--primary-text-color); }
+    .legend .cap { font-weight: 500; }
+    .legend .verdict { margin-left: auto; font-size: 11px; padding: 1px 8px;
+                       border-radius: 10px; }
+    .legend .verdict.good { background: var(--success-color, #43a047); color: #fff; }
+    .legend .verdict.off { background: var(--divider-color);
+                           color: var(--secondary-text-color); }
+  </style>`;
+
 if (!customElements.get("difluid-card")) {
   customElements.define("difluid-card", DifluidCard);
+}
+if (!customElements.get("difluid-control-card")) {
+  customElements.define("difluid-control-card", DifluidControlCard);
 }
 if (!customElements.get("difluid-pour-card")) {
   customElements.define("difluid-pour-card", DifluidPourCard);
@@ -824,6 +1065,17 @@ if (!window.customCards.some((c) => c.type === "difluid-card")) {
     name: "DiFluid Microbalance / R2",
     description:
       "Ordered sensors + controls for a DiFluid scale or R2 refractometer.",
+    preview: true,
+    documentationURL:
+      "https://github.com/eryepa/difluid_for_home_assistant",
+  });
+}
+if (!window.customCards.some((c) => c.type === "difluid-control-card")) {
+  window.customCards.push({
+    type: "difluid-control-card",
+    name: "DiFluid Extraction Chart",
+    description:
+      "Measured brews on the TDS/extraction control chart, with ratio diagonals.",
     preview: true,
     documentationURL:
       "https://github.com/eryepa/difluid_for_home_assistant",

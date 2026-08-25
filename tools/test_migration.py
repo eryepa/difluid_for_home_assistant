@@ -271,6 +271,8 @@ async def test_a_scale_on_default_thresholds_is_migrated_too(
         == 1
     )
 
+    await _unload_all(hass)
+
 
 async def test_a_deliberately_deleted_detector_does_not_come_back(
     hass: HomeAssistant,
@@ -301,6 +303,98 @@ async def test_a_deliberately_deleted_detector_does_not_come_back(
         for e in hass.config_entries.async_entries(DOMAIN)
         if e.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_DETECTOR
     ]
+
+
+async def _unload_all(hass: HomeAssistant) -> None:
+    """Put every entry this test created back down.
+
+    Not housekeeping.  A detector that cannot find its scale raises
+    ConfigEntryNotReady, and Home Assistant answers that with a retry timer — so a
+    test that walks away leaves one running, and the harness reports it as a leak.
+    Unloading is both the fix and a free check that the teardown path works.
+    """
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+
+
+def _session(tmp_key="difluid_microbalance.test"):
+    """A session with no Home Assistant behind it — Store is never touched here."""
+    from unittest.mock import MagicMock
+
+    from custom_components.difluid_microbalance.brew_session import BrewSession
+
+    session = BrewSession(MagicMock(), None, tmp_key)
+    session._store = MagicMock()
+    session._save = lambda: None
+    return session
+
+
+def _pair(dose, yield_g, at):
+    from custom_components.difluid_microbalance.brew_detect import BrewPair
+
+    return BrewPair(dose=dose, dose_at=at - 200, yield_g=yield_g, yield_at=at)
+
+
+def test_a_reading_attaches_to_the_last_brew_and_computes_extraction() -> None:
+    """EXT = TDS x yield / dose — the relation the chart's ratio diagonals are drawn
+    from, so a disagreement here puts every dot off its own line."""
+    session = _session()
+    session.last_pair = _pair(17.8, 37.4, 1000.0)
+
+    point = session.record_measurement(10.67)
+
+    assert point is not None
+    assert point.dose == 17.8 and point.yield_g == 37.4 and point.tds == 10.67
+    assert point.ext == 22.42          # 10.67 * 37.4 / 17.8
+    assert point.at == 1000.0          # identified by the brew, not by the reading
+    assert session.measurements == [point]
+
+
+def test_re_measuring_the_same_brew_replaces_its_point() -> None:
+    """Stir and measure again and you have corrected one reading, not drunk twice.
+
+    Worth pinning because the rule that makes it possible — every reading belongs to
+    the most recent brew — is also what would produce the twin.
+    """
+    session = _session()
+    session.last_pair = _pair(17.8, 37.4, 1000.0)
+
+    session.record_measurement(9.0)
+    session.record_measurement(10.67)
+
+    assert len(session.measurements) == 1
+    assert session.measurements[0].tds == 10.67
+
+
+def test_a_reading_with_no_brew_behind_it_is_dropped() -> None:
+    """Measuring something on a fresh install has nothing to attach to."""
+    session = _session()
+    assert session.last_pair is None
+    assert session.record_measurement(10.67) is None
+    assert session.measurements == []
+
+
+def test_measurements_survive_a_restart_and_a_record_from_the_future() -> None:
+    """Restored per-record, like the totals and for the same reason: this is the only
+    copy.  A reading cannot be reconstructed from anywhere — the R2 keeps its own log,
+    but nothing can re-associate an entry in it with the brew it belonged to."""
+    from custom_components.difluid_microbalance.brew_session import BrewSession
+
+    session = _session()
+    session.last_pair = _pair(17.8, 37.4, 1000.0)
+    session.record_measurement(10.67)
+    stored = session._snapshot()
+
+    # One record written by a later version, carrying a field this one never heard of.
+    stored["measurements"].append(
+        {**stored["measurements"][0], "at": 2000.0, "grinder_setting": 4.5}
+    )
+
+    restored = BrewSession._restore_measurements(stored)
+    assert [m.at for m in restored] == [1000.0], (
+        "an unreadable record took the readable ones with it"
+    )
 
 
 async def test_the_import_flow_carries_the_prefix_store_key_and_thresholds(
@@ -355,3 +449,5 @@ async def test_the_import_flow_carries_the_prefix_store_key_and_thresholds(
     )
     assert again["type"] == "abort"
     assert again["reason"] == "already_configured"
+
+    await _unload_all(hass)

@@ -5,12 +5,14 @@ from pathlib import Path
 
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import CONF_ADDRESS, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
     async_dispatcher_send,
 )
+from homeassistant.helpers.event import async_track_state_change_event
 
 from .brew_detect import config_from_options
 from .brew_session import DEFAULT_STORE_KEY, async_create_session
@@ -30,6 +32,7 @@ from .const import (
     DEVICE_TYPE_DETECTOR,
     DEVICE_TYPE_R2,
     DOMAIN,
+    R2_SAMPLE_FINISHED,
 )
 from .coordinator import DifluidMicrobalanceCoordinator
 from .coordinator_r2 import DifluidR2Coordinator
@@ -216,12 +219,73 @@ async def _async_setup_detector(hass: HomeAssistant, entry: ConfigEntry) -> bool
     )
     hass.data[DOMAIN][entry.entry_id] = session
     entry.async_on_unload(coordinator.add_brew_consumer(session))
+    _async_watch_refractometer(hass, entry, session)
     # Changing a threshold in the options flow reloads the entry, which rebuilds the
     # detector with the new config.
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
 
     await hass.config_entries.async_forward_entry_setups(entry, DETECTOR_PLATFORMS)
     return True
+
+
+def _async_watch_refractometer(
+    hass: HomeAssistant, entry: ConfigEntry, session
+) -> None:
+    """Attach every finished R2 sample to the brew it followed.
+
+    Driven by Test Status rather than by the TDS reading itself, for two reasons.  A
+    repeat of the same value writes no state change, so two identical shots measured in
+    a row would register as one; and TDS alone cannot tell a sample from a calibration,
+    which is water and would plot the brew at 0%.
+
+    Watching the entity through the state machine rather than reaching into the R2's
+    coordinator is what makes the load order irrelevant: a reading arrives once per
+    measurement, not five times a second, and an entity that does not exist yet simply
+    never fires until it does.
+    """
+    r2_entry_id = entry.data.get(CONF_R2_ENTRY)
+    if not r2_entry_id:
+        return
+
+    registry = er.async_get(hass)
+    status_id = tds_id = None
+    for item in er.async_entries_for_config_entry(registry, r2_entry_id):
+        if item.unique_id.endswith("_test_status"):
+            status_id = item.entity_id
+        elif item.unique_id.endswith("_concentration"):
+            tds_id = item.entity_id
+    if not status_id or not tds_id:
+        _LOGGER.warning(
+            "Refractometer entry %s has no test-status/concentration entities; "
+            "brews will not be measured",
+            r2_entry_id,
+        )
+        return
+
+    @callback
+    def _finished(event) -> None:
+        new = event.data.get("new_state")
+        if new is None or new.state not in R2_SAMPLE_FINISHED:
+            return
+        old = event.data.get("old_state")
+        if old is not None and old.state == new.state:
+            return
+        reading = hass.states.get(tds_id)
+        if reading is None:
+            return
+        try:
+            tds = float(reading.state)
+        except (TypeError, ValueError):
+            # unknown/unavailable — the status arrived before the value did.
+            return
+        if tds <= 0:
+            _LOGGER.debug("Ignoring a refractometer reading of %.2f%%", tds)
+            return
+        session.record_measurement(tds)
+
+    entry.async_on_unload(
+        async_track_state_change_event(hass, [status_id], _finished)
+    )
 
 
 def _async_seed_detector_identity(hass: HomeAssistant, entry: ConfigEntry) -> None:

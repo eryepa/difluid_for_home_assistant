@@ -40,7 +40,8 @@ function loadCardHelpers() {
     src.slice(0, cut) +
       "\n;globalThis.__exported = { SENSOR_ORDER, CONTROL_ORDER, EXCLUDE_CONTROLS," +
       " STATS_ORDER, DIAG_ORDER, rank, inList, isStat, statRank, DOMAIN," +
-      " pourWindow, cleanSamples, linePath };",
+      " pourWindow, cleanSamples, linePath, controlFrame, ratioSegment," +
+      " CONTROL_FRAMES, ESPRESSO_TDS };",
     sandbox,
     { filename: CARD }
   );
@@ -362,6 +363,107 @@ check(
   "an empty series produces no path rather than a broken one",
   h.linePath([]),
   ""
+);
+
+// ── the control chart ───────────────────────────────────────────────────────
+// Checked against the DiFluid app's own Pro chart, read off a screenshot of it: the
+// 1:2 diagonal runs from (14, 7) to (26, 13) and 1:1 from (14, 14) to (16, 16).  Both
+// follow from TDS = EXT / ratio, and reproducing them is what says our axes mean the
+// same thing the app's do — a chart that disagreed would still look plausible.
+console.log("\ndifluid-control-card — TDS against extraction\n");
+
+const esp = h.CONTROL_FRAMES.espresso;
+
+// Guarded before being read.  Get the relation backwards — TDS = EXT * r rather than
+// EXT / r — and every diagonal leaves the frame entirely, so these come back null and
+// the checks below would die on a TypeError.  That still fails the build, but it
+// reports "cannot read properties of null" instead of naming the formula.
+const seg12 = h.ratioSegment(2, esp);
+const seg11 = h.ratioSegment(1, esp);
+check(
+  "the ratio diagonals cross the espresso frame at all",
+  [seg12 !== null, seg11 !== null],
+  [true, true]
+);
+
+if (seg12 && seg11) {
+  check(
+    "the 1:2 diagonal crosses the espresso frame where the app draws it",
+    [seg12.from.ext, +seg12.from.tds.toFixed(2), seg12.to.ext, +seg12.to.tds.toFixed(2)],
+    [14, 7, 26, 13]
+  );
+
+  // 1:1 leaves through the top of the frame, not the right edge — which is why the app
+  // labels it up there and 1:2 on the side.
+  check(
+    "the 1:1 diagonal leaves through the top, at TDS 16",
+    [seg11.from.ext, seg11.to.ext, +seg11.to.tds.toFixed(2)],
+    [14, 16, 16]
+  );
+}
+
+// A ratio whose line never enters the frame must report that rather than produce a
+// degenerate segment for the renderer to draw as a dot in the corner.
+check(
+  "a diagonal that misses the frame is refused",
+  h.ratioSegment(40, esp),
+  null
+);
+
+// The brew this all started from: 17.8 g in, 37.4 g out, TDS 10.67.
+const RATIO = 37.4 / 17.8;
+const ESPRESSO_POINT = { at: 1, ext: +(10.67 * RATIO).toFixed(2), tds: 10.67, ratio: RATIO };
+
+// 22.42 is past 22, so this shot sits just outside the right edge of the box — a
+// touch over-extracted. Worth pinning as a number rather than a feeling: it is the
+// difference between the chart being decorative and it telling you something.
+check(
+  "the measured shot lands at 22.42% EXT, just past the box",
+  [
+    ESPRESSO_POINT.ext,
+    ESPRESSO_POINT.ext > esp.box[1],
+    ESPRESSO_POINT.ext - esp.box[1] < 0.5,
+    ESPRESSO_POINT.tds >= esp.box[2] && ESPRESSO_POINT.tds <= esp.box[3],
+  ],
+  [22.42, true, true, true]
+);
+
+// A point sits on its own ratio diagonal by construction — EXT = TDS x ratio is the
+// same relation the line is drawn from.  If these ever disagree, one of the two is
+// using a different formula.  Compared with a tolerance because `ext` is stored
+// rounded for display; the identity is exact on the values it was computed from.
+check(
+  "a brew sits on the diagonal of its own ratio",
+  Math.abs(ESPRESSO_POINT.ext / ESPRESSO_POINT.ratio - ESPRESSO_POINT.tds) < 0.01,
+  true
+);
+
+// Filter coffee is 1.2-1.5% TDS. On an espresso frame it would sit in the bottom pixel
+// row, so the frame is chosen by the coffee rather than configured.
+check(
+  "a filter brew switches the frame instead of vanishing off the bottom",
+  [
+    h.controlFrame([{ ext: 20, tds: 1.35, ratio: 15 }]).y1,
+    h.controlFrame([ESPRESSO_POINT]).y1,
+  ],
+  [h.CONTROL_FRAMES.filter.y1, esp.y1]
+);
+
+// The shot that went wrong is the one worth looking at, so the axes give way.
+const wild = h.controlFrame([{ ext: 31, tds: 14, ratio: 2.2 }]);
+check(
+  "a brew off the right of the frame widens it rather than falling off",
+  [wild.x1 >= 31, esp.x1],
+  [true, 26]
+);
+
+check(
+  "an explicit box overrides the default without touching the axes",
+  (() => {
+    const f = h.controlFrame([ESPRESSO_POINT], [19, 21, 9, 11]);
+    return [f.box, f.x0, f.x1];
+  })(),
+  [[19, 21, 9, 11], 14, 26]
 );
 
 console.log(ok ? "\nOK" : "\nFAILED");

@@ -32,6 +32,12 @@ from .coordinator import DifluidMicrobalanceCoordinator, MicrobalanceData
 from .coordinator_r2 import DifluidR2Coordinator, R2Data
 
 
+#: Measured brews published for the chart.  The session keeps more than this; a
+#: control chart with fifty dots on it stops showing where you are and starts showing
+#: where you have ever been.
+CHART_POINTS = 20
+
+
 @dataclass(frozen=True)
 class DifluidSensorDescription(SensorEntityDescription):
     value_fn: Callable = lambda _: None
@@ -269,6 +275,66 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
                 ).isoformat(),
             }
             if s.last_pair
+            else {}
+        ),
+    ),
+    # ── the refractometer's verdict on the last measured brew ─────────────────
+    # DIAGNOSTIC alongside the rest of the last shot's working parts.  Both read the
+    # stored measurement rather than the R2's own sensors, which are unavailable
+    # whenever it is switched off — which is nearly always, it being a handheld.
+    DifluidBrewSensorDescription(
+        key="last_tds",
+        name="Last TDS",
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=PERCENTAGE,
+        suggested_display_precision=2,
+        icon="mdi:water-percent",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda s: s.last_measurement.tds if s.last_measurement else None,
+        attrs_fn=lambda s: (
+            {
+                "measured_at": dt_util.utc_from_timestamp(
+                    s.last_measurement.measured_at
+                ).isoformat(),
+                "brew_at": dt_util.utc_from_timestamp(s.last_measurement.at).isoformat(),
+            }
+            if s.last_measurement
+            else {}
+        ),
+    ),
+    # Extraction yield: the share of the ground coffee that ended up dissolved in the
+    # cup.  TDS x yield / dose, which is what the DiFluid app's ratio diagonals are
+    # drawn for — on that chart a 1:2 line is TDS = EXT / 2.
+    DifluidBrewSensorDescription(
+        key="last_extraction",
+        name="Extraction",
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement=PERCENTAGE,
+        suggested_display_precision=2,
+        icon="mdi:coffee-to-go-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda s: s.last_measurement.ext if s.last_measurement else None,
+        attrs_fn=lambda s: (
+            {
+                "dose": s.last_measurement.dose,
+                "yield": s.last_measurement.yield_g,
+                "tds": s.last_measurement.tds,
+                "ratio": round(s.last_measurement.ratio, 2),
+                "measured_brews": len(s.measurements),
+                # The series the control chart plots, oldest first, as
+                # [brew time, EXT %, TDS %, ratio].  Positional rather than named to
+                # keep it small: this rides along on every state change, and a list of
+                # dicts would be four times the size for no more information.
+                #
+                # An attribute rather than a service or a websocket command because it
+                # is small, it is already flowing to every dashboard, and it needs no
+                # round trip when the card first renders.
+                "points": [
+                    [round(m.at, 1), m.ext, m.tds, round(m.ratio, 2)]
+                    for m in s.measurements[-CHART_POINTS:]
+                ],
+            }
+            if s.last_measurement
             else {}
         ),
     ),
