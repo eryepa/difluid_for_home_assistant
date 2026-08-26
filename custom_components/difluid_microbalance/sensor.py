@@ -317,9 +317,15 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
         attrs_fn=lambda s: (
             {
                 "dose": s.last_measurement.dose,
+                # Null, not 0, when the scale never saw the pour — and the ratio and
+                # the extraction go with it.  Type the yield into the Measured Yield
+                # control and all three arrive together.
                 "yield": s.last_measurement.yield_g,
                 "tds": s.last_measurement.tds,
-                "ratio": round(s.last_measurement.ratio, 2),
+                "ratio": (
+                    None if s.last_measurement.ratio is None
+                    else round(s.last_measurement.ratio, 2)
+                ),
                 # Null, not 0, when the pour's start was never observed.  See
                 # BrewPair.pour_seconds.
                 "seconds": s.last_measurement.seconds,
@@ -355,7 +361,8 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
                 # round trip when the card first renders.
                 "points": [
                     [
-                        round(m.at, 1), m.ext, m.tds, round(m.ratio, 2),
+                        round(m.at, 1), m.ext, m.tds,
+                        None if m.ratio is None else round(m.ratio, 2),
                         m.dose, m.yield_g, m.seconds, round(m.measured_at, 1),
                     ]
                     for m in s.measurements[-CHART_POINTS:]

@@ -626,6 +626,53 @@ check(
   [1, true, true]
 );
 
+// ── a cup whose pour the scale never saw ─────────────────────────────────────────
+// It is a real measurement with a real TDS and no place on an extraction axis.  The
+// card has to keep it, say so, and not call it "nothing measured yet".
+check(
+  "a brew with no yield keeps its dose and loses the rest of the line",
+  h.brewLabel({ dose: 18.1, yieldG: null, ratio: null, seconds: null }),
+  "18.1 g"
+);
+
+check(
+  "a yieldless point survives parsing but cannot be plotted",
+  (() => {
+    const points = loadPointsFn().call({
+      _extractionEntity: () => "sensor.brew_detector_extraction",
+      _hass: {
+        states: {
+          "sensor.brew_detector_extraction": {
+            attributes: {
+              points: [[BREW_0844, null, 10.13, null, 18.1, null, null, READ_1012]],
+            },
+          },
+        },
+      },
+    });
+    // Guarded rather than indexed straight: the failure being checked for is the
+    // point being dropped, and reading .tds off nothing throws a TypeError that kills
+    // the whole run instead of reporting one failed assertion.
+    const p = points[0];
+    return [points.length, p ? p.tds : null, p ? Number.isFinite(p.ext) : null];
+  })(),
+  [1, 10.13, false]
+);
+
+// The frame is built from the plottable points, and a null ext must not drag an axis
+// to NaN — one such point would blank the whole chart.
+check(
+  "a yieldless point cannot poison the axes",
+  (() => {
+    const f = h.controlFrame([
+      { ext: null, tds: 10.13, ratio: null },
+      ESPRESSO_POINT,
+    ]);
+    return [Number.isFinite(f.x0), Number.isFinite(f.x1), Number.isFinite(f.y1)];
+  })(),
+  [true, true, true]
+);
+
 check(
   "the chart reads all eight fields of a stored point",
   (() => {

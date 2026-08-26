@@ -194,7 +194,8 @@ const trim1 = (v) => String(Math.round(v * 10) / 10);
 const brewLabel = (p) => [
   Number.isFinite(p.dose) && Number.isFinite(p.yieldG)
     ? `${trim1(p.dose)} → ${trim1(p.yieldG)} g`
-    : null,
+    // The dose alone, when the scale saw the grind but not the pour.  Not "18 → 0 g".
+    : Number.isFinite(p.dose) ? `${trim1(p.dose)} g` : null,
   Number.isFinite(p.ratio) ? `1:${p.ratio.toFixed(1)}` : null,
   Number.isFinite(p.seconds) ? `${Math.round(p.seconds)} s` : null,
 ].filter(Boolean).join(" · ");
@@ -1019,7 +1020,10 @@ class DifluidControlCard extends HTMLElement {
     return (attrs.points || [])
       .map(([at, ext, tds, ratio, dose, yieldG, seconds, measuredAt]) =>
         ({ at, ext, tds, ratio, dose, yieldG, seconds, measuredAt }))
-      .filter((p) => Number.isFinite(p.ext) && Number.isFinite(p.tds));
+      // A reading with no TDS is not a reading.  A reading with no EXT is one whose
+      // pour the scale never saw: it is a real measurement and it is kept, but it
+      // cannot be placed on an extraction axis until somebody supplies the yield.
+      .filter((p) => Number.isFinite(p.tds));
   }
 
   _render() {
@@ -1039,7 +1043,27 @@ class DifluidControlCard extends HTMLElement {
       return;
     }
 
-    const f = controlFrame(points, this._config.box);
+    // Measured, but with no yield there is no extraction and therefore no x for the
+    // dot.  Saying "nothing measured yet" here would be a lie about the one number
+    // the refractometer cannot produce again, so the card says what is missing and
+    // where to put it.
+    const plottable = points.filter((p) => Number.isFinite(p.ext));
+    if (!plottable.length) {
+      const p = points[points.length - 1];
+      root.innerHTML = `
+        <ha-card header="Extraction">
+          <div class="empty">
+            TDS ${p.tds.toFixed(2)}% on ${trim1(p.dose)} g, but the scale never saw the
+            pour, so there is no extraction to plot. Enter what came out in
+            <b>Measured Yield</b> and this brew joins the chart.
+            <div class="when">${whenRow(p)}</div>
+          </div>
+          ${DifluidControlCard.STYLE}
+        </ha-card>`;
+      return;
+    }
+
+    const f = controlFrame(plottable, this._config.box);
     const W = 520, H = 380;
     const padL = 38, padR = 40, padT = 16, padB = 30;
     const iW = W - padL - padR, iH = H - padT - padB;
@@ -1078,15 +1102,17 @@ class DifluidControlCard extends HTMLElement {
                        width="${X(bx1) - X(bx0)}" height="${Y(by0) - Y(by1)}"/>`;
 
     // Oldest faintest, so the drift is legible as a direction and not just a cloud.
-    const dots = points.map((p, i) => {
-      const last = i === points.length - 1;
-      const age = points.length > 1 ? i / (points.length - 1) : 1;
+    const dots = plottable.map((p, i) => {
+      const last = i === plottable.length - 1;
+      const age = plottable.length > 1 ? i / (plottable.length - 1) : 1;
       return `<circle class="${last ? "dot last" : "dot"}"
                       cx="${X(p.ext)}" cy="${Y(p.tds)}" r="${last ? 6 : 4}"
                       opacity="${last ? 1 : (0.25 + age * 0.45).toFixed(2)}"/>`;
     }).join("");
 
-    const p = points[points.length - 1];
+    // The newest brew that can be drawn, which is not always the newest measured —
+    // one still waiting for its yield stays off the chart until it has one.
+    const p = plottable[plottable.length - 1];
 
     root.innerHTML = `
       <ha-card header="Extraction">

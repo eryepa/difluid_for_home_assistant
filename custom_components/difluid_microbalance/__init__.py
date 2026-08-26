@@ -41,8 +41,10 @@ from .coordinator_r2 import DifluidR2Coordinator
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.SENSOR, Platform.BUTTON, Platform.NUMBER, Platform.SELECT]
-#: The detector has no BLE link, so no number or select of its own.
-DETECTOR_PLATFORMS = [Platform.SENSOR, Platform.BUTTON]
+#: No select: that one drives the scale's display mode over BLE, which the detector has
+#: no link for.  Number is here for Measured Yield, which touches nothing but the stored
+#: measurement.
+DETECTOR_PLATFORMS = [Platform.SENSOR, Platform.BUTTON, Platform.NUMBER]
 
 
 def _async_wake_waiting_detectors(hass: HomeAssistant, scale_entry: ConfigEntry) -> None:

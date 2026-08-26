@@ -385,6 +385,62 @@ async def test_a_detector_set_up_before_its_scale_recovers_when_the_scale_arrive
     await _unload_all(hass)
 
 
+async def test_the_detector_offers_a_measured_yield_control(
+    hass: HomeAssistant,
+) -> None:
+    """Measured Yield is on a platform the detector did not forward until 1.7.0.
+
+    Worth its own test because a platform missing from DETECTOR_PLATFORMS fails the
+    way the load-order bug did: nothing raises, nothing is logged above debug, the
+    entity simply is not there.  Setting it here also exercises the whole path —
+    entity to session to stored measurement — rather than the session in isolation.
+    """
+    scale = MockConfigEntry(
+        domain=DOMAIN,
+        title="Microbalance 304268",
+        data={CONF_DEVICE_TYPE: DEVICE_TYPE_MICROBALANCE, "address": "AA:BB:CC:DD:EE:FF"},
+    )
+    scale.add_to_hass(hass)
+    detector = MockConfigEntry(
+        domain=DOMAIN,
+        title="Brew Detector",
+        data={
+            CONF_DEVICE_TYPE: DEVICE_TYPE_DETECTOR,
+            CONF_SCALE_ENTRY: scale.entry_id,
+            CONF_UID_PREFIX: scale.entry_id,
+            CONF_DETECTOR_IMPORTED_KEY: True,
+        },
+    )
+    detector.add_to_hass(hass)
+    await hass.config_entries.async_setup(detector.entry_id)
+    await hass.async_block_till_done()
+
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id(
+        "number", DOMAIN, f"{scale.entry_id}_measured_yield"
+    )
+    assert entity_id is not None, "the detector has no Measured Yield control"
+
+    session = hass.data[DOMAIN][detector.entry_id]
+    session._save = lambda: None
+    session.last_dose = _dose(18.1, 2000.0)
+    session.record_measurement(10.13)
+    assert session.last_measurement.ext is None
+
+    await hass.services.async_call(
+        "number",
+        "set_value",
+        {"entity_id": entity_id, "value": 37.0},
+        blocking=True,
+    )
+
+    assert session.last_measurement.yield_g == 37.0
+    assert session.last_measurement.ext == 20.71
+    assert hass.states.get(entity_id).state == "37.0"
+
+    await _unload_all(hass)
+
+
 def _session(tmp_key="difluid_microbalance.test"):
     """A session with no Home Assistant behind it — Store is never touched here."""
     from unittest.mock import MagicMock
@@ -397,11 +453,14 @@ def _session(tmp_key="difluid_microbalance.test"):
     return session
 
 
-def _pair(dose, yield_g, at, pour_seconds=None):
+def _pair(dose, yield_g, at, pour_seconds=None, dose_at=None):
     from custom_components.difluid_microbalance.brew_detect import BrewPair
 
     return BrewPair(
-        dose=dose, dose_at=at - 200, yield_g=yield_g, yield_at=at,
+        dose=dose,
+        dose_at=at - 200 if dose_at is None else dose_at,
+        yield_g=yield_g,
+        yield_at=at,
         pour_seconds=pour_seconds,
     )
 
@@ -419,6 +478,118 @@ def test_a_reading_attaches_to_the_last_brew_and_computes_extraction() -> None:
     assert point.ext == 22.42          # 10.67 * 37.4 / 17.8
     assert point.at == 1000.0          # identified by the brew, not by the reading
     assert session.measurements == [point]
+
+
+def _dose(value, at, rise=2.0):
+    from custom_components.difluid_microbalance.brew_session import WeighEvent
+
+    return WeighEvent(value=value, at=at, hold_seconds=30.0, rise_seconds=rise)
+
+
+def test_a_dose_weighed_after_the_last_pair_is_the_brew_being_measured() -> None:
+    """The 2026-08-26 defect, at its real numbers.
+
+    18.1 g was ground at 10:06, the BLE link died 25 s later and stayed down through
+    the shot, and the reading taken at 10:12 was divided by the dose and yield of an
+    08:44 brew.  Arithmetically perfect, about the wrong coffee.
+    """
+    session = _session()
+    session.last_pair = _pair(18.0, 37.4, 1000.0)      # the 08:44 cup
+    session.last_dose = _dose(18.1, 2000.0)            # ground at 10:06, never paired
+
+    point = session.record_measurement(10.13)
+
+    assert point.dose == 18.1, "the reading was attributed to the previous brew"
+    assert point.at == 2000.0
+    assert point.yield_g is None
+    assert point.ext is None, "extraction is not computable without a yield"
+
+
+def test_a_dose_older_than_the_last_pair_does_not_hijack_the_reading() -> None:
+    """The ordinary case: grind, pull, measure.  last_dose belongs to that same pair
+    and is older than its pour, so the pair — which knows the yield — must win."""
+    session = _session()
+    session.last_dose = _dose(18.0, 900.0)
+    session.last_pair = _pair(18.0, 37.4, 1000.0)
+
+    point = session.record_measurement(10.67)
+
+    assert point.yield_g == 37.4
+    assert point.ext == 22.17                          # 10.67 * 37.4 / 18.0
+
+
+def test_typing_the_yield_completes_the_extraction() -> None:
+    session = _session()
+    session.last_dose = _dose(18.1, 2000.0)
+    session.record_measurement(10.13)
+
+    updated = session.set_measured_yield(37.0)
+
+    assert updated.yield_g == 37.0
+    assert updated.ext == 20.71                       # 10.13 * 37.0 / 18.1
+    assert len(session.measurements) == 1, "it edited the brew rather than adding one"
+    assert session.last_measurement.ext == 20.71
+
+
+def test_typing_a_yield_with_nothing_measured_does_nothing() -> None:
+    """Deliberately not remembered for the next reading: a figure typed an hour ago
+    silently overriding a pour the scale did see is worse than doing nothing."""
+    session = _session()
+    assert session.set_measured_yield(37.0) is None
+    assert session.measurements == []
+
+
+def test_a_late_pour_completes_the_brew_that_was_already_measured() -> None:
+    """The scale comes back and reports the pour after the cup was measured.
+
+    Without this the reading would sit extraction-less forever *and* a second reading
+    would start a second point, because a dose-anchored point is stamped with the
+    dose's time and a paired one with the pour's.
+    """
+    session = _session()
+    session.last_dose = _dose(18.1, 2000.0)
+    session.record_measurement(10.13)
+    assert session.measurements[0].ext is None
+
+    # dose_at 0.3 s off the dose's own timestamp: the two are independent conversions
+    # of the same monotonic instant, made minutes apart with whatever clock offset was
+    # measured at the time, so they are never bit-identical in production.  An equality
+    # match here would pass on a fixture and never fire on the real thing.
+    pair = _pair(18.1, 37.0, 2100.0, pour_seconds=24.0, dose_at=2000.3)
+    session._complete_measurement(pair)
+
+    assert len(session.measurements) == 1
+    point = session.measurements[0]
+    assert point.yield_g == 37.0
+    assert point.ext == 20.71
+    assert point.seconds == 24.0
+    assert point.at == 2100.0, "the point moved onto the pour's time"
+
+    # And a second reading of that cup now replaces the point instead of twinning it.
+    session.last_pair = pair
+    session.record_measurement(10.20)
+    assert len(session.measurements) == 1
+
+
+def test_a_later_brew_does_not_steal_an_earlier_cups_missing_yield() -> None:
+    """Measure cup A with its pour lost, then grind and pull cup B.
+
+    B's pour must not be written onto A.  This is why the match is on the dose's time
+    rather than "the newest measurement that has no yield", which is simpler and
+    wrong.
+    """
+    session = _session()
+    session.last_dose = _dose(18.1, 2000.0)
+    session.record_measurement(10.13)
+
+    # Two minutes after A's dose, which is a back-to-back pair of shots and not an
+    # unusual one.  The gap is deliberately small: a tolerance loose enough to cover
+    # it would steal A's identity, and the first version of this test used a
+    # three-quarter-hour gap that a 30-minute tolerance sailed through.
+    session._complete_measurement(_pair(18.0, 37.4, 2200.0, dose_at=2120.0))
+
+    assert session.measurements[0].yield_g is None
+    assert session.measurements[0].ext is None
 
 
 def test_the_point_carries_the_pour_it_came_from() -> None:

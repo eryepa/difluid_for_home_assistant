@@ -60,6 +60,11 @@ _DATASET_WINDOW_SECONDS = 180.0
 _DATASET_MAX_SAMPLES = 400
 
 
+#: How close two timestamps have to be to be talking about the same dose.
+#: See BrewSession._complete_measurement for why this is a window and not equality.
+_SAME_DOSE_SECONDS = 1.0
+
+
 #: How many measured brews to keep.  One point per refractometer reading, and nobody
 #: measures every shot, so this is months of them; the chart plots the tail of it.
 MAX_MEASUREMENTS = 50
@@ -79,15 +84,27 @@ class BrewMeasurement:
     was true then, rather than the number this version's formula would produce today.
     """
 
-    #: yield_at of the brew this belongs to; also the identity of the point, so a
+    #: When the brew this belongs to happened; also the identity of the point, so a
     #: second reading of the same brew replaces the first instead of adding a twin.
+    #: The pour's time when there is a pour, the dose's when there is not.
     at: float
     dose: float
-    yield_g: float
+    #: What came out, or ``None`` when the scale never saw it.
+    #:
+    #: Optional because the pour is the half of a brew most easily lost: the BLE link
+    #: on this install drops for minutes at a time, and on 2026-08-26 it died 25
+    #: seconds after the dose was weighed and stayed down through the shot.  The dose
+    #: and the refractometer reading both survived that; only the pour did not, and
+    #: refusing to record the other two would have thrown away the one number the R2
+    #: cannot produce again.  Filled in by hand afterwards through the Measured Yield
+    #: control — see BrewSession.set_measured_yield.
+    yield_g: Optional[float]
     tds: float
     #: Extraction percentage: TDS × yield / dose.  The same figure the DiFluid app
     #: plots, and the one its ratio diagonals are drawn for — a 1:2 line is TDS = EXT/2.
-    ext: float
+    #: ``None`` whenever the yield is: it is not computable, and 0.0 would plot the
+    #: brew at the far left of the chart as if it had extracted nothing.
+    ext: Optional[float]
     measured_at: float
     #: How long the pour took, or ``None`` when it was not observed — BrewPair.
     #: pour_seconds, copied for the same reason `ext` is: a point plotted a month from
@@ -96,20 +113,44 @@ class BrewMeasurement:
     seconds: Optional[float] = None
 
     @property
-    def ratio(self) -> float:
-        return self.yield_g / self.dose if self.dose else 0.0
+    def ratio(self) -> Optional[float]:
+        if not self.dose or self.yield_g is None:
+            return None
+        return self.yield_g / self.dose
+
+    @staticmethod
+    def extraction(dose: float, yield_g: Optional[float], tds: float) -> Optional[float]:
+        """TDS × yield / dose, or None when there is no yield to divide by."""
+        if not dose or yield_g is None:
+            return None
+        return round(tds * yield_g / dose, 2)
 
     @classmethod
-    def build(cls, pair: BrewPair, tds: float, measured_at: float) -> "BrewMeasurement":
+    def build(cls, brew: "BrewAnchor", tds: float, measured_at: float) -> "BrewMeasurement":
         return cls(
-            at=pair.yield_at,
-            dose=pair.dose,
-            yield_g=pair.yield_g,
+            at=brew.at,
+            dose=brew.dose,
+            yield_g=brew.yield_g,
             tds=tds,
-            ext=round(tds * pair.ratio, 2),
+            ext=cls.extraction(brew.dose, brew.yield_g, tds),
             measured_at=measured_at,
-            seconds=pair.pour_seconds,
+            seconds=brew.pour_seconds,
         )
+
+
+@dataclass(frozen=True)
+class BrewAnchor:
+    """The brew a reading taken right now belongs to.
+
+    Not a BrewPair, because the whole point is that it does not need to be one.  A
+    reading arrives after the coffee is made, and by then the scale may have seen both
+    halves of the brew, or only the dose.
+    """
+
+    at: float
+    dose: float
+    yield_g: Optional[float]
+    pour_seconds: Optional[float]
 
 
 @dataclass
@@ -370,25 +411,61 @@ class BrewSession:
         self.measurements = []
         await self._store.async_remove()
 
+    def current_brew(self) -> Optional[BrewAnchor]:
+        """The brew a reading taken now belongs to: the newest one there is evidence of.
+
+        Usually the last completed pair.  But a dose weighed *after* that pair is a
+        brew of its own, in progress or finished with its pour unseen, and it is the
+        one being measured — the pair is then the cup before it.
+
+        Anchoring on the pair alone is what produced the wrong answer on 2026-08-26:
+        18.1 g was ground at 10:06, the BLE link died 25 seconds later and stayed down
+        through the shot, and the two refractometer readings taken at 10:12 were
+        divided by the dose and yield of an 08:44 brew.  Every number was right and
+        every one was about the wrong coffee.
+
+        The dose comes from last_dose, which is whatever was last weighed in the dose
+        range and *not* the pairer's considered choice between competing candidates.
+        So a portafilter set back on the scale can become the anchor, the way one did
+        on 2026-08-17.  That is a visible mistake — Last Dose shows it on the device
+        page and the measurement carries its time — where the alternative, using the
+        pairer's pending dose, is invisible from outside and does not survive a
+        restart, which is exactly the situation this exists to survive.
+        """
+        pair = self.last_pair
+        dose = self.last_dose
+        if dose is not None and (pair is None or dose.at > pair.yield_at):
+            return BrewAnchor(at=dose.at, dose=dose.value, yield_g=None, pour_seconds=None)
+        if pair is not None:
+            return BrewAnchor(
+                at=pair.yield_at,
+                dose=pair.dose,
+                yield_g=pair.yield_g,
+                pour_seconds=pair.pour_seconds,
+            )
+        return None
+
     def record_measurement(self, tds: float) -> Optional[BrewMeasurement]:
         """Attach a refractometer reading to the most recent brew.
 
         Always the most recent one, with no time window — measuring is something you
         do after pulling a shot, and a window would only ever be a guess about how
-        long you took to get round to it.
+        long you took to get round to it.  What counts as "the most recent brew" is
+        current_brew's business.
 
         Re-measuring replaces that brew's point rather than adding a second: the rule
         is one reading per brew, and a stirred-and-remeasured sample is a correction,
-        not a second cup.  A reading taken before any brew was ever detected has
+        not a second cup.  A reading taken before anything was ever weighed has
         nothing to attach to and is dropped.
         """
-        if self.last_pair is None:
+        brew = self.current_brew()
+        if brew is None:
             _LOGGER.info(
                 "Refractometer read %.2f%% with no brew to attach it to; ignoring", tds
             )
             return None
 
-        point = BrewMeasurement.build(self.last_pair, tds, time.time())
+        point = BrewMeasurement.build(brew, tds, time.time())
         replaced = False
         for i, existing in enumerate(self.measurements):
             if existing.at == point.at:
@@ -400,15 +477,101 @@ class BrewSession:
             self.measurements.sort(key=lambda m: m.at)
             del self.measurements[:-MAX_MEASUREMENTS]
 
+        # Formatted rather than passed through %.1f because either can be None, and a
+        # crash in the logging call would take the measurement down with it.
         _LOGGER.info(
-            "Brew measured: %.1f g in, %.1f g out, TDS %.2f%%, extraction %.2f%% (%s)",
-            point.dose, point.yield_g, point.tds, point.ext,
+            "Brew measured: %.1f g in, %s g out, TDS %.2f%%, extraction %s (%s)",
+            point.dose,
+            "?" if point.yield_g is None else f"{point.yield_g:.1f}",
+            point.tds,
+            "unknown — no pour was detected" if point.ext is None else f"{point.ext:.2f}%",
             "re-measured" if replaced else "new",
         )
         self._save()
         for callback in list(self._listeners):
             callback()
         return point
+
+    def set_measured_yield(self, yield_g: float) -> Optional[BrewMeasurement]:
+        """Fill in, or correct, the yield of the brew that was measured last.
+
+        The manual half of the pour going missing.  It edits the stored point rather
+        than the brew: brew_count and the ground-coffee odometer count what the
+        detector actually saw, and a number typed in afterwards is not that — mixing
+        the two would make the odometer a total of two different things.
+
+        Typing a yield before anything has been measured does nothing, deliberately.
+        There is no cup to attach it to yet, and remembering it for the next reading
+        would mean a figure typed an hour ago silently overriding a pour the scale did
+        see.
+        """
+        point = self.last_measurement
+        if point is None:
+            _LOGGER.warning(
+                "Measured Yield set to %.1f g with nothing measured yet; ignoring",
+                yield_g,
+            )
+            return None
+
+        updated = replace(
+            point,
+            yield_g=yield_g,
+            ext=BrewMeasurement.extraction(point.dose, yield_g, point.tds),
+        )
+        self.measurements[-1] = updated
+        _LOGGER.info(
+            "Measured Yield set by hand: %.1f g in, %.1f g out, TDS %.2f%%, "
+            "extraction %s",
+            updated.dose, yield_g, updated.tds,
+            "unknown" if updated.ext is None else f"{updated.ext:.2f}%",
+        )
+        self._save()
+        for callback in list(self._listeners):
+            callback()
+        return updated
+
+    def _complete_measurement(self, pair: BrewPair) -> None:
+        """Give a measured-but-yieldless brew its pour, once the scale reports one.
+
+        The case this closes: the dose is weighed, the link drops, the shot is pulled
+        and measured — a point with a TDS and no extraction — and then the scale comes
+        back and reports the pour after all.  Without this the reading would sit
+        incomplete forever while a second reading of the same cup started a second
+        point, because a dose-anchored point is stamped with the dose's time and a
+        paired one with the pour's.
+
+        Matched on the dose's time, which is the one thing about a brew that does not
+        move: the pour's time does not exist yet when the dose-anchored point is
+        written.
+
+        Matched with a tolerance rather than for equality, and that is not defensive
+        rounding.  The two numbers are independent conversions of the same monotonic
+        instant: last_dose.at was mapped to the wall clock when the dose closed, and
+        pair.dose_at when the pour closed minutes later, each with the offset
+        _sync_clock had measured at the time.  Any correction to the host clock in
+        between — an NTP step is the obvious one — moves them apart, and an equality
+        test would then simply never match, silently, leaving every such brew
+        incomplete with nothing in the log to say why.  A second is orders of
+        magnitude more than that drift and orders of magnitude less than the gap
+        between two brews: a weighing alone takes longer than that.
+        """
+        for i, point in enumerate(self.measurements):
+            if point.yield_g is None and abs(point.at - pair.dose_at) < _SAME_DOSE_SECONDS:
+                self.measurements[i] = replace(
+                    point,
+                    at=pair.yield_at,
+                    yield_g=pair.yield_g,
+                    ext=BrewMeasurement.extraction(pair.dose, pair.yield_g, point.tds),
+                    seconds=pair.pour_seconds,
+                )
+                _LOGGER.info(
+                    "The pour for an already-measured brew arrived: %.1f g out, "
+                    "extraction %s",
+                    pair.yield_g,
+                    "unknown" if self.measurements[i].ext is None
+                    else f"{self.measurements[i].ext:.2f}%",
+                )
+                return
 
     @property
     def last_measurement(self) -> Optional[BrewMeasurement]:
@@ -613,6 +776,7 @@ class BrewSession:
 
         if pair is not None:
             self.last_pair = pair
+            self._complete_measurement(pair)
             self.brew_count += 1
             # Only paired doses count towards the odometer, so it and brew_count always
             # describe the same population and total_dose_g / brew_count is the average
