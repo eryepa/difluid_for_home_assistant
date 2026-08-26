@@ -86,6 +86,16 @@ class BrewPair:
     dose_at: float
     yield_g: float
     yield_at: float
+    #: How long the pour took, or ``None`` when that was never observed — the pour's own
+    #: Plateau.rise_seconds, carried here because it is a property of *this brew* and
+    #: the session's last_yield is not: last_yield moves on to whatever is weighed next,
+    #: and reading the duration off it is the same mistake that reported a 42.8 g shot's
+    #: ratio against a 59.8 g weighing on 2026-08-15.
+    #:
+    #: ``None`` stays ``None`` for the reason given at length on Plateau.rise_seconds:
+    #: a pour whose start was never seen has no duration, and 0.0 would claim it took no
+    #: time at all.  Defaulted so that a pair stored by an earlier version still loads.
+    pour_seconds: Optional[float] = None
 
     @property
     def ratio(self) -> float:
@@ -910,6 +920,13 @@ class BrewPairer:
                         dose_at=dose.t_end,
                         yield_g=plateau.value,
                         yield_at=plateau.t_end,
+                        # The pour's rise, not the dose's: the seconds between the cup
+                        # being empty on the scale and the flow stopping.
+                        pour_seconds=(
+                            None
+                            if plateau.rise_seconds is None
+                            else round(plateau.rise_seconds, 1)
+                        ),
                     )
             # Stale or implausible — drop the dose rather than pair it wrongly.
             self._pending_dose = None

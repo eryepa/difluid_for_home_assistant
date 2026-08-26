@@ -178,6 +178,40 @@ const ratioSegment = (ratio, frame) => {
   return { from, to };
 };
 
+// 18 rather than 18.0, and 37.4 rather than 37.40 — the numbers as a person writing a
+// brew down would write them.
+const trim1 = (v) => String(Math.round(v * 10) / 10);
+
+/**
+ * What the scale saw, as one line: `18 → 37.4 g · 1:2.1 · 20 s`.
+ *
+ * Every part is dropped when its number is missing rather than shown as zero.  The
+ * pour time is the part that is really optional: a pour whose start was never
+ * observed — an HA restart mid-shot, a BLE gap — has no duration at all, and "0 s"
+ * would be a claim about the shot rather than an admission about the recording.  See
+ * BrewPair.pour_seconds.
+ */
+const brewLabel = (p) => [
+  Number.isFinite(p.dose) && Number.isFinite(p.yieldG)
+    ? `${trim1(p.dose)} → ${trim1(p.yieldG)} g`
+    : null,
+  Number.isFinite(p.ratio) ? `1:${p.ratio.toFixed(1)}` : null,
+  Number.isFinite(p.seconds) ? `${Math.round(p.seconds)} s` : null,
+].filter(Boolean).join(" · ");
+
+/**
+ * The line under the chart: what the refractometer read on the left, what the scale
+ * saw on the right.
+ *
+ * A function rather than a template inside _render so that it can be tested at all —
+ * everything from `class DifluidCard` down needs a DOM and never runs in tools/
+ * test_card.js.  Before 1.7.0 the right-hand side said "in the box" or "outside",
+ * which only repeated where the dot already was.
+ */
+const legendRow = (p) => `
+            <span class="cap">EXT ${p.ext.toFixed(2)}% · TDS ${p.tds.toFixed(2)}%</span>
+            <span class="brew">${brewLabel(p)}</span>`;
+
 const idPart = (entityId) => entityId.split(".")[1] || entityId;
 
 const rank = (entityId, order) => {
@@ -926,8 +960,13 @@ class DifluidControlCard extends HTMLElement {
     const id = this._extractionEntity();
     if (!id) return [];
     const attrs = (this._hass.states[id] || {}).attributes || {};
+    // Positional, and the tail is optional: dose, yield and pour time were added in
+    // 1.7.0, and a point stored before that — or a pour whose start was never seen —
+    // simply has none.  Destructuring past the end gives undefined, which every
+    // consumer below already treats as "do not show it".
     return (attrs.points || [])
-      .map(([at, ext, tds, ratio]) => ({ at, ext, tds, ratio }))
+      .map(([at, ext, tds, ratio, dose, yieldG, seconds]) =>
+        ({ at, ext, tds, ratio, dose, yieldG, seconds }))
       .filter((p) => Number.isFinite(p.ext) && Number.isFinite(p.tds));
   }
 
@@ -996,7 +1035,6 @@ class DifluidControlCard extends HTMLElement {
     }).join("");
 
     const p = points[points.length - 1];
-    const inBox = p.ext >= bx0 && p.ext <= bx1 && p.tds >= by0 && p.tds <= by1;
 
     root.innerHTML = `
       <ha-card header="Extraction">
@@ -1010,9 +1048,7 @@ class DifluidControlCard extends HTMLElement {
             <text class="axis" x="${padL - 6}" y="${padT - 4}">TDS</text>
             <text class="axis end" x="${padL + iW}" y="${H - 10}">EXT %</text>
           </svg>
-          <div class="legend">
-            <span class="cap">EXT ${p.ext.toFixed(2)}% · TDS ${p.tds.toFixed(2)}% · 1:${p.ratio.toFixed(1)}</span>
-            <span class="verdict ${inBox ? "good" : "off"}">${inBox ? "in the box" : "outside"}</span>
+          <div class="legend">${legendRow(p)}
           </div>
         </div>
         ${DifluidControlCard.STYLE}
@@ -1038,11 +1074,8 @@ DifluidControlCard.STYLE = `
     .legend { display: flex; align-items: center; gap: 8px; font-size: 12px;
               padding-top: 4px; color: var(--primary-text-color); }
     .legend .cap { font-weight: 500; }
-    .legend .verdict { margin-left: auto; font-size: 11px; padding: 1px 8px;
-                       border-radius: 10px; }
-    .legend .verdict.good { background: var(--success-color, #43a047); color: #fff; }
-    .legend .verdict.off { background: var(--divider-color);
-                           color: var(--secondary-text-color); }
+    .legend .brew { margin-left: auto; font-variant-numeric: tabular-nums;
+                    color: var(--secondary-text-color); }
   </style>`;
 
 if (!customElements.get("difluid-card")) {

@@ -320,17 +320,29 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
                 "yield": s.last_measurement.yield_g,
                 "tds": s.last_measurement.tds,
                 "ratio": round(s.last_measurement.ratio, 2),
+                # Null, not 0, when the pour's start was never observed.  See
+                # BrewPair.pour_seconds.
+                "seconds": s.last_measurement.seconds,
                 "measured_brews": len(s.measurements),
                 # The series the control chart plots, oldest first, as
-                # [brew time, EXT %, TDS %, ratio].  Positional rather than named to
-                # keep it small: this rides along on every state change, and a list of
-                # dicts would be four times the size for no more information.
+                # [brew time, EXT %, TDS %, ratio, dose g, yield g, pour s].  Positional
+                # rather than named to keep it small: this rides along on every state
+                # change, and a list of dicts would be several times the size for no
+                # more information.
+                #
+                # The last three are what the chart shows *about* a point rather than
+                # where it sits, and they are per-point rather than read off the
+                # top-level attributes because the card has to be able to walk back
+                # through the history and describe an older brew, not only this one.
                 #
                 # An attribute rather than a service or a websocket command because it
                 # is small, it is already flowing to every dashboard, and it needs no
                 # round trip when the card first renders.
                 "points": [
-                    [round(m.at, 1), m.ext, m.tds, round(m.ratio, 2)]
+                    [
+                        round(m.at, 1), m.ext, m.tds, round(m.ratio, 2),
+                        m.dose, m.yield_g, m.seconds,
+                    ]
                     for m in s.measurements[-CHART_POINTS:]
                 ],
             }

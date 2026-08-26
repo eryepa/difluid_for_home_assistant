@@ -89,6 +89,11 @@ class BrewMeasurement:
     #: plots, and the one its ratio diagonals are drawn for — a 1:2 line is TDS = EXT/2.
     ext: float
     measured_at: float
+    #: How long the pour took, or ``None`` when it was not observed — BrewPair.
+    #: pour_seconds, copied for the same reason `ext` is: a point plotted a month from
+    #: now should carry the brew it was, not whatever the session holds today.
+    #: Defaulted so that a measurement stored by an earlier version still loads.
+    seconds: Optional[float] = None
 
     @property
     def ratio(self) -> float:
@@ -103,6 +108,7 @@ class BrewMeasurement:
             tds=tds,
             ext=round(tds * pair.ratio, 2),
             measured_at=measured_at,
+            seconds=pair.pour_seconds,
         )
 
 

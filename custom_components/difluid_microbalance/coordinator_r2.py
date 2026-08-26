@@ -37,6 +37,23 @@ def _build_cmd(func: int, cmd: int, data: bytes = b"") -> bytes:
 
 _CMD_GET_FIRMWARE = _build_cmd(0x00, 0x02)
 
+#: Device Action commands whose responses carry a reading, all packaged the same way:
+#: package 0 is the status, 1 the temperatures, 2 the concentration.
+#:
+#: 0x00 single test, 0x01 average test and 0x02 calibrate are in protocolR2.md.  0x03 is
+#: not, and leaving it out is why a test started on the device itself showed nothing in
+#: Home Assistant: the R2 answers a single-test command straight away only when the
+#: prism is already at the sample's temperature, and otherwise re-tests in a loop until
+#: it settles — status 7/8/9, "Loop Test Start/Ongoing/Finished" — over command 0x03.
+#: Pressing the button in Home Assistant on an already-warm prism took the first path
+#: and worked; putting a fresh sample on the prism took the second, and every packet of
+#: it was dropped here, so the reading only ever reached the device's own screen.
+#:
+#: Observed on 2026-08-26, e.g. `dfdf 03 03 07 02 044f 00021060 92` — package 2, TDS
+#: 11.03 %, RI 1.35264.  Bounded rather than open-ended because 0xFE and 0xFF are error
+#: codes in the same func, and an error is not a reading.
+_R2_TEST_COMMANDS = frozenset({0x00, 0x01, 0x02, 0x03})
+
 
 @dataclass
 class R2Data:
@@ -410,7 +427,7 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             except Exception:
                 pass
 
-        elif func == 0x03 and cmd in (0x00, 0x01, 0x02) and data_len >= 1:
+        elif func == 0x03 and cmd in _R2_TEST_COMMANDS and data_len >= 1:
             pkg_no = payload[0]
 
             if pkg_no == 0x00 and data_len >= 2:

@@ -174,7 +174,7 @@ def main() -> int:
         ok &= check("ratio about 1:2.04", abs(pair.ratio - 2.04) < 0.02, f"{pair.ratio:.3f}")
 
     print("\nlost_shot.csv — the real 2026-08-10 19:47 cup that went unreported")
-    events, pairs = run(HERE / "testdata" / "lost_shot.csv")
+    events, pairs, weighings = run(HERE / "testdata" / "lost_shot.csv", detail=True)
     ok &= check(
         "the pour survives the lift-off transient and the BLE drop",
         any(k == "yield" and 36.0 <= v <= 37.5 for k, v in events),
@@ -193,6 +193,21 @@ def main() -> int:
             abs(p.dose - 18.0) < 0.05 and abs(p.yield_g - 36.7) < 0.1
             and abs(p.ratio - 2.04) < 0.02,
             f"dose {p.dose} yield {p.yield_g} ratio {p.ratio:.3f}",
+        )
+        # The pour's own rise, carried onto the pair so that a measured brew can say
+        # how long it took months later.  Asserted against the weighing it came from
+        # rather than against 18.5, so that a fixture correction moves both at once —
+        # and against the *pour's* rise specifically: the dose in this capture rose in
+        # 3.8 s, and wiring this to the wrong plateau would still produce a plausible
+        # number.
+        pour = [w for w in weighings if abs(w.value - 36.7) < 0.1][0]
+        dose = [w for w in weighings if abs(w.value - 18.0) < 0.1][0]
+        ok &= check(
+            "the pair carries how long the pour took, not how long the dose took",
+            p.pour_seconds == round(pour.rise_seconds, 1)
+            and abs(p.pour_seconds - round(dose.rise_seconds, 1)) > 1.0,
+            f"pour_seconds {p.pour_seconds}, pour rise {pour.rise_seconds:.1f}, "
+            f"dose rise {dose.rise_seconds:.1f}",
         )
 
     print("\nporridge.csv — 30 g of oats poured from two packets, then milk and water")

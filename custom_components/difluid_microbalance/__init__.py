@@ -8,7 +8,7 @@ from homeassistant.const import CONF_ADDRESS, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 
 from .brew_detect import config_from_options
 from .brew_session import DEFAULT_STORE_KEY, async_create_session
@@ -235,17 +235,35 @@ async def _async_setup_detector(hass: HomeAssistant, entry: ConfigEntry) -> bool
     return True
 
 
+#: How long a finished test's own result is worth waiting for.
+#:
+#: The R2 answers a test in three packets in a fixed order — status, temperatures,
+#: concentration — and the last one trails the first.  Measured on 2026-08-26: 216 ms.
+#: So reading TDS at the instant the status says "Test Finished" reads what the
+#: *previous* test left in the entity, and that is what happened to the first shot this
+#: ever measured — 11.03 % recorded for a shot the R2 read as 11.04 %.  The error was
+#: invisible because the two shots were nearly identical; a calibration followed by an
+#: espresso would have recorded the distilled water.
+#:
+#: Three seconds is a wait, not a deadline: the moment the concentration arrives the
+#: wait ends.  It only runs out when the value did not change at all, which is a real
+#: outcome — two samples that read the same write no state change — and then the value
+#: already in the entity is the right one.
+_TDS_SETTLE_SECONDS = 3.0
+
+
 def _async_watch_refractometer(
     hass: HomeAssistant, entry: ConfigEntry, session
 ) -> None:
     """Attach every finished R2 sample to the brew it followed.
 
-    Driven by Test Status rather than by the TDS reading itself, for two reasons.  A
-    repeat of the same value writes no state change, so two identical shots measured in
-    a row would register as one; and TDS alone cannot tell a sample from a calibration,
-    which is water and would plot the brew at 0%.
+    Armed by Test Status, fired by the reading.  Status has to be what arms it: a
+    repeat of the same TDS writes no state change, so two identical shots measured in a
+    row would register as one, and TDS alone cannot tell a sample from a calibration,
+    which is water and would plot the brew at 0%.  But status cannot be what *reads* it
+    — see _TDS_SETTLE_SECONDS for the 216 ms that separate the two.
 
-    Watching the entity through the state machine rather than reaching into the R2's
+    Watching the entities through the state machine rather than reaching into the R2's
     coordinator is what makes the load order irrelevant: a reading arrives once per
     measurement, not five times a second, and an entity that does not exist yet simply
     never fires until it does.
@@ -269,6 +287,37 @@ def _async_watch_refractometer(
         )
         return
 
+    # At most one entry, the pending timer's cancel callback.  A list because these are
+    # @callback closures and a list is the plainest thing they can all agree on.
+    armed: list = []
+
+    @callback
+    def _disarm() -> None:
+        while armed:
+            armed.pop()()
+
+    @callback
+    def _record(state) -> None:
+        if state is None:
+            return
+        try:
+            tds = float(state.state)
+        except (TypeError, ValueError):
+            # unknown or unavailable: the R2 went off the air between the two packets.
+            _LOGGER.debug("Refractometer finished a test but reported %s", state.state)
+            return
+        if tds <= 0:
+            _LOGGER.debug("Ignoring a refractometer reading of %.2f%%", tds)
+            return
+        session.record_measurement(tds)
+
+    @callback
+    def _settled(_now) -> None:
+        # The timer that fired cannot be cancelled, so drop the handle rather than
+        # calling it.
+        armed.clear()
+        _record(hass.states.get(tds_id))
+
     @callback
     def _finished(event) -> None:
         new = event.data.get("new_state")
@@ -277,22 +326,26 @@ def _async_watch_refractometer(
         old = event.data.get("old_state")
         if old is not None and old.state == new.state:
             return
-        reading = hass.states.get(tds_id)
-        if reading is None:
+        _disarm()
+        armed.append(async_call_later(hass, _TDS_SETTLE_SECONDS, _settled))
+
+    @callback
+    def _reading(event) -> None:
+        if not armed:
+            # A reading with no finished test behind it: the live value of a loop test
+            # still hunting for a stable temperature.  It belongs on the card, which
+            # reads the entity, and not in the record.
             return
-        try:
-            tds = float(reading.state)
-        except (TypeError, ValueError):
-            # unknown/unavailable — the status arrived before the value did.
-            return
-        if tds <= 0:
-            _LOGGER.debug("Ignoring a refractometer reading of %.2f%%", tds)
-            return
-        session.record_measurement(tds)
+        _disarm()
+        _record(event.data.get("new_state"))
 
     entry.async_on_unload(
         async_track_state_change_event(hass, [status_id], _finished)
     )
+    entry.async_on_unload(
+        async_track_state_change_event(hass, [tds_id], _reading)
+    )
+    entry.async_on_unload(_disarm)
 
 
 def _async_seed_detector_identity(hass: HomeAssistant, entry: ConfigEntry) -> None:

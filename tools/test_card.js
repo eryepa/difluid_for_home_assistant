@@ -41,7 +41,7 @@ function loadCardHelpers() {
       "\n;globalThis.__exported = { SENSOR_ORDER, CONTROL_ORDER, EXCLUDE_CONTROLS," +
       " STATS_ORDER, DIAG_ORDER, rank, inList, isStat, statRank, DOMAIN," +
       " pourWindow, cleanSamples, linePath, controlFrame, ratioSegment," +
-      " CONTROL_FRAMES, ESPRESSO_TDS };",
+      " CONTROL_FRAMES, ESPRESSO_TDS, brewLabel, legendRow };",
     sandbox,
     { filename: CARD }
   );
@@ -59,6 +59,18 @@ function loadClusterFn() {
   const end = src.indexOf("\n  }", start);
   const body = src.slice(src.indexOf("{", start) + 1, end);
   return new Function("DOMAIN", `return function () {${body}\n};`)(DOMAIN_NAME);
+}
+
+// Lifted out of the class the same way _clusterIds is, and for the same reason: the
+// mapping from the sensor's positional `points` attribute to what the chart draws is
+// exactly where a field added on the Python side goes missing on the JavaScript one.
+function loadPointsFn() {
+  const src = fs.readFileSync(CARD, "utf8");
+  const start = src.indexOf("  _points() {");
+  if (start < 0) throw new Error("no _points() in the card — did it get renamed?");
+  const end = src.indexOf("\n  }", start);
+  const body = src.slice(src.indexOf("{", start) + 1, end);
+  return new Function(`return function () {${body}\n};`)();
 }
 
 const DOMAIN_NAME = "difluid_microbalance";
@@ -464,6 +476,83 @@ check(
     return [f.box, f.x0, f.x1];
   })(),
   [[19, 21, 9, 11], 14, 26]
+);
+
+// ── the legend under the chart ───────────────────────────────────────────────────
+// It used to say "in the box" or "outside", which repeats what the dot's position
+// already shows.  What it could not tell you was the brew: the chart plots TDS against
+// extraction, and neither axis is the dose, the yield or how long the pour took.
+
+check(
+  "the legend reads the brew off the scale",
+  h.brewLabel({ dose: 18, yieldG: 37.4, ratio: 2.08, seconds: 20.4 }),
+  "18 → 37.4 g · 1:2.1 · 20 s"
+);
+
+// A pour whose start was never observed — a restart mid-shot, a BLE gap — stores null,
+// and the line has to drop the part rather than print "0 s", which would be a claim
+// about the shot instead of an admission about the recording.
+check(
+  "an unobserved pour loses its duration and keeps the rest",
+  h.brewLabel({ dose: 18, yieldG: 37.4, ratio: 2.08, seconds: null }),
+  "18 → 37.4 g · 1:2.1"
+);
+
+// What a browser holding a cached card sees against a sensor that has not been
+// upgraded yet, and what every point measured before 1.7.0 looks like forever.
+check(
+  "a point stored before the scale figures existed still renders",
+  h.brewLabel({ ratio: 2.08 }),
+  "1:2.1"
+);
+
+// The rendered row, not just the formatter.  The first attempt at these tests checked
+// brewLabel alone and passed with the legend hard-coded back to "outside" — a helper
+// nothing calls is a helper that works perfectly.
+check(
+  "the rendered legend carries the reading and the brew, and no verdict",
+  (() => {
+    const html = h.legendRow({
+      ext: 22.92, tds: 11.03, ratio: 2.08, dose: 18, yieldG: 37.4, seconds: 20.4,
+    }).replace(/\s+/g, " ").trim();
+    return [html, /in the box|outside/.test(html)];
+  })(),
+  ['<span class="cap">EXT 22.92% · TDS 11.03%</span> ' +
+   '<span class="brew">18 → 37.4 g · 1:2.1 · 20 s</span>', false]
+);
+
+// …and that _render actually delegates to it rather than keeping its own copy, which
+// is the only part of the chain a harness with no DOM cannot execute.
+check(
+  "the chart's legend is the one tested above",
+  (() => {
+    const src = fs.readFileSync(CARD, "utf8");
+    // From the control card, not the pour card — both have a legend.
+    const legend = src.slice(
+      src.indexOf('<div class="legend">', src.indexOf("class DifluidControlCard"))
+    );
+    return legend.slice(0, legend.indexOf("</div>")).replace(/\s+/g, " ").trim();
+  })(),
+  '<div class="legend">${legendRow(p)}'
+);
+
+check(
+  "the chart reads all seven fields of a stored point",
+  (() => {
+    const points = loadPointsFn().call({
+      _extractionEntity: () => "sensor.brew_detector_extraction",
+      _hass: {
+        states: {
+          "sensor.brew_detector_extraction": {
+            attributes: { points: [[1787723068.9, 22.92, 11.03, 2.08, 18, 37.4, 20.4]] },
+          },
+        },
+      },
+    });
+    return points;
+  })(),
+  [{ at: 1787723068.9, ext: 22.92, tds: 11.03, ratio: 2.08,
+     dose: 18, yieldG: 37.4, seconds: 20.4 }]
 );
 
 console.log(ok ? "\nOK" : "\nFAILED");

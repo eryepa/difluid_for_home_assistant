@@ -397,10 +397,13 @@ def _session(tmp_key="difluid_microbalance.test"):
     return session
 
 
-def _pair(dose, yield_g, at):
+def _pair(dose, yield_g, at, pour_seconds=None):
     from custom_components.difluid_microbalance.brew_detect import BrewPair
 
-    return BrewPair(dose=dose, dose_at=at - 200, yield_g=yield_g, yield_at=at)
+    return BrewPair(
+        dose=dose, dose_at=at - 200, yield_g=yield_g, yield_at=at,
+        pour_seconds=pour_seconds,
+    )
 
 
 def test_a_reading_attaches_to_the_last_brew_and_computes_extraction() -> None:
@@ -416,6 +419,35 @@ def test_a_reading_attaches_to_the_last_brew_and_computes_extraction() -> None:
     assert point.ext == 22.42          # 10.67 * 37.4 / 17.8
     assert point.at == 1000.0          # identified by the brew, not by the reading
     assert session.measurements == [point]
+
+
+def test_the_point_carries_the_pour_it_came_from() -> None:
+    """The chart's legend shows what the scale saw, and it has to be *this* brew's.
+
+    Reading the duration off the session's last_yield instead would be the same
+    mistake that reported a 42.8 g shot's ratio against a 59.8 g weighing on
+    2026-08-15: last_yield moves on to whatever is weighed next, and a point plotted
+    a month from now must still describe the cup it was.
+    """
+    session = _session()
+    session.last_pair = _pair(17.8, 37.4, 1000.0, pour_seconds=20.4)
+    point = session.record_measurement(10.67)
+    assert point.seconds == 20.4
+
+    # Something else goes on the scale, and the measured brew is unaffected.
+    session.last_pair = _pair(18.0, 40.0, 2000.0, pour_seconds=31.0)
+    assert session.measurements[0].seconds == 20.4
+
+
+def test_a_pour_nobody_watched_start_has_no_duration() -> None:
+    """None, not 0.0 — the distinction Plateau.rise_seconds exists for.
+
+    A restart or a BLE gap mid-shot leaves the detector with no idea how the coffee
+    got into the cup, and "0 s" would state that it arrived instantly.
+    """
+    session = _session()
+    session.last_pair = _pair(17.8, 37.4, 1000.0)
+    assert session.record_measurement(10.67).seconds is None
 
 
 def test_re_measuring_the_same_brew_replaces_its_point() -> None:
