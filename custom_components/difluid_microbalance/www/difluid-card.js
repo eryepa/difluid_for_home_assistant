@@ -200,6 +200,43 @@ const brewLabel = (p) => [
   Number.isFinite(p.seconds) ? `${Math.round(p.seconds)} s` : null,
 ].filter(Boolean).join(" · ");
 
+//: How far apart the pour card's two sources can be and still be the same brew.  They
+//: are two publications of one plateau — Last Yield's detected_at and Brew Ratio's
+//: paired_at — so they match exactly; the slack costs nothing and a mismatch here is
+//: read as "different brews", which is the safe direction.
+const SAME_POUR_SECONDS = 1;
+
+/**
+ * The brew the pour card should caption its curve with, in brewLabel's shape.
+ *
+ * The dose, the yield and the ratio come off Brew Ratio, which is the one place they
+ * are guaranteed to describe the same cup — its own attributes, written in one go when
+ * the pair formed.
+ *
+ * Not from the drawn curve, which is where the yield used to come from and why the two
+ * cards disagreed: the pour card said 37.0 g and the extraction card 37.2 g for one
+ * shot.  Both were honest.  The curve's last sample is whatever the scale read a few
+ * seconds after the flow stopped, and the detector's figure is the plateau it settled
+ * on — the crema was still going down.  The number a person compares between two cards
+ * has to be the brew's, so only one of them can be right to show.
+ *
+ * Returns just the seconds when the last pour did not pair, which happens when a pour
+ * is detected with no dose before it: Brew Ratio then describes an older cup than the
+ * curve, and captioning one with the other is the mismatch this exists to prevent.
+ */
+const pourBrew = (ratioState, detectedAt, riseSeconds) => {
+  const attrs = (ratioState || {}).attributes || {};
+  const ratio = Number((ratioState || {}).state);
+  const pairedAt = Date.parse(attrs.paired_at) / 1000;
+  const drawnAt = Date.parse(detectedAt) / 1000;
+  const samePour =
+    Number.isFinite(pairedAt) && Number.isFinite(drawnAt) &&
+    Math.abs(pairedAt - drawnAt) < SAME_POUR_SECONDS;
+  return samePour
+    ? { dose: attrs.dose, yieldG: attrs.yield, ratio, seconds: riseSeconds }
+    : { seconds: riseSeconds };
+};
+
 //: How far apart two timestamps can be and still name the same brew.  They come from
 //: the same stored pair by two routes — the point copied it when it was written, the
 //: attribute reads it now — so they agree exactly today; the slack is here so that a
@@ -222,56 +259,83 @@ const isCurrent = (point, lastBrewAt) =>
   !point || !Number.isFinite(lastBrewAt) || point.at >= lastBrewAt - SAME_BREW_SECONDS;
 
 /**
+ * How this Home Assistant formats a time.
+ *
+ * Not the browser's defaults, which is what `toLocaleTimeString([], …)` gets you and
+ * which rendered 19:32 as "07:32 PM" on an install whose every other clock reads 24
+ * hours.  Home Assistant keeps the answer in hass.locale, and it is a real setting a
+ * user has chosen — so it is the one to ask.
+ *
+ *   time_format  "12" / "24" force it; "language" follows the HA language's own
+ *                convention; "system" defers to the browser, which is the only case
+ *                where passing no language is right.
+ *   time_zone    "local" or "server"; on "server" the instant must be rendered in
+ *                hass.config.time_zone rather than wherever the browser is sitting.
+ */
+const timeFormat = (hass) => {
+  const locale = (hass && hass.locale) || {};
+  const opts = {};
+  if (locale.time_format === "24") opts.hour12 = false;
+  else if (locale.time_format === "12") opts.hour12 = true;
+  if (locale.time_zone === "server" && hass && hass.config && hass.config.time_zone) {
+    opts.timeZone = hass.config.time_zone;
+  }
+  return {
+    lang: locale.time_format === "system" ? undefined : locale.language || undefined,
+    opts,
+  };
+};
+
+//: Which calendar day an instant falls on, in the same zone the time is rendered in —
+//: otherwise a "server" setting could print yesterday's time without its date.
+const dayKey = (d, lang, opts) =>
+  d.toLocaleDateString(lang, {
+    ...(opts.timeZone ? { timeZone: opts.timeZone } : {}),
+    year: "numeric", month: "2-digit", day: "2-digit",
+  });
+
+/**
  * A POSIX timestamp as a clock time, with the date added once it is not today.
  *
  * `now` is a parameter rather than a call to Date.now() inside so that the "is it
  * today" branch can be tested at all.
  */
-const whenLabel = (ts, now = Date.now()) => {
+const whenLabel = (ts, hass, now = Date.now()) => {
   if (!Number.isFinite(ts)) return "";
+  const { lang, opts } = timeFormat(hass);
   const d = new Date(ts * 1000);
-  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  return d.toDateString() === new Date(now).toDateString()
+  const time = d.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit", ...opts });
+  return dayKey(d, lang, opts) === dayKey(new Date(now), lang, opts)
     ? time
-    : `${d.toLocaleDateString([], { day: "numeric", month: "short" })} ${time}`;
+    : `${d.toLocaleDateString(lang, {
+        ...(opts.timeZone ? { timeZone: opts.timeZone } : {}),
+        day: "numeric", month: "short",
+      })} ${time}`;
 };
 
 /**
- * When the coffee was made, and when it was read — `brewed 08:44 · measured 10:12`.
+ * A card header with the time of the brew it is about: `Extraction · 19:32`.
  *
- * Two times rather than one because they are routinely not the same time, and the
- * distance between them is the only thing on the card that can tell you the reading
- * is not about the cup in your hand.  Every refractometer reading attaches to the
- * most recent *detected* brew with no time window, which is the right rule — measuring
- * is something you get round to — but it means that on a morning when the scale is off
- * the air, a fresh reading is divided by an old shot's dose and yield and the result
- * is arithmetically perfect nonsense.  On 2026-08-26 a 10:12 reading was attributed to
- * an 08:44 brew and nothing in the numbers gave it away.
- *
- * Both are shown whenever both exist, with no rule about hiding one when they are
- * close.  A first draft dropped the reading time when it rendered to the same minute
- * as the brew, which sounds tidy and is a threshold that fires on the clock rather
- * than on anything real: measuring a minute after pulling the shot is the ordinary
- * case and would have shown both anyway, while a reading taken 59 seconds later would
- * have shown one.  Two times a minute apart read as what they are.
+ * Both charts describe one cup, so both name it the same way and in the same place.
+ * The time was in a line of its own under the Extraction chart until 1.9.0, next to a
+ * second time saying when the reading was taken — which answered a question nobody was
+ * asking twice.  The brew's own time is the one that identifies it; when the reading
+ * happened is in the Last TDS sensor for anyone who wants it.
  */
-const whenRow = (p, now = Date.now()) => {
-  const brewed = whenLabel(p.at, now);
-  if (!brewed) return "";
-  const measured = whenLabel(p.measuredAt, now);
-  return measured ? `brewed ${brewed} · measured ${measured}` : `brewed ${brewed}`;
+const cardTitle = (title, at, hass, now = Date.now()) => {
+  const when = whenLabel(at, hass, now);
+  return when ? `${title} · ${when}` : title;
 };
 
 /**
- * What to add to that line when the highlight has gone out.
+ * What to say when the highlight has gone out.
  *
- * A dot that quietly stops being red says something happened without saying what, and
- * the whole reason these times exist is that "is this my cup?" was not answerable from
- * the chart.  So the newer brew names itself.
+ * A dot that quietly stops being red says something happened without saying what, so
+ * the newer brew names itself.
  */
-const staleNote = (lastBrewAt, now = Date.now()) => {
-  const when = whenLabel(lastBrewAt, now);
-  return when ? ` · newer brew ${when}, not measured` : "";
+const staleNote = (lastBrewAt, hass, now = Date.now()) => {
+  const when = whenLabel(lastBrewAt, hass, now);
+  return when ? `newer brew ${when}, not measured` : "";
 };
 
 /**
@@ -924,28 +988,21 @@ class DifluidPourCard extends HTMLElement {
       );
     }
 
-    const last = series.weight[series.weight.length - 1];
-    const ratio = (this._hass.states[ids.ratio] || {}).state;
-    const dose = ((this._hass.states[ids.ratio] || {}).attributes || {}).dose;
-    const caption = series.live
-      ? `${last.v.toFixed(1)} g · ${secs(last).toFixed(0)}s`
-      : [
-          dose !== undefined ? `${dose} g` : null,
-          `${last.v.toFixed(1)} g`,
-          ratio && ratio !== "unknown" ? `1:${ratio}` : null,
-          `${series.riseSeconds.toFixed(0)}s`,
-        ].filter(Boolean).join(" · ");
-
     // When the drawn pour happened.  Only for the recorded one — "Pouring" is now by
     // definition, and the curve is moving while you read it.  Taken from the same
     // detected_at the history window was fetched for, so the header cannot name one
     // brew while the chart draws another.
     const detectedAt = ((this._hass.states[ids.lastYield] || {}).attributes || {})
       .detected_at;
-    const when = series.live ? "" : whenLabel(Date.parse(detectedAt) / 1000);
+
+    const last = series.weight[series.weight.length - 1];
+    const caption = series.live
+      ? `${last.v.toFixed(1)} g · ${secs(last).toFixed(0)} s`
+      : brewLabel(pourBrew(this._hass.states[ids.ratio], detectedAt, series.riseSeconds))
+        || `${last.v.toFixed(1)} g`;
     const header = series.live
       ? "Pouring"
-      : when ? `Last pour · ${when}` : "Last pour";
+      : cardTitle("Last pour", Date.parse(detectedAt) / 1000, this._hass);
 
     root.innerHTML = `
       <ha-card header="${header}">
@@ -1092,12 +1149,11 @@ class DifluidControlCard extends HTMLElement {
     if (!plottable.length) {
       const p = points[points.length - 1];
       root.innerHTML = `
-        <ha-card header="Extraction">
+        <ha-card header="${cardTitle("Extraction", p.at, this._hass)}">
           <div class="empty">
             TDS ${p.tds.toFixed(2)}% on ${trim1(p.dose)} g, but the scale never saw the
             pour, so there is no extraction to plot. Enter what came out in
             <b>Measured Yield</b> and this brew joins the chart.
-            <div class="when">${whenRow(p)}</div>
           </div>
           ${DifluidControlCard.STYLE}
         </ha-card>`;
@@ -1160,9 +1216,9 @@ class DifluidControlCard extends HTMLElement {
     }).join("");
 
     root.innerHTML = `
-      <ha-card header="Extraction">
+      <ha-card header="${cardTitle("Extraction", p.at, this._hass)}">
         <div class="body">
-          <div class="when">${whenRow(p)}${current ? "" : staleNote(this._lastBrewAt())}</div>
+          <div class="when">${current ? "" : staleNote(this._lastBrewAt(), this._hass)}</div>
           <svg viewBox="0 0 ${W} ${H}" role="img"
                aria-label="Brewing control chart: TDS against extraction">
             ${grid.join("")}

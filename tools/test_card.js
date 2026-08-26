@@ -41,8 +41,8 @@ function loadCardHelpers() {
       "\n;globalThis.__exported = { SENSOR_ORDER, CONTROL_ORDER, EXCLUDE_CONTROLS," +
       " STATS_ORDER, DIAG_ORDER, rank, inList, isStat, statRank, DOMAIN," +
       " pourWindow, cleanSamples, linePath, controlFrame, ratioSegment," +
-      " CONTROL_FRAMES, ESPRESSO_TDS, brewLabel, legendRow, whenLabel, whenRow," +
-      " isCurrent, staleNote };",
+      " CONTROL_FRAMES, ESPRESSO_TDS, brewLabel, legendRow, whenLabel, cardTitle," +
+      " isCurrent, staleNote, pourBrew, timeFormat };",
     sandbox,
     { filename: CARD }
   );
@@ -546,7 +546,7 @@ check(
 check(
   "the chart prints the times above it, and says when the light is out",
   controlMarkup("when", "const current = isCurrent("),
-  '<div class="when">${whenRow(p)}${current ? "" : staleNote(this._lastBrewAt())}'
+  '<div class="when">${current ? "" : staleNote(this._lastBrewAt(), this._hass)}'
 );
 
 // The dot itself: only the newest point may wear the highlight, and only while the
@@ -580,73 +580,114 @@ check(
     const to = src.indexOf("\nDifluidPourCard.STYLE =");
     const body = src.slice(from, to);
     return [
-      /const when = series\.live \? "" : whenLabel\(/.test(body),
-      /`Last pour · \$\{when\}`/.test(body),
+      /cardTitle\("Last pour", Date\.parse\(detectedAt\) \/ 1000, this\._hass\)/.test(body),
+      /series\.live\s*\n?\s*\? "Pouring"/.test(body),
       body.includes('<ha-card header="${header}">'),
     ];
   })(),
   [true, true, true]
 );
 
-// ── when it was made, and when it was read ───────────────────────────────────────
-// The 2026-08-26 case, at its real timestamps: the scale was off the air all morning,
-// so a shot read at 10:12 was divided by the dose and yield of an 08:44 brew.  Every
-// number on the card was correct and every one of them was about the wrong coffee.
-// Two clock times are the only thing that shows it.
+// ── the clock ────────────────────────────────────────────────────────────────────
+// 19:32 rendered as "07:32 PM" on an install whose every other clock reads 24 hours,
+// because toLocaleTimeString([], …) asks the browser and not Home Assistant.  The
+// answer is a setting the user chose, in hass.locale.
 const BREW_0844 = 1787723068.9;                 // 2026-08-26 08:44:28 +03
 const READ_1012 = 1787728377.1;                 // 2026-08-26 10:12:57 +03
 const SAME_DAY = READ_1012 * 1000;              // "now", for the is-it-today branch
 
-// Asserted on structure, not on the rendered string.  The first attempt pinned
-// "brewed 08:44 · measured 10:12" and failed under Node, which formats 08:44 AM — and
-// that is not a bug to fix but the feature working: the time follows the reader's
-// locale, so a hard-coded expectation would be testing Intl's defaults on whichever
-// machine happened to run it.
-const clocks = (s) => s.match(/\d{1,2}:\d{2}/g) || [];
+const HASS_24H = { locale: { language: "en", time_format: "24", time_zone: "local" } };
+const HASS_12H = { locale: { language: "en", time_format: "12", time_zone: "local" } };
 
 check(
-  "a reading taken well after the brew shows both times",
-  (() => {
-    const row = h.whenRow({ at: BREW_0844, measuredAt: READ_1012 }, SAME_DAY);
-    return [clocks(row).length, row.startsWith("brewed "), row.includes("measured ")];
-  })(),
-  [2, true, true]
+  "the 24-hour setting is obeyed, whatever the browser would have done",
+  [h.whenLabel(BREW_0844, HASS_24H, SAME_DAY),
+   h.whenLabel(READ_1012, HASS_24H, SAME_DAY)],
+  ["08:44", "10:12"]
 );
 
-// Measuring the cup you just pulled shows two times a minute apart, which is the
-// honest rendering of what happened.  Pinned because the tempting alternative — hide
-// the reading time when it is "close enough" — puts a threshold on the clock, and
-// this is the case that sits right on it.
 check(
-  "a shot measured a minute later still shows both times",
-  (() => {
-    const row = h.whenRow({ at: READ_1012, measuredAt: READ_1012 + 60 }, SAME_DAY);
-    return [clocks(row).length, row.includes("measured ")];
-  })(),
-  [2, true]
+  "and so is the 12-hour one",
+  h.whenLabel(READ_1012, HASS_12H, SAME_DAY),
+  "10:12 AM"
 );
 
-// A point from before 1.7.0 has no measured time at all; the brew time still shows.
+// "system" is the one case where the browser is the right authority, so no language is
+// passed; "language" follows the HA language's own convention.
 check(
-  "a point with no reading time still says when it was brewed",
-  (() => {
-    const row = h.whenRow({ at: BREW_0844 }, SAME_DAY);
-    return [clocks(row).length, row.includes("measured ")];
-  })(),
-  [1, false]
+  "system defers to the browser and language does not",
+  [
+    h.timeFormat({ locale: { language: "ru", time_format: "system" } }).lang,
+    h.timeFormat({ locale: { language: "ru", time_format: "language" } }).lang,
+  ],
+  [undefined, "ru"]
 );
 
-// Yesterday's shot must not read as a bare "08:44" next to today's, or the chart's
-// history becomes a column of times with no days attached.  Which side the date falls
-// on is the locale's business; that there is one is not.
+// A dashboard opened from another country must still show the times the coffee was
+// actually made at, when Home Assistant is set to report in the server's zone.
+check(
+  "a server time zone is applied rather than the viewer's",
+  h.whenLabel(BREW_0844, {
+    locale: { language: "en", time_format: "24", time_zone: "server" },
+    config: { time_zone: "Asia/Tokyo" },
+  }, SAME_DAY),
+  // 08:44 in Moscow is 14:44 in Tokyo, and still 26 August there — so no date, which
+  // is the point: the day check has to run in the zone being rendered, not the
+  // browser's, or a "server" setting could print yesterday's time bare.
+  "14:44"
+);
+
+// Yesterday's shot must not read as a bare "08:44" next to today's.
 check(
   "a brew from another day carries a date and today's does not",
   (() => {
-    const today = h.whenLabel(BREW_0844, SAME_DAY);
-    const older = h.whenLabel(BREW_0844, SAME_DAY + 86400000);
-    return [clocks(today).length, older.length > today.length, older.includes(today)];
+    const today = h.whenLabel(BREW_0844, HASS_24H, SAME_DAY);
+    const older = h.whenLabel(BREW_0844, HASS_24H, SAME_DAY + 86400000);
+    return [today, older.length > today.length, older.includes(today)];
   })(),
-  [1, true, true]
+  ["08:44", true, true]
+);
+
+// Both charts describe one cup and name it the same way, in the same place.
+check(
+  "the card header carries the time of the brew it is about",
+  [
+    h.cardTitle("Extraction", BREW_0844, HASS_24H, SAME_DAY),
+    h.cardTitle("Last pour", BREW_0844, HASS_24H, SAME_DAY),
+    h.cardTitle("Extraction", null, HASS_24H, SAME_DAY),
+  ],
+  ["Extraction · 08:44", "Last pour · 08:44", "Extraction"]
+);
+
+// ── one cup, one line, on both cards ─────────────────────────────────────────────
+// They used to disagree about the same shot: the pour card said "18g · 37.0g · 1:2.07
+// · 17s" and the extraction card "18 → 37.2 g · 1:2.1 · 17 s".  Both were honest — the
+// pour card was reading the last sample of the drawn curve, taken a few seconds after
+// the flow stopped and still settling, while the detector's figure is the plateau it
+// came to rest on.  Only one of them can be the number a person compares.
+const RATIO_STATE = {
+  state: "2.07",
+  attributes: { dose: 18, yield: 37.2, paired_at: "2026-08-26T16:32:17.339393+00:00" },
+};
+const DETECTED_AT = "2026-08-26T16:32:17.339393+00:00";
+
+check(
+  "both cards caption the same brew identically",
+  (() => {
+    const fromPour = h.brewLabel(h.pourBrew(RATIO_STATE, DETECTED_AT, 17));
+    const fromChart = h.brewLabel({ dose: 18, yieldG: 37.2, ratio: 2.07, seconds: 17 });
+    return [fromPour, fromPour === fromChart];
+  })(),
+  ["18 → 37.2 g · 1:2.1 · 17 s", true]
+);
+
+// A pour with no dose before it does not pair, so Brew Ratio still describes an older
+// cup.  Captioning this curve with those numbers is the mismatch above, in its worst
+// form — right-looking figures about a different shot.
+check(
+  "an unpaired pour is captioned with what is known about it and nothing more",
+  h.brewLabel(h.pourBrew(RATIO_STATE, "2026-08-26T17:10:00.000000+00:00", 21)),
+  "21 s"
 );
 
 // ── the highlight goes out when the cup is no longer yours ───────────────────────
@@ -692,11 +733,8 @@ check(
 
 check(
   "the line says which brew put the light out",
-  (() => {
-    const note = h.staleNote(READ_1012, SAME_DAY);
-    return [note.includes("not measured"), (note.match(/\d{1,2}:\d{2}/g) || []).length];
-  })(),
-  [true, 1]
+  h.staleNote(READ_1012, HASS_24H, SAME_DAY),
+  "newer brew 10:12, not measured"
 );
 
 // ── a cup whose pour the scale never saw ─────────────────────────────────────────
