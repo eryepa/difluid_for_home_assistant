@@ -323,17 +323,32 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
                 # Null, not 0, when the pour's start was never observed.  See
                 # BrewPair.pour_seconds.
                 "seconds": s.last_measurement.seconds,
+                "brew_at": dt_util.utc_from_timestamp(
+                    s.last_measurement.at
+                ).isoformat(),
+                "measured_at": dt_util.utc_from_timestamp(
+                    s.last_measurement.measured_at
+                ).isoformat(),
                 "measured_brews": len(s.measurements),
                 # The series the control chart plots, oldest first, as
-                # [brew time, EXT %, TDS %, ratio, dose g, yield g, pour s].  Positional
-                # rather than named to keep it small: this rides along on every state
-                # change, and a list of dicts would be several times the size for no
-                # more information.
+                # [brew time, EXT %, TDS %, ratio, dose g, yield g, pour s, read at].
+                # Positional rather than named to keep it small: this rides along on
+                # every state change, and a list of dicts would be several times the
+                # size for no more information.
                 #
-                # The last three are what the chart shows *about* a point rather than
-                # where it sits, and they are per-point rather than read off the
-                # top-level attributes because the card has to be able to walk back
+                # Everything after the ratio is what the chart shows *about* a point
+                # rather than where it sits, and it is per-point rather than read off
+                # the top-level attributes because the card has to be able to walk back
                 # through the history and describe an older brew, not only this one.
+                #
+                # The two times are both here because they are not the same time and
+                # the distance between them is the point.  Every reading attaches to
+                # the most recent brew with no window at all — deliberately, since
+                # measuring is something you get round to — so a reading taken on a
+                # morning when the scale was off the air lands on yesterday's cup and
+                # is arithmetically correct about the wrong coffee.  That happened on
+                # 2026-08-26: a shot read at 10:12 was divided by an 08:44 brew.
+                # Nothing in the numbers shows it; the clock does.
                 #
                 # An attribute rather than a service or a websocket command because it
                 # is small, it is already flowing to every dashboard, and it needs no
@@ -341,7 +356,7 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
                 "points": [
                     [
                         round(m.at, 1), m.ext, m.tds, round(m.ratio, 2),
-                        m.dose, m.yield_g, m.seconds,
+                        m.dose, m.yield_g, m.seconds, round(m.measured_at, 1),
                     ]
                     for m in s.measurements[-CHART_POINTS:]
                 ],

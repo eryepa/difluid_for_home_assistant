@@ -200,6 +200,47 @@ const brewLabel = (p) => [
 ].filter(Boolean).join(" · ");
 
 /**
+ * A POSIX timestamp as a clock time, with the date added once it is not today.
+ *
+ * `now` is a parameter rather than a call to Date.now() inside so that the "is it
+ * today" branch can be tested at all.
+ */
+const whenLabel = (ts, now = Date.now()) => {
+  if (!Number.isFinite(ts)) return "";
+  const d = new Date(ts * 1000);
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === new Date(now).toDateString()
+    ? time
+    : `${d.toLocaleDateString([], { day: "numeric", month: "short" })} ${time}`;
+};
+
+/**
+ * When the coffee was made, and when it was read — `brewed 08:44 · measured 10:12`.
+ *
+ * Two times rather than one because they are routinely not the same time, and the
+ * distance between them is the only thing on the card that can tell you the reading
+ * is not about the cup in your hand.  Every refractometer reading attaches to the
+ * most recent *detected* brew with no time window, which is the right rule — measuring
+ * is something you get round to — but it means that on a morning when the scale is off
+ * the air, a fresh reading is divided by an old shot's dose and yield and the result
+ * is arithmetically perfect nonsense.  On 2026-08-26 a 10:12 reading was attributed to
+ * an 08:44 brew and nothing in the numbers gave it away.
+ *
+ * Both are shown whenever both exist, with no rule about hiding one when they are
+ * close.  A first draft dropped the reading time when it rendered to the same minute
+ * as the brew, which sounds tidy and is a threshold that fires on the clock rather
+ * than on anything real: measuring a minute after pulling the shot is the ordinary
+ * case and would have shown both anyway, while a reading taken 59 seconds later would
+ * have shown one.  Two times a minute apart read as what they are.
+ */
+const whenRow = (p, now = Date.now()) => {
+  const brewed = whenLabel(p.at, now);
+  if (!brewed) return "";
+  const measured = whenLabel(p.measuredAt, now);
+  return measured ? `brewed ${brewed} · measured ${measured}` : `brewed ${brewed}`;
+};
+
+/**
  * The line under the chart: what the refractometer read on the left, what the scale
  * saw on the right.
  *
@@ -861,8 +902,19 @@ class DifluidPourCard extends HTMLElement {
           `${series.riseSeconds.toFixed(0)}s`,
         ].filter(Boolean).join(" · ");
 
+    // When the drawn pour happened.  Only for the recorded one — "Pouring" is now by
+    // definition, and the curve is moving while you read it.  Taken from the same
+    // detected_at the history window was fetched for, so the header cannot name one
+    // brew while the chart draws another.
+    const detectedAt = ((this._hass.states[ids.lastYield] || {}).attributes || {})
+      .detected_at;
+    const when = series.live ? "" : whenLabel(Date.parse(detectedAt) / 1000);
+    const header = series.live
+      ? "Pouring"
+      : when ? `Last pour · ${when}` : "Last pour";
+
     root.innerHTML = `
-      <ha-card header="${series.live ? "Pouring" : "Last pour"}">
+      <ha-card header="${header}">
         <div class="body">
           <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
                aria-label="Pour curve: weight and flow over time">
@@ -965,8 +1017,8 @@ class DifluidControlCard extends HTMLElement {
     // simply has none.  Destructuring past the end gives undefined, which every
     // consumer below already treats as "do not show it".
     return (attrs.points || [])
-      .map(([at, ext, tds, ratio, dose, yieldG, seconds]) =>
-        ({ at, ext, tds, ratio, dose, yieldG, seconds }))
+      .map(([at, ext, tds, ratio, dose, yieldG, seconds, measuredAt]) =>
+        ({ at, ext, tds, ratio, dose, yieldG, seconds, measuredAt }))
       .filter((p) => Number.isFinite(p.ext) && Number.isFinite(p.tds));
   }
 
@@ -1039,6 +1091,7 @@ class DifluidControlCard extends HTMLElement {
     root.innerHTML = `
       <ha-card header="Extraction">
         <div class="body">
+          <div class="when">${whenRow(p)}</div>
           <svg viewBox="0 0 ${W} ${H}" role="img"
                aria-label="Brewing control chart: TDS against extraction">
             ${grid.join("")}
@@ -1060,6 +1113,8 @@ DifluidControlCard.STYLE = `
   <style>
     .body { padding: 4px 12px 12px; }
     .empty { padding: 24px 16px; color: var(--secondary-text-color); line-height: 1.5; }
+    .when { text-align: right; font-size: 11px; color: var(--secondary-text-color);
+            font-variant-numeric: tabular-nums; padding-bottom: 2px; }
     svg { width: 100%; height: auto; display: block; }
     .grid { stroke: var(--divider-color); stroke-width: .5; }
     .ratio { stroke: var(--secondary-text-color); stroke-width: 1; opacity: .55; }

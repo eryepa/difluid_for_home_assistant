@@ -41,7 +41,7 @@ function loadCardHelpers() {
       "\n;globalThis.__exported = { SENSOR_ORDER, CONTROL_ORDER, EXCLUDE_CONTROLS," +
       " STATS_ORDER, DIAG_ORDER, rank, inList, isStat, statRank, DOMAIN," +
       " pourWindow, cleanSamples, linePath, controlFrame, ratioSegment," +
-      " CONTROL_FRAMES, ESPRESSO_TDS, brewLabel, legendRow };",
+      " CONTROL_FRAMES, ESPRESSO_TDS, brewLabel, legendRow, whenLabel, whenRow };",
     sandbox,
     { filename: CARD }
   );
@@ -522,37 +522,129 @@ check(
 );
 
 // …and that _render actually delegates to it rather than keeping its own copy, which
-// is the only part of the chain a harness with no DOM cannot execute.
+// is the only part of the chain a harness with no DOM cannot execute.  Both rows are
+// checked the same way: emptying either one in the template left every assertion above
+// passing, because a helper nobody calls still works perfectly.
+const controlMarkup = (tag) => {
+  const src = fs.readFileSync(CARD, "utf8");
+  // From the control card, not the pour card — both have a legend.
+  const from = src.slice(
+    src.indexOf(`<div class="${tag}">`, src.indexOf("class DifluidControlCard"))
+  );
+  return from.slice(0, from.indexOf("</div>")).replace(/\s+/g, " ").trim();
+};
+
 check(
   "the chart's legend is the one tested above",
-  (() => {
-    const src = fs.readFileSync(CARD, "utf8");
-    // From the control card, not the pour card — both have a legend.
-    const legend = src.slice(
-      src.indexOf('<div class="legend">', src.indexOf("class DifluidControlCard"))
-    );
-    return legend.slice(0, legend.indexOf("</div>")).replace(/\s+/g, " ").trim();
-  })(),
+  controlMarkup("legend"),
   '<div class="legend">${legendRow(p)}'
 );
 
 check(
-  "the chart reads all seven fields of a stored point",
+  "the chart prints the times above it",
+  controlMarkup("when"),
+  '<div class="when">${whenRow(p)}'
+);
+
+// The pour card names its brew in the header instead, and has the same blind spot.
+check(
+  "the pour card's header carries the time of the pour it drew",
+  (() => {
+    const src = fs.readFileSync(CARD, "utf8");
+    const from = src.indexOf("class DifluidPourCard");
+    // At the start of a line: `${DifluidPourCard.STYLE}` appears inside the class
+    // first, and slicing there cuts the body off above the part being checked.
+    const to = src.indexOf("\nDifluidPourCard.STYLE =");
+    const body = src.slice(from, to);
+    return [
+      /const when = series\.live \? "" : whenLabel\(/.test(body),
+      /`Last pour · \$\{when\}`/.test(body),
+      body.includes('<ha-card header="${header}">'),
+    ];
+  })(),
+  [true, true, true]
+);
+
+// ── when it was made, and when it was read ───────────────────────────────────────
+// The 2026-08-26 case, at its real timestamps: the scale was off the air all morning,
+// so a shot read at 10:12 was divided by the dose and yield of an 08:44 brew.  Every
+// number on the card was correct and every one of them was about the wrong coffee.
+// Two clock times are the only thing that shows it.
+const BREW_0844 = 1787723068.9;                 // 2026-08-26 08:44:28 +03
+const READ_1012 = 1787728377.1;                 // 2026-08-26 10:12:57 +03
+const SAME_DAY = READ_1012 * 1000;              // "now", for the is-it-today branch
+
+// Asserted on structure, not on the rendered string.  The first attempt pinned
+// "brewed 08:44 · measured 10:12" and failed under Node, which formats 08:44 AM — and
+// that is not a bug to fix but the feature working: the time follows the reader's
+// locale, so a hard-coded expectation would be testing Intl's defaults on whichever
+// machine happened to run it.
+const clocks = (s) => s.match(/\d{1,2}:\d{2}/g) || [];
+
+check(
+  "a reading taken well after the brew shows both times",
+  (() => {
+    const row = h.whenRow({ at: BREW_0844, measuredAt: READ_1012 }, SAME_DAY);
+    return [clocks(row).length, row.startsWith("brewed "), row.includes("measured ")];
+  })(),
+  [2, true, true]
+);
+
+// Measuring the cup you just pulled shows two times a minute apart, which is the
+// honest rendering of what happened.  Pinned because the tempting alternative — hide
+// the reading time when it is "close enough" — puts a threshold on the clock, and
+// this is the case that sits right on it.
+check(
+  "a shot measured a minute later still shows both times",
+  (() => {
+    const row = h.whenRow({ at: READ_1012, measuredAt: READ_1012 + 60 }, SAME_DAY);
+    return [clocks(row).length, row.includes("measured ")];
+  })(),
+  [2, true]
+);
+
+// A point from before 1.7.0 has no measured time at all; the brew time still shows.
+check(
+  "a point with no reading time still says when it was brewed",
+  (() => {
+    const row = h.whenRow({ at: BREW_0844 }, SAME_DAY);
+    return [clocks(row).length, row.includes("measured ")];
+  })(),
+  [1, false]
+);
+
+// Yesterday's shot must not read as a bare "08:44" next to today's, or the chart's
+// history becomes a column of times with no days attached.  Which side the date falls
+// on is the locale's business; that there is one is not.
+check(
+  "a brew from another day carries a date and today's does not",
+  (() => {
+    const today = h.whenLabel(BREW_0844, SAME_DAY);
+    const older = h.whenLabel(BREW_0844, SAME_DAY + 86400000);
+    return [clocks(today).length, older.length > today.length, older.includes(today)];
+  })(),
+  [1, true, true]
+);
+
+check(
+  "the chart reads all eight fields of a stored point",
   (() => {
     const points = loadPointsFn().call({
       _extractionEntity: () => "sensor.brew_detector_extraction",
       _hass: {
         states: {
           "sensor.brew_detector_extraction": {
-            attributes: { points: [[1787723068.9, 22.92, 11.03, 2.08, 18, 37.4, 20.4]] },
+            attributes: {
+              points: [[BREW_0844, 22.92, 11.03, 2.08, 18, 37.4, 20.4, READ_1012]],
+            },
           },
         },
       },
     });
     return points;
   })(),
-  [{ at: 1787723068.9, ext: 22.92, tds: 11.03, ratio: 2.08,
-     dose: 18, yieldG: 37.4, seconds: 20.4 }]
+  [{ at: BREW_0844, ext: 22.92, tds: 11.03, ratio: 2.08,
+     dose: 18, yieldG: 37.4, seconds: 20.4, measuredAt: READ_1012 }]
 );
 
 console.log(ok ? "\nOK" : "\nFAILED");
