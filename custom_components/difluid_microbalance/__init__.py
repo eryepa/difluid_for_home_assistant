@@ -4,7 +4,12 @@ import logging
 from pathlib import Path
 
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry, ConfigEntryState
-from homeassistant.const import CONF_ADDRESS, Platform
+from homeassistant.const import (
+    CONF_ADDRESS,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+    Platform,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import entity_registry as er
@@ -325,6 +330,17 @@ def _async_watch_refractometer(
             return
         old = event.data.get("old_state")
         if old is not None and old.state == new.state:
+            return
+        if old is None or old.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            # Coming back from the dead, not finishing a test.  The R2 is a handheld
+            # that spends its life switched off, and its sensors go unavailable with
+            # it; the coordinator keeps the last reading in memory, so reconnecting
+            # republishes "Test Finished" with the TDS of whatever was measured last.
+            # Seen on 2026-08-26 10:02:45, where a reconnect re-recorded the 08:49
+            # reading — harmless only because no cup had been pulled in between.  With
+            # one that had, the rule that every reading belongs to the most recent brew
+            # would have pinned a stale number onto a brew nobody measured.
+            _LOGGER.debug("Refractometer came back as %s; not a new test", new.state)
             return
         _disarm()
         armed.append(async_call_later(hass, _TDS_SETTLE_SECONDS, _settled))

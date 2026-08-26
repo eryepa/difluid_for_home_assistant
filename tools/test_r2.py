@@ -213,6 +213,50 @@ async def test_a_loop_test_still_hunting_records_nothing(
     assert session.recorded == [11.05]
 
 
+async def test_switching_the_r2_back_on_does_not_record_the_last_test_again(
+    hass: HomeAssistant,
+) -> None:
+    """Found in the live data on 2026-08-26, at 10:02:45.
+
+    The R2 is a handheld and spends its life switched off; its sensors go unavailable
+    with it and the coordinator keeps the last reading in memory.  So a reconnect
+    republishes "Test Finished" together with whatever TDS was measured last — and
+    "every reading belongs to the most recent brew" then pins that stale number onto
+    whichever cup happens to be the latest.  That day it landed back on the same brew
+    and only corrected a rounding; the next unmeasured shot would have been given a
+    reading it never had.
+    """
+    session, status_id, tds_id = await _watch(hass)
+
+    hass.states.async_set(tds_id, "11.04")
+    hass.states.async_set(status_id, "Test Finished")
+    await hass.async_block_till_done()
+    session.recorded.clear()
+
+    # Switched off, then on again — the retained value comes back unchanged.
+    hass.states.async_set(status_id, "unavailable")
+    hass.states.async_set(tds_id, "unavailable")
+    await hass.async_block_till_done()
+    hass.states.async_set(status_id, "Test Finished")
+    hass.states.async_set(tds_id, "11.04")
+    await hass.async_block_till_done()
+
+    async_fire_time_changed(
+        hass, dt_util.utcnow() + timedelta(seconds=_TDS_SETTLE_SECONDS + 1)
+    )
+    await hass.async_block_till_done()
+    assert session.recorded == []
+
+    # A real test run right afterwards still records, which is what keeps the guard
+    # from being "ignore the first measurement after every reconnect".
+    hass.states.async_set(status_id, "Test Start")
+    await hass.async_block_till_done()
+    hass.states.async_set(status_id, "Test Finished")
+    hass.states.async_set(tds_id, "10.20")
+    await hass.async_block_till_done()
+    assert session.recorded == [10.20]
+
+
 async def test_a_calibration_is_not_a_brew(hass: HomeAssistant) -> None:
     """Distilled water on the prism finishes like any other test and reads ~0 %."""
     session, status_id, tds_id = await _watch(hass)
