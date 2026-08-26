@@ -41,7 +41,8 @@ function loadCardHelpers() {
       "\n;globalThis.__exported = { SENSOR_ORDER, CONTROL_ORDER, EXCLUDE_CONTROLS," +
       " STATS_ORDER, DIAG_ORDER, rank, inList, isStat, statRank, DOMAIN," +
       " pourWindow, cleanSamples, linePath, controlFrame, ratioSegment," +
-      " CONTROL_FRAMES, ESPRESSO_TDS, brewLabel, legendRow, whenLabel, whenRow };",
+      " CONTROL_FRAMES, ESPRESSO_TDS, brewLabel, legendRow, whenLabel, whenRow," +
+      " isCurrent, staleNote };",
     sandbox,
     { filename: CARD }
   );
@@ -525,11 +526,13 @@ check(
 // is the only part of the chain a harness with no DOM cannot execute.  Both rows are
 // checked the same way: emptying either one in the template left every assertion above
 // passing, because a helper nobody calls still works perfectly.
-const controlMarkup = (tag) => {
+// `after` anchors where the search starts.  The pour card has a legend of its own, and
+// the control card prints a `.when` row twice — once above the chart, and once in the
+// message shown when a brew was measured but has no yield to place it with.
+const controlMarkup = (tag, after = "class DifluidControlCard") => {
   const src = fs.readFileSync(CARD, "utf8");
-  // From the control card, not the pour card — both have a legend.
   const from = src.slice(
-    src.indexOf(`<div class="${tag}">`, src.indexOf("class DifluidControlCard"))
+    src.indexOf(`<div class="${tag}">`, src.indexOf(after))
   );
   return from.slice(0, from.indexOf("</div>")).replace(/\s+/g, " ").trim();
 };
@@ -541,9 +544,29 @@ check(
 );
 
 check(
-  "the chart prints the times above it",
-  controlMarkup("when"),
-  '<div class="when">${whenRow(p)}'
+  "the chart prints the times above it, and says when the light is out",
+  controlMarkup("when", "const current = isCurrent("),
+  '<div class="when">${whenRow(p)}${current ? "" : staleNote(this._lastBrewAt())}'
+);
+
+// The dot itself: only the newest point may wear the highlight, and only while the
+// brew it describes is still the newest one.  Checked against the template because the
+// harness cannot render — isCurrent passing on its own proves nothing about the SVG.
+check(
+  "the highlight is tied to isCurrent, not just to being last",
+  (() => {
+    const src = fs.readFileSync(CARD, "utf8");
+    const from = src.indexOf("const dots = plottable.map", src.indexOf("class DifluidControlCard"));
+    const body = src.slice(from, src.indexOf('.join("")', from));
+    return [
+      /const lit = newest && current;/.test(body),
+      /class="\$\{lit \? "dot last" : "dot"\}"/.test(body),
+      /r="\$\{lit \? 6 : 4\}"/.test(body),
+      // Full opacity for the newest either way: it is still the last thing measured.
+      /opacity="\$\{newest \? 1 :/.test(body),
+    ];
+  })(),
+  [true, true, true, true]
 );
 
 // The pour card names its brew in the header instead, and has the same blind spot.
@@ -624,6 +647,56 @@ check(
     return [clocks(today).length, older.length > today.length, older.includes(today)];
   })(),
   [1, true, true]
+);
+
+// ── the highlight goes out when the cup is no longer yours ───────────────────────
+// The red dot means "this is the cup you are drinking".  Pull another shot without
+// measuring it and that stops being true, silently: the chart goes on highlighting the
+// cup before the one in your hand.
+
+check(
+  "the newest measured brew stays lit while it is also the newest brewed",
+  h.isCurrent({ at: BREW_0844 }, BREW_0844),
+  true
+);
+
+check(
+  "a shot pulled after the last measurement puts the highlight out",
+  h.isCurrent({ at: BREW_0844 }, BREW_0844 + 600),
+  false
+);
+
+// Measuring that newer shot lights it again — the same call, with the point that the
+// new measurement produced.
+check(
+  "measuring the newer shot lights it again",
+  h.isCurrent({ at: BREW_0844 + 600 }, BREW_0844 + 600),
+  true
+);
+
+// A detector that has never completed a pair publishes null, and a card must not read
+// that as "everything is stale" and put out a light it never lit.
+check(
+  "nothing known about the last brew leaves the highlight alone",
+  [h.isCurrent({ at: BREW_0844 }, null), h.isCurrent(null, BREW_0844 + 600)],
+  [true, true]
+);
+
+// A measurement anchored on a dose, with the pour never seen, is *newer* than the last
+// completed pair.  It must not be called stale by the pair it postdates.
+check(
+  "a dose-anchored measurement is not stale against an older pair",
+  h.isCurrent({ at: READ_1012 }, BREW_0844),
+  true
+);
+
+check(
+  "the line says which brew put the light out",
+  (() => {
+    const note = h.staleNote(READ_1012, SAME_DAY);
+    return [note.includes("not measured"), (note.match(/\d{1,2}:\d{2}/g) || []).length];
+  })(),
+  [true, 1]
 );
 
 // ── a cup whose pour the scale never saw ─────────────────────────────────────────

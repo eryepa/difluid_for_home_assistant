@@ -592,6 +592,29 @@ def test_a_later_brew_does_not_steal_an_earlier_cups_missing_yield() -> None:
     assert session.measurements[0].ext is None
 
 
+def test_the_extraction_sensor_says_when_the_last_brew_was() -> None:
+    """What the chart puts its highlight out from.
+
+    Its own test because the card cannot check it: emptying this attribute leaves every
+    JavaScript assertion passing and every dot lit forever, which is the state the
+    highlight exists to prevent.
+    """
+    session = _session()
+    session.last_dose = _dose(18.0, 900.0)
+    session.last_pair = _pair(18.0, 37.2, 1000.0)
+    session.record_measurement(11.01)
+
+    desc = next(d for d in BREW_SENSORS if d.key == "last_extraction")
+    assert desc.attrs_fn(session)["last_brew_at"] == 1000.0
+
+    # Another shot pulled and not measured.  The attribute moves ahead of the newest
+    # point, which is exactly the gap the card reads as "your cup is not this one".
+    session.last_pair = _pair(18.0, 37.0, 5000.0)
+    attrs = desc.attrs_fn(session)
+    assert attrs["last_brew_at"] == 5000.0
+    assert attrs["points"][-1][0] == 1000.0
+
+
 def test_the_point_carries_the_pour_it_came_from() -> None:
     """The chart's legend shows what the scale saw, and it has to be *this* brew's.
 

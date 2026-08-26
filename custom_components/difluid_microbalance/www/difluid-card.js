@@ -200,6 +200,27 @@ const brewLabel = (p) => [
   Number.isFinite(p.seconds) ? `${Math.round(p.seconds)} s` : null,
 ].filter(Boolean).join(" · ");
 
+//: How far apart two timestamps can be and still name the same brew.  They come from
+//: the same stored pair by two routes — the point copied it when it was written, the
+//: attribute reads it now — so they agree exactly today; the slack is here so that a
+//: rounding change on the Python side cannot silently turn every point stale.
+const SAME_BREW_SECONDS = 0.5;
+
+/**
+ * Is the newest measured brew still the newest brew?
+ *
+ * The red dot means "this is the cup you are drinking".  It stops being true the
+ * moment another shot is pulled: the chart then highlights the cup *before* the one in
+ * your hand, and nothing on it says so.  So the highlight goes out when the detector
+ * completes a brew later than the newest measured one, and comes back when that brew
+ * is measured.
+ *
+ * True when nothing is known about the last brew, rather than false: a detector that
+ * has never paired should not put out a light it never lit.
+ */
+const isCurrent = (point, lastBrewAt) =>
+  !point || !Number.isFinite(lastBrewAt) || point.at >= lastBrewAt - SAME_BREW_SECONDS;
+
 /**
  * A POSIX timestamp as a clock time, with the date added once it is not today.
  *
@@ -239,6 +260,18 @@ const whenRow = (p, now = Date.now()) => {
   if (!brewed) return "";
   const measured = whenLabel(p.measuredAt, now);
   return measured ? `brewed ${brewed} · measured ${measured}` : `brewed ${brewed}`;
+};
+
+/**
+ * What to add to that line when the highlight has gone out.
+ *
+ * A dot that quietly stops being red says something happened without saying what, and
+ * the whole reason these times exist is that "is this my cup?" was not answerable from
+ * the chart.  So the newer brew names itself.
+ */
+const staleNote = (lastBrewAt, now = Date.now()) => {
+  const when = whenLabel(lastBrewAt, now);
+  return when ? ` · newer brew ${when}, not measured` : "";
 };
 
 /**
@@ -1009,6 +1042,14 @@ class DifluidControlCard extends HTMLElement {
     return null;
   }
 
+  //: When the detector last completed a brew, measured or not — see isCurrent.
+  _lastBrewAt() {
+    const id = this._extractionEntity();
+    if (!id) return null;
+    const v = ((this._hass.states[id] || {}).attributes || {}).last_brew_at;
+    return Number.isFinite(v) ? v : null;
+  }
+
   _points() {
     const id = this._extractionEntity();
     if (!id) return [];
@@ -1101,23 +1142,27 @@ class DifluidControlCard extends HTMLElement {
     const box = `<rect class="ideal" x="${X(bx0)}" y="${Y(by1)}"
                        width="${X(bx1) - X(bx0)}" height="${Y(by0) - Y(by1)}"/>`;
 
-    // Oldest faintest, so the drift is legible as a direction and not just a cloud.
-    const dots = plottable.map((p, i) => {
-      const last = i === plottable.length - 1;
-      const age = plottable.length > 1 ? i / (plottable.length - 1) : 1;
-      return `<circle class="${last ? "dot last" : "dot"}"
-                      cx="${X(p.ext)}" cy="${Y(p.tds)}" r="${last ? 6 : 4}"
-                      opacity="${last ? 1 : (0.25 + age * 0.45).toFixed(2)}"/>`;
-    }).join("");
-
     // The newest brew that can be drawn, which is not always the newest measured —
     // one still waiting for its yield stays off the chart until it has one.
     const p = plottable[plottable.length - 1];
+    const current = isCurrent(p, this._lastBrewAt());
+
+    // Oldest faintest, so the drift is legible as a direction and not just a cloud.
+    // The newest keeps full opacity either way — it is still the last thing measured
+    // — but only wears the highlight while it is also the last thing brewed.
+    const dots = plottable.map((q, i) => {
+      const newest = i === plottable.length - 1;
+      const lit = newest && current;
+      const age = plottable.length > 1 ? i / (plottable.length - 1) : 1;
+      return `<circle class="${lit ? "dot last" : "dot"}"
+                      cx="${X(q.ext)}" cy="${Y(q.tds)}" r="${lit ? 6 : 4}"
+                      opacity="${newest ? 1 : (0.25 + age * 0.45).toFixed(2)}"/>`;
+    }).join("");
 
     root.innerHTML = `
       <ha-card header="Extraction">
         <div class="body">
-          <div class="when">${whenRow(p)}</div>
+          <div class="when">${whenRow(p)}${current ? "" : staleNote(this._lastBrewAt())}</div>
           <svg viewBox="0 0 ${W} ${H}" role="img"
                aria-label="Brewing control chart: TDS against extraction">
             ${grid.join("")}

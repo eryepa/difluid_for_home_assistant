@@ -335,6 +335,18 @@ BREW_SENSORS: tuple[DifluidBrewSensorDescription, ...] = (
                 "measured_at": dt_util.utc_from_timestamp(
                     s.last_measurement.measured_at
                 ).isoformat(),
+                # When the detector last completed a brew, measured or not.  The chart
+                # needs it to know whether its newest dot is still the cup you are
+                # drinking: pull a shot and do not measure it, and the highlighted
+                # point is describing the cup before it.
+                #
+                # The pair rather than current_brew(), so grinding alone does not put
+                # the chart out of date — a dose can turn out to be the portafilter
+                # going back on the scale, and the highlight would flicker on and off
+                # with it.  A pour is the thing that makes a previous measurement old.
+                "last_brew_at": (
+                    None if s.last_pair is None else round(s.last_pair.yield_at, 1)
+                ),
                 "measured_brews": len(s.measurements),
                 # The series the control chart plots, oldest first, as
                 # [brew time, EXT %, TDS %, ratio, dose g, yield g, pour s, read at].
