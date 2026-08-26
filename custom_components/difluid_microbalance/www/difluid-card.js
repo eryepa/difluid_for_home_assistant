@@ -109,6 +109,38 @@ const cleanSamples = (samples, expected) => {
   );
 };
 
+//: Horizontal gridlines, and therefore how many steps each vertical axis is cut into.
+//: Both axes share the lines, so both have to share the count.
+const AXIS_STEPS = 4;
+
+/**
+ * A round top for an axis, and the step to label it with.
+ *
+ * The axes used to be `peak * 1.1` cut into quarters, which put the numbers wherever
+ * the coffee happened to land: a 37.2 g shot was labelled 0, 10, 20, 31, 41 and its
+ * flow 0.0, 1.0, 2.0, 2.9, 3.9.  Every one of those is arithmetically correct and none
+ * of them is a number anybody reads an axis in.
+ *
+ * The step is rounded up to 1, 2, 2.5 or 5 times a power of ten — the ladder every
+ * chart axis has used since long before this one — and the top is that step times the
+ * fixed number of lines, so `max >= peak` always holds and nothing is ever clipped.
+ *
+ * `minStep` is how flow gets whole numbers: below about 4 g/s the ladder would pick
+ * tenths, and a tenth of a gram per second is not a quantity anybody is deciding
+ * anything on.
+ */
+const axisTo = (peak, steps = AXIS_STEPS, minStep = 0) => {
+  const raw = Number.isFinite(peak) && peak > 0 ? peak / steps : 0;
+  const mag = raw > 0 ? Math.pow(10, Math.floor(Math.log10(raw))) : 1;
+  const nice = [1, 2, 2.5, 5, 10].find((m) => m * mag >= raw - 1e-9) * mag;
+  const step = Math.max(minStep, nice);
+  return { step, max: step * steps };
+};
+
+//: Seconds between the vertical gridlines.  Ten, until a pour is long enough that ten
+//: would draw a fence — a filter brew runs for minutes.
+const timeStep = (xMax) => (xMax > 90 ? 30 : 10);
+
 /** An SVG path through points already mapped to chart coordinates. */
 const linePath = (pts) =>
   pts.length ? pts.map((p, i) => `${i ? "L" : "M"}${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join("") : "";
@@ -957,12 +989,13 @@ class DifluidPourCard extends HTMLElement {
 
     const secs = (s) => (s.t - series.t0) / 1000;
     const xMax = Math.max(1, ...series.weight.map(secs));
-    const yMax = Math.max(1, ...series.weight.map((s) => s.v)) * 1.1;
-    const fMax = Math.max(0.5, ...series.flow.map((s) => s.v)) * 1.15;
+    // Whole grams on the left of the ladder, whole grams per second on the right.
+    const wAxis = axisTo(Math.max(1, ...series.weight.map((s) => s.v)));
+    const fAxis = axisTo(Math.max(0.5, ...series.flow.map((s) => s.v)), AXIS_STEPS, 1);
 
     const X = (t) => padL + (Math.min(Math.max(secs({ t }), 0), xMax) / xMax) * innerW;
-    const Yw = (v) => padT + innerH - (Math.min(v, yMax) / yMax) * innerH;
-    const Yf = (v) => padT + innerH - (Math.min(v, fMax) / fMax) * innerH;
+    const Yw = (v) => padT + innerH - (Math.min(v, wAxis.max) / wAxis.max) * innerH;
+    const Yf = (v) => padT + innerH - (Math.min(v, fAxis.max) / fAxis.max) * innerH;
 
     const wPts = series.weight.map((s) => ({ x: X(s.t), y: Yw(s.v) }));
     const fPts = series.flow
@@ -973,18 +1006,27 @@ class DifluidPourCard extends HTMLElement {
       ? `${linePath(wPts)}L${wPts[wPts.length - 1].x.toFixed(1)} ${(padT + innerH).toFixed(1)}L${wPts[0].x.toFixed(1)} ${(padT + innerH).toFixed(1)}Z`
       : "";
 
-    const gridY = [0, 0.25, 0.5, 0.75, 1].map((f) => {
-      const y = padT + innerH - f * innerH;
-      return `<line class="grid" x1="${padL}" y1="${y}" x2="${padL + innerW}" y2="${y}"/>
-              <text class="tick w" x="${padL - 5}" y="${y + 3}">${(yMax * f).toFixed(0)}</text>
-              <text class="tick f" x="${padL + innerW + 5}" y="${y + 3}">${(fMax * f).toFixed(1)}</text>`;
-    }).join("");
+    // Flow on the left, weight on the right.  One set of lines serves both, which is
+    // why the two axes are cut into the same number of steps.
+    const gridY = [];
+    for (let i = 0; i <= AXIS_STEPS; i++) {
+      const y = padT + innerH - (i / AXIS_STEPS) * innerH;
+      gridY.push(
+        `<line class="grid" x1="${padL}" y1="${y}" x2="${padL + innerW}" y2="${y}"/>
+         <text class="tick f" x="${padL - 5}" y="${y + 3}">${trim1(i * fAxis.step)}</text>
+         <text class="tick w" x="${padL + innerW + 5}" y="${y + 3}">${trim1(i * wAxis.step)}</text>`
+      );
+    }
 
+    // Vertical lines to match, so a point on the curve can be read off in both
+    // directions instead of only downwards.
     const secTicks = [];
-    const step = xMax > 45 ? 15 : xMax > 20 ? 10 : 5;
+    const step = timeStep(xMax);
     for (let s = 0; s <= xMax; s += step) {
+      const x = X(series.t0 + s * 1000);
       secTicks.push(
-        `<text class="tick x" x="${X(series.t0 + s * 1000)}" y="${H - 6}">${s}s</text>`
+        `<line class="grid" x1="${x}" y1="${padT}" x2="${x}" y2="${padT + innerH}"/>
+         <text class="tick x" x="${x}" y="${H - 6}">${s}s</text>`
       );
     }
 
@@ -996,10 +1038,30 @@ class DifluidPourCard extends HTMLElement {
       .detected_at;
 
     const last = series.weight[series.weight.length - 1];
+    const brew = series.live
+      ? null
+      : pourBrew(this._hass.states[ids.ratio], detectedAt, series.riseSeconds);
     const caption = series.live
       ? `${last.v.toFixed(1)} g · ${secs(last).toFixed(0)} s`
-      : brewLabel(pourBrew(this._hass.states[ids.ratio], detectedAt, series.riseSeconds))
-        || `${last.v.toFixed(1)} g`;
+      : brewLabel(brew) || `${last.v.toFixed(1)} g`;
+
+    // Where the pour actually ended.
+    //
+    // The curve runs on past it — deliberately, so the reading can be seen settling —
+    // and that is what makes the chart read wrong at a glance: the axis goes to 20 s
+    // while the brew took 17, and nothing says which of the two the caption means.
+    // So the end names itself, on both axes at once.
+    const endAt = series.live ? null : series.riseSeconds;
+    const endWeight = brew && Number.isFinite(brew.yieldG) ? brew.yieldG : last.v;
+    const endMark = Number.isFinite(endAt) && endAt > 0 && endAt <= xMax
+      ? (() => {
+          const x = X(series.t0 + endAt * 1000), y = Yw(endWeight);
+          return `<line class="mark" x1="${x}" y1="${padT}" x2="${x}" y2="${padT + innerH}"/>
+                  <line class="mark" x1="${padL}" y1="${y}" x2="${x}" y2="${y}"/>
+                  <circle class="markdot" cx="${x}" cy="${y}" r="3.5"/>
+                  <text class="tick end" x="${x - 4}" y="${y - 6}">${trim1(endWeight)} g · ${Math.round(endAt)} s</text>`;
+        })()
+      : "";
     const header = series.live
       ? "Pouring"
       : cardTitle("Last pour", Date.parse(detectedAt) / 1000, this._hass);
@@ -1014,10 +1076,11 @@ class DifluidPourCard extends HTMLElement {
             <path class="weight" d="${linePath(wPts)}"/>
             <path class="flow" d="${linePath(fPts)}"/>
             ${secTicks.join("")}
+            ${endMark}
           </svg>
           <div class="legend">
-            <span class="k weight"></span>Weight
             <span class="k flow"></span>Flow
+            <span class="k weight"></span>Weight
             <span class="cap">${caption}</span>
           </div>
         </div>
@@ -1038,8 +1101,12 @@ DifluidPourCard.STYLE = `
     .flow { fill: none; stroke: var(--warning-color, #ffa726); stroke-width: 1.5;
             stroke-dasharray: 3 3; stroke-linejoin: round; }
     .tick { font-size: 9px; fill: var(--secondary-text-color); }
-    .tick.w { text-anchor: end; }
-    .tick.f { text-anchor: start; }
+    .tick.f { text-anchor: end; }
+    .tick.w { text-anchor: start; }
+    .tick.end { text-anchor: end; fill: var(--primary-text-color); font-weight: 500; }
+    .mark { stroke: var(--state-icon-color, #44739e); stroke-width: 1;
+            stroke-dasharray: 2 3; opacity: .8; }
+    .markdot { fill: var(--state-icon-color, #44739e); }
     .tick.x { text-anchor: middle; }
     .legend { display: flex; align-items: center; gap: 6px; font-size: 12px;
               color: var(--secondary-text-color); padding-top: 2px; }

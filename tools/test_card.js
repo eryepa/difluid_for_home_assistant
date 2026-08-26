@@ -42,7 +42,7 @@ function loadCardHelpers() {
       " STATS_ORDER, DIAG_ORDER, rank, inList, isStat, statRank, DOMAIN," +
       " pourWindow, cleanSamples, linePath, controlFrame, ratioSegment," +
       " CONTROL_FRAMES, ESPRESSO_TDS, brewLabel, legendRow, whenLabel, cardTitle," +
-      " isCurrent, staleNote, pourBrew, timeFormat };",
+      " isCurrent, staleNote, pourBrew, timeFormat, axisTo, timeStep, AXIS_STEPS };",
     sandbox,
     { filename: CARD }
   );
@@ -657,6 +657,110 @@ check(
     h.cardTitle("Extraction", null, HASS_24H, SAME_DAY),
   ],
   ["Extraction · 08:44", "Last pour · 08:44", "Extraction"]
+);
+
+// ── axes a person can read ───────────────────────────────────────────────────────
+// The axes were `peak * 1.1` cut into quarters, so they were labelled wherever the
+// coffee happened to land: a 37.2 g shot got 0, 10, 20, 31, 41 and its flow 0.0, 1.0,
+// 2.0, 2.9, 3.9.  Correct arithmetic, and not numbers anybody reads an axis in.
+
+check(
+  "a 37.2 g shot is labelled in tens, not in 31 and 41",
+  (() => {
+    const a = h.axisTo(37.2);
+    const labels = [];
+    for (let i = 0; i <= h.AXIS_STEPS; i++) labels.push(i * a.step);
+    return labels;
+  })(),
+  [0, 10, 20, 30, 40]
+);
+
+check(
+  "flow gets whole grams per second",
+  (() => {
+    const a = h.axisTo(3.9, h.AXIS_STEPS, 1);
+    const labels = [];
+    for (let i = 0; i <= h.AXIS_STEPS; i++) labels.push(i * a.step);
+    return labels;
+  })(),
+  [0, 1, 2, 3, 4]
+);
+
+// A slow pour would otherwise be labelled in tenths, which is the thing being fixed.
+check(
+  "a slow pour is still labelled in whole numbers",
+  h.axisTo(1.4, h.AXIS_STEPS, 1).step,
+  1
+);
+
+// The top must never fall below the peak, or the curve is silently clipped at the
+// frame — the one failure of a rounded axis that loses data rather than tidiness.
+check(
+  "no shot is ever clipped by its own axis",
+  (() => {
+    const peaks = [0.4, 1, 3.9, 17, 18.6, 36.7, 37.2, 41, 60, 120, 480];
+    return peaks.every((peak) => {
+      const a = h.axisTo(peak);
+      return a.max >= peak && Math.abs(a.max / a.step - h.AXIS_STEPS) < 1e-9;
+    });
+  })(),
+  true
+);
+
+check(
+  "the time grid is ten seconds until a pour is long enough to fence in",
+  [h.timeStep(21), h.timeStep(45), h.timeStep(150)],
+  [10, 10, 30]
+);
+
+// ── what the pour chart draws ────────────────────────────────────────────────────
+// Source checks, because the render needs a DOM.  Each of these was asked for by
+// someone looking at the chart and not being able to read it.
+const pourBody = (() => {
+  const src = fs.readFileSync(CARD, "utf8");
+  return src.slice(
+    src.indexOf("class DifluidPourCard"), src.indexOf("\nDifluidPourCard.STYLE =")
+  );
+})();
+
+check(
+  "flow is labelled down the left and weight down the right",
+  [
+    /<text class="tick f" x="\$\{padL - 5\}"/.test(pourBody),
+    /<text class="tick w" x="\$\{padL \+ innerW \+ 5\}"/.test(pourBody),
+  ],
+  [true, true]
+);
+
+// axisTo takes the whole-numbers rule as an argument, so testing the function alone
+// proves only that the argument works — dropping it at the call site left every
+// assertion above passing and the flow axis back in tenths.
+check(
+  "the flow axis is the one that asks for whole numbers",
+  /const fAxis = axisTo\([^;]*AXIS_STEPS, 1\);/.test(pourBody),
+  true
+);
+
+check(
+  "the seconds have gridlines and not just labels",
+  /secTicks\.push\(\s*`<line class="grid" x1="\$\{x\}" y1="\$\{padT\}"/.test(pourBody),
+  true
+);
+
+// The curve runs past the end of the pour on purpose, to show the reading settle — and
+// that is exactly what made the chart read wrong: the axis reaches 20 s while the
+// caption says 17.  The end has to name itself.
+check(
+  "the end of the pour is marked on both axes",
+  [
+    /const endAt = series\.live \? null : series\.riseSeconds;/.test(pourBody),
+    /class="mark"/.test(pourBody),
+    /class="markdot"/.test(pourBody),
+    /\$\{trim1\(endWeight\)\} g · \$\{Math\.round\(endAt\)\} s/.test(pourBody),
+    // Never while pouring: there is no end yet, and the curve is moving.
+    /series\.live\s*\n?\s*\? null/.test(pourBody),
+  ],
+  [true, true, true, true, true]
 );
 
 // ── one cup, one line, on both cards ─────────────────────────────────────────────
