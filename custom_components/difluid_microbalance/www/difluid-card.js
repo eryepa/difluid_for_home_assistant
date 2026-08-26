@@ -1053,13 +1053,21 @@ class DifluidPourCard extends HTMLElement {
     // So the end names itself, on both axes at once.
     const endAt = series.live ? null : series.riseSeconds;
     const endWeight = brew && Number.isFinite(brew.yieldG) ? brew.yieldG : last.v;
+    // Two independent readings, and deliberately no dot where they cross.
+    //
+    // The first version drew one, and it was a point that never happened: the vertical
+    // is where the pour stopped and the horizontal is what ended up in the cup, and
+    // those are 1.5 seconds apart.  On 2026-08-26 the scale read 36.5 g when the flow
+    // died and 37.2 g once the crema had gone down, so a dot at the crossing claimed
+    // "37.2 g at 17 s" about an instant at which there was 36.5 g.  Each line on its
+    // own is true; their intersection is not.
     const endMark = Number.isFinite(endAt) && endAt > 0 && endAt <= xMax
       ? (() => {
           const x = X(series.t0 + endAt * 1000), y = Yw(endWeight);
           return `<line class="mark" x1="${x}" y1="${padT}" x2="${x}" y2="${padT + innerH}"/>
-                  <line class="mark" x1="${padL}" y1="${y}" x2="${x}" y2="${y}"/>
-                  <circle class="markdot" cx="${x}" cy="${y}" r="3.5"/>
-                  <text class="tick end" x="${x - 4}" y="${y - 6}">${trim1(endWeight)} g · ${Math.round(endAt)} s</text>`;
+                  <line class="mark" x1="${padL}" y1="${y}" x2="${padL + innerW}" y2="${y}"/>
+                  <text class="tick end" x="${x - 5}" y="${padT + innerH - 5}">${Math.round(endAt)} s</text>
+                  <text class="tick end" x="${padL + innerW - 3}" y="${y - 5}">${trim1(endWeight)} g</text>`;
         })()
       : "";
     const header = series.live
@@ -1106,7 +1114,6 @@ DifluidPourCard.STYLE = `
     .tick.end { text-anchor: end; fill: var(--primary-text-color); font-weight: 500; }
     .mark { stroke: var(--state-icon-color, #44739e); stroke-width: 1;
             stroke-dasharray: 2 3; opacity: .8; }
-    .markdot { fill: var(--state-icon-color, #44739e); }
     .tick.x { text-anchor: middle; }
     .legend { display: flex; align-items: center; gap: 6px; font-size: 12px;
               color: var(--secondary-text-color); padding-top: 2px; }

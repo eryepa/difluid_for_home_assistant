@@ -754,13 +754,22 @@ check(
   "the end of the pour is marked on both axes",
   [
     /const endAt = series\.live \? null : series\.riseSeconds;/.test(pourBody),
-    /class="mark"/.test(pourBody),
-    /class="markdot"/.test(pourBody),
-    /\$\{trim1\(endWeight\)\} g · \$\{Math\.round\(endAt\)\} s/.test(pourBody),
+    (pourBody.match(/class="mark"/g) || []).length,
+    /\$\{Math\.round\(endAt\)\} s<\/text>/.test(pourBody),
+    /\$\{trim1\(endWeight\)\} g<\/text>/.test(pourBody),
     // Never while pouring: there is no end yet, and the curve is moving.
     /series\.live\s*\n?\s*\? null/.test(pourBody),
   ],
-  [true, true, true, true, true]
+  [true, 2, true, true, true]
+);
+
+// The two lines cross at an instant that never happened — the pour stopped at 36.5 g
+// and the cup settled at 37.2 a second and a half later — so nothing may be drawn
+// there.  A dot at the crossing reads as a measurement and is not one.
+check(
+  "nothing is drawn where the two marker lines cross",
+  /markdot|<circle/.test(pourBody),
+  false
 );
 
 // ── one cup, one line, on both cards ─────────────────────────────────────────────
