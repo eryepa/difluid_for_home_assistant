@@ -1,0 +1,63 @@
+# Coffee dashboard — the author's own, exported as an example.
+#
+# Paste into a dashboard's raw configuration editor:
+#   Edit dashboard -> three-dot menu -> Raw configuration editor -> replace all.
+#
+# The two device ids below are per-install random hex, so they have been
+# replaced with placeholders: copied verbatim from another Home Assistant they
+# would match nothing and every card would come up blank. Find yours under
+# Settings -> Devices & services -> Difluid, or just drop the `device:` line and
+# pick the device in the card editor's device selector.
+#
+# Cards used here are all registered by the integration itself — no resource to
+# add by hand:
+#   custom:difluid-pour-card     weight/flow chart of the last pour
+#   custom:difluid-control-card  tare, timer, mode, auto-disconnect
+#   custom:difluid-card          sensor rows; `sections:` narrows what it shows
+
+views:
+  - type: sections
+    max_columns: 1
+    cards: []
+    sections:
+      - type: grid
+        cards:
+          - type: heading
+            heading: Pour curve
+            heading_style: title
+            icon: mdi:chart-bell-curve-cumulative
+          - type: custom:difluid-pour-card
+            device: YOUR_SCALE_DEVICE_ID
+          - type: custom:difluid-control-card
+            device: YOUR_SCALE_DEVICE_ID
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Scale
+            heading_style: title
+            icon: mdi:scale-balance
+          - type: custom:difluid-card
+            device: YOUR_SCALE_DEVICE_ID
+            sections: [live]
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Refractometer
+            icon: mdi:flask-outline
+          - type: custom:difluid-card
+            device: YOUR_R2_DEVICE_ID
+
+      # Not on the author's dashboard, but this is where the Brew Detector's own
+      # cards go if you want them. The detector is a separate device hung off the
+      # scale, so it has its own device id.
+      #
+      # - type: grid
+      #   cards:
+      #     - type: custom:difluid-card
+      #       device: YOUR_BREW_DETECTOR_DEVICE_ID
+      #       sections: [statistics]
+      #     - type: custom:difluid-card
+      #       device: YOUR_BREW_DETECTOR_DEVICE_ID
+      #       sections: [diagnostic]

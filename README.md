@@ -169,6 +169,18 @@ sections: [statistics]
 
 > Карточка грузится автоматически (интеграция регистрирует её как ресурс) — добавлять её в **Настройки → Панели** вручную не нужно. Если сразу не появилась в списке — обновите страницу с очисткой кэша (Ctrl+F5).
 
+### Готовый дашборд как пример
+
+В [`examples/dashboard-coffee.yaml`](examples/dashboard-coffee.yaml) лежит рабочий
+дашборд автора: график пролива, кнопки управления, живые показания весов и
+рефрактометр. Его можно взять целиком — **Изменить дашборд → ⋮ → Редактор кода** и
+вставить вместо содержимого — или растащить по кускам.
+
+Идентификаторы устройств в примере заменены на заглушки: они у каждой установки свои,
+и чужой `device_id` не совпадёт ни с чем, так что карточки останутся пустыми. Свои
+возьмите в **Настройки → Устройства и службы → Difluid** либо просто удалите строку
+`device:` и выберите устройство в редакторе карточки.
+
 ---
 
 ## Режимы (Microbalance)
@@ -403,6 +415,18 @@ sections: [statistics]
 ```
 
 > The card is loaded automatically (the integration registers it as a resource) — you do **not** need to add it under **Settings → Dashboards → Resources**. If it doesn't appear right away, hard-refresh the page (Ctrl+F5).
+
+### A ready-made dashboard to start from
+
+[`examples/dashboard-coffee.yaml`](examples/dashboard-coffee.yaml) is the author's own
+working dashboard: pour chart, controls, live scale readings and the refractometer.
+Take it whole — **Edit dashboard → ⋮ → Raw configuration editor**, replace the contents
+— or lift the pieces you want.
+
+The device ids in it are placeholders. They are random per install, so someone else's
+`device_id` matches nothing and every card comes up blank. Find yours under **Settings →
+Devices & services → Difluid**, or just drop the `device:` line and pick the device in
+the card editor.
 
 ---
 
