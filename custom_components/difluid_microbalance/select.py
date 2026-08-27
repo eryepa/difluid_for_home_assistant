@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -9,6 +11,8 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CONF_DEVICE_TYPE, CONF_IS_TI, DEVICE_TYPE_R2, DOMAIN
 from .coordinator import DifluidMicrobalanceCoordinator
+
+_LOGGER = logging.getLogger(__name__)
 
 # (auto_detect_timing, auto_stop_timing)
 _MODE_MAP: dict[str, tuple[bool, bool]] = {
@@ -65,16 +69,32 @@ class DifluidModeSelect(CoordinatorEntity[DifluidMicrobalanceCoordinator], Selec
         return client is not None and client.is_connected
 
     @property
-    def current_option(self) -> str:
+    def current_option(self) -> str | None:
+        """The named mode the scale is in, or None when it is in none of them.
+
+        None rather than the "Manual" this used to fall back on.  _MODE_MAP covers
+        three of the four combinations, and the fourth — auto-detect off with auto-stop
+        still armed — is reachable: async_select_option sends two commands in
+        succession, and a link that drops between them leaves the scale exactly there.
+        Reporting that as Manual made the UI agree with what was asked for while the
+        scale went on auto-stopping the timer, and re-selecting Manual was then a no-op
+        from the frontend's side, so the one obvious way to fix it did nothing.
+        Unknown is the honest answer and it leaves the option selectable.
+        """
         data = self.coordinator.data
         if data is None:
-            return "Manual"
+            return None
         detect = data.auto_detect_timing
         stop = data.auto_stop_timing
         for name, (d, s) in _MODE_MAP.items():
             if d == detect and s == stop:
                 return name
-        return "Manual"
+        _LOGGER.debug(
+            "Scale is in an unnamed mode (auto_detect=%s, auto_stop=%s); reporting "
+            "unknown rather than guessing",
+            detect, stop,
+        )
+        return None
 
     async def async_select_option(self, option: str) -> None:
         detect, stop = _MODE_MAP.get(option, (False, False))

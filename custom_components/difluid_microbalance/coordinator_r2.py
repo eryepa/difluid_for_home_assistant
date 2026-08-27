@@ -55,6 +55,17 @@ _CMD_GET_FIRMWARE = _build_cmd(0x00, 0x02)
 _R2_TEST_COMMANDS = frozenset({0x00, 0x01, 0x02, 0x03})
 
 
+def _to_celsius(value: float, fahrenheit: bool) -> float:
+    """The R2's temperature in Celsius, whichever unit it reported it in.
+
+    Rounded to a tenth because that is the resolution the device sends (the raw field
+    is degrees x 10); without it a converted Fahrenheit reading arrives as
+    26.166666666666668 and the sensor's own display precision is the only thing
+    hiding it.
+    """
+    return round((value - 32.0) * 5.0 / 9.0, 1) if fahrenheit else value
+
+
 @dataclass
 class R2Data:
     concentration: float = 0.0
@@ -437,12 +448,32 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             elif pkg_no == 0x01 and data_len >= 6:
                 prism_raw = int.from_bytes(payload[1:3], "big", signed=True)
                 sample_raw = int.from_bytes(payload[3:5], "big", signed=True)
-                self.data.temperature_unit = "°F" if payload[5] == 1 else "°C"
-                self.data.prism_temperature = prism_raw / 10.0
-                self.data.sample_temperature = sample_raw / 10.0
+                # protocolR2.md: "Data5: Temperature Unit (0:℃,1:℉)".  The R2 reports in
+                # whatever its own display is set to, and that is a per-device setting
+                # nothing here controls.  Both temperature sensors declare Celsius, so
+                # the value has to *be* Celsius before it is stored — publishing 79.1
+                # from a °F device as 79.1 °C is a 53-degree error that goes straight
+                # into long-term statistics with nothing logged.
+                #
+                # Converted here rather than published in the device's own unit, to
+                # match what the scale already does with ounces: coordinator.py stores
+                # grams and keeps `weight_unit` for diagnostics only.  One canonical
+                # unit in the data means every consumer can do arithmetic without
+                # asking which one it got.
+                fahrenheit = payload[5] == 1
+                self.data.temperature_unit = "°F" if fahrenheit else "°C"
+                self.data.prism_temperature = _to_celsius(prism_raw / 10.0, fahrenheit)
+                self.data.sample_temperature = _to_celsius(sample_raw / 10.0, fahrenheit)
                 updated = True
 
-            elif pkg_no == 0x02 and data_len >= 7:
+            # cmd 0x02 is Calibrate, and protocolR2.md is explicit that it answers in
+            # the single-test shape: "calibration success will respond with
+            # concentration result as 0".  Taking that as a reading overwrites the last
+            # real TDS with 0.00 — in the entity and in recorder history — for a packet
+            # that says the prism was just zeroed on distilled water.  The status
+            # package above is still read, so a calibration is still visible; only its
+            # result is not mistaken for coffee.
+            elif pkg_no == 0x02 and data_len >= 7 and cmd != 0x02:
                 conc_raw = int.from_bytes(payload[1:3], "big", signed=True)
                 ri_raw = int.from_bytes(payload[3:7], "big", signed=True)
                 self.data.concentration = conc_raw / 100.0

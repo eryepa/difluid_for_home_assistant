@@ -85,6 +85,13 @@ const SECTION_LABELS = {
 // Seconds of the hold to keep after the pour stops.  Enough to show the reading
 // settle, short enough to stay clear of what ends it — see pourWindow.
 const POUR_TAIL_SECONDS = 4;
+//: How far short of detected_at the window must always stop, however short the
+//: plateau was.  detected_at is the moment the weighing closed, i.e. the moment the
+//: cup was already coming off, and the samples at and just before it are the lift —
+//: this install's last brew reads -200.4, -142.7, 160.0, 685.4, 831.6 g there.  A
+//: fifth of a second is one notification at the scale's 5 Hz, which is the smallest
+//: gap that can exclude a sample at all.
+const POUR_TAIL_MARGIN_MS = 200;
 //: Seconds of flat line before the rise, so a pour does not start at the y-axis.
 const POUR_LEAD_SECONDS = 2;
 
@@ -116,7 +123,19 @@ const pourWindow = (attrs) => {
   const riseStart = pourEnd - riseSeconds * 1000;
   return {
     start: riseStart - POUR_LEAD_SECONDS * 1000,
-    end: pourEnd + Math.min(plateau, POUR_TAIL_SECONDS) * 1000,
+    // Bounded *below* detected_at, not merely by a tail no larger than the plateau.
+    //
+    // This read `pourEnd + Math.min(plateau, POUR_TAIL_SECONDS) * 1000`, and since
+    // pourEnd is `detected - plateau * 1000`, any plateau of POUR_TAIL_SECONDS or less
+    // cancels out to exactly `detected` — the instant this function exists to stay
+    // away from.  That is not a rare case: brew_detect's stable_seconds is 3.0 s and a
+    // cup lifted as soon as the pour stops never holds much longer, so pour plateaus
+    // cluster at 3–4 s and the guard was a no-op precisely when it was needed.  The
+    // fixture happens to use 9.8 s, which is why every assertion stayed green.
+    end: Math.min(
+      pourEnd + POUR_TAIL_SECONDS * 1000,
+      detected - POUR_TAIL_MARGIN_MS,
+    ),
     riseStart,
     pourEnd,
     riseSeconds,
@@ -1106,7 +1125,9 @@ class DifluidPourCard extends HTMLElement {
 
     const secs = (s) => (s.t - series.t0) / 1000;
     const xMax = Math.max(1, ...series.weight.map(secs));
-    // Whole grams on the left of the ladder, whole grams per second on the right.
+    // Flow down the left, weight down the right — the two swapped sides in 1.9.0 and
+    // this line did not follow.  Only flow asks for whole numbers (minStep 1): tenths
+    // of a gram per second carry nothing a person reads off an axis.
     const wAxis = axisTo(Math.max(1, ...series.weight.map((s) => s.v)));
     const fAxis = axisTo(Math.max(0.5, ...series.flow.map((s) => s.v)), AXIS_STEPS, 1);
 

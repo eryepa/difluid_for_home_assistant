@@ -93,6 +93,13 @@
 | **Last Yield** | Вес напитка последнего пролива (г) |
 | **Brew Ratio** | Отношение пролив/доза последней пары. Атрибуты: `dose`, `yield`, `paired_at` |
 | **Integration Version** | Диагностический — какая сборка интеграции реально загружена |
+| Число **Measured Dose** | Доза последнего замера, введённая руками. Нужна, когда детектор принял за зёрна что-то другое — например портафильтр, поставленный обратно на весы |
+| Число **Measured Yield** | Выход последнего замера, введённый руками. Нужен, когда BLE отвалился и весы не увидели пролив |
+
+Оба числа правят **сохранённый замер** и пересчитывают экстракцию, но не трогают
+счётчик чашек и одометр смолотого: те считают то, что весы действительно взвесили.
+Если после ручного ввода весы всё-таки сообщат пролив, он заменит введённое значение —
+это была подстановка на время, а теперь есть измерение.
 
 Эти сенсоры **не уходят в `unavailable`** вместе с весами: результат последней чашки остаётся виден и после того, как весы отключились по авто-таймауту.
 
@@ -108,7 +115,7 @@
 |---|---|
 | Кнопка **Tare** | Обнуление веса (одиночное нажатие кнопки питания) |
 | Кнопка **Start/Stop** | Запуск / возобновление таймера (одиночное нажатие DLink) |
-| Селектор **Mode** | `Manual` / `Espresso` / `Pour Over` — управляет Auto Detect Timing и Auto Stop Timing |
+| Селектор **Mode** | `Manual` / `Espresso` / `Pour Over` — управляет Auto Detect Timing и Auto Stop Timing. Показывает «неизвестно», если весы оказались в комбинации, не совпадающей ни с одним режимом |
 | Число **Auto-disconnect Bluetooth** | Разорвать BLE через N минут без изменения веса (0 = отключено). После разрыва весы выключаются по собственному аппаратному таймеру |
 
 ### R2 Extract — сенсоры
@@ -146,6 +153,18 @@
 type: custom:difluid-card
 device: <device_id>   # выбирается в редакторе карточки
 title: Мои весы       # необязательно
+sections: [live]      # необязательно: live | statistics | diagnostic
+```
+
+`sections` выбирает, какие группы показывает одна карточка. Без него показываются все
+три — как и раньше, так что уже настроенные карточки не меняются. С ним статистику
+детектора и разбор последней чашки можно вынести на отдельные карточки, где заголовок
+называет детектор, а не весы:
+
+```yaml
+type: custom:difluid-card
+device: <device_id детектора>
+sections: [statistics]
 ```
 
 > Карточка грузится автоматически (интеграция регистрирует её как ресурс) — добавлять её в **Настройки → Панели** вручную не нужно. Если сразу не появилась в списке — обновите страницу с очисткой кэша (Ctrl+F5).
@@ -309,6 +328,13 @@ The integration works out from the weight stream when you weighed beans and when
 | **Last Yield** | Beverage weight of the last pour (g) |
 | **Brew Ratio** | Yield-to-dose ratio of the last pair. Attributes: `dose`, `yield`, `paired_at` |
 | **Integration Version** | Diagnostic — which build is actually loaded |
+| **Measured Dose** number | The last measured brew's dose, typed in by hand. For when the detector took something else for the beans — a portafilter set back on the scale, say |
+| **Measured Yield** number | The last measured brew's yield, typed in by hand. For when BLE dropped and the scale never saw the pour |
+
+Both edit the **stored measurement** and recompute the extraction, and neither touches
+the brew count or the ground-coffee odometer: those count what the scale actually
+weighed. If the scale later reports the pour after all, it supersedes what was typed —
+that was a stand-in, and now there is a measurement.
 
 These sensors **do not go `unavailable`** with the scale: the last shot stays readable after the scale drops its BLE link on the idle timer.
 
@@ -362,6 +388,18 @@ The card works for both the scale and the R2. The YAML equivalent:
 type: custom:difluid-card
 device: <device_id>   # chosen in the card editor
 title: My Scale       # optional
+sections: [live]      # optional: live | statistics | diagnostic
+```
+
+`sections` picks which groups one card shows. Omit it and you get all three, exactly as
+before, so cards already on a dashboard are unchanged. With it, the detector's
+statistics and the last shot's working parts can each sit on their own card, headed by
+the detector rather than by the scale:
+
+```yaml
+type: custom:difluid-card
+device: <detector device_id>
+sections: [statistics]
 ```
 
 > The card is loaded automatically (the integration registers it as a resource) — you do **not** need to add it under **Settings → Dashboards → Resources**. If it doesn't appear right away, hard-refresh the page (Ctrl+F5).

@@ -596,24 +596,62 @@ class BrewSession:
         incomplete with nothing in the log to say why.  A second is orders of
         magnitude more than that drift and orders of magnitude less than the gap
         between two brews: a weighing alone takes longer than that.
+
+        Matched on the time *alone*, and no longer on the yield still being missing.
+        That extra condition looked like a safety rail and was the opposite: typing the
+        yield into Measured Yield — the documented remedy for exactly this situation —
+        made the point permanently unmatchable, so its `at` was never moved onto the
+        pour.  `last_brew_at` then pointed at the pour while the point still carried
+        the dose's time, so the card showed "a newer brew has been pulled since" for
+        the cup in your hand, and a second reading of that same cup anchored on the
+        pour's time, found no point there and started the twin this method exists to
+        prevent.  The time match already implies the point has not been completed: a
+        completed one carries its pour's time, not its dose's.
+
+        The point adopts the pair whole — dose, yield and pour time together — rather
+        than keeping whatever it was anchored on.  Two reasons, and the first is not
+        negotiable: `ext` is stored rather than derived, so it must be computed from
+        the numbers that end up in the same record.  It was computed from `pair.dose`
+        while `dose` kept its old value, which left a stored brew whose own fields did
+        not satisfy TDS x yield / dose — the relation the chart's ratio diagonals are
+        drawn from.  The second is that the pair's dose is the better answer anyway:
+        the point was anchored on `last_dose`, whatever was weighed last in the dose
+        range, while the pair's is the pairer's considered choice between candidates.
+        A figure typed in by hand is superseded here, deliberately — it was a stand-in
+        for a pour the scale had not seen, and the scale has now seen it.
         """
         for i, point in enumerate(self.measurements):
-            if point.yield_g is None and abs(point.at - pair.dose_at) < _SAME_DOSE_SECONDS:
-                self.measurements[i] = replace(
-                    point,
-                    at=pair.yield_at,
-                    yield_g=pair.yield_g,
-                    ext=BrewMeasurement.extraction(pair.dose, pair.yield_g, point.tds),
-                    seconds=pair.pour_seconds,
-                )
-                _LOGGER.info(
-                    "The pour for an already-measured brew arrived: %.1f g out, "
-                    "extraction %s",
-                    pair.yield_g,
-                    "unknown" if self.measurements[i].ext is None
-                    else f"{self.measurements[i].ext:.2f}%",
-                )
-                return
+            if abs(point.at - pair.dose_at) >= _SAME_DOSE_SECONDS:
+                continue
+            self.measurements[i] = replace(
+                point,
+                at=pair.yield_at,
+                dose=pair.dose,
+                yield_g=pair.yield_g,
+                ext=BrewMeasurement.extraction(pair.dose, pair.yield_g, point.tds),
+                seconds=pair.pour_seconds,
+            )
+            _LOGGER.info(
+                "The pour for an already-measured brew arrived: %.1f g in, %.1f g out, "
+                "extraction %s",
+                pair.dose,
+                pair.yield_g,
+                "unknown" if self.measurements[i].ext is None
+                else f"{self.measurements[i].ext:.2f}%",
+            )
+            # The point just moved from its dose's time to its pour's, minutes later,
+            # so it may no longer be in the right place.  Everything downstream reads
+            # this list positionally — last_measurement is [-1], _amend_measurement
+            # writes to [-1], and the card takes the last plottable point as the newest
+            # dot — so an unsorted list does not degrade gracefully, it reports a
+            # different cup.  record_measurement sorts on every append and
+            # _restore_measurements sorts on load for the same reason; this was the
+            # one path that moved an `at` and did not.
+            #
+            # Sorting rather than re-inserting: the list is at most MAX_MEASUREMENTS
+            # long and already nearly ordered, and this runs once per brew.
+            self.measurements.sort(key=lambda m: m.at)
+            return
 
     @property
     def last_measurement(self) -> Optional[BrewMeasurement]:

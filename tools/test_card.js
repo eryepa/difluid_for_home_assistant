@@ -509,6 +509,29 @@ check(
   [16.3, 2]
 );
 
+// The fixture's 9.8 s plateau is the comfortable case, and it was the only one tested.
+// The window ended at `pourEnd + min(plateau, 4)`, which for any plateau of 4 s or
+// less is exactly detected_at — so the guard vanished precisely where it was needed.
+// brew_detect's stable_seconds is 3.0 and a cup lifted as the pour stops rarely holds
+// longer, so 3–4 s is the ordinary plateau, not the exotic one.
+check(
+  "a short plateau still stops the window short of the lift",
+  [3.0, 3.2, 4.0, 9.8].map((plateau_seconds) => {
+    const w = h.pourWindow({ ...YIELD_ATTRS, plateau_seconds });
+    return w.end < Date.parse(YIELD_ATTRS.detected_at);
+  }),
+  [true, true, true, true]
+);
+
+// And it must still keep as much of the settle as it can: clamping is a ceiling, not
+// a replacement for the tail.
+check(
+  "the tail is still drawn for a plateau long enough to afford one",
+  (h.pourWindow({ ...YIELD_ATTRS, plateau_seconds: 9.8 }).end
+   - h.pourWindow({ ...YIELD_ATTRS, plateau_seconds: 9.8 }).pourEnd) / 1000,
+  4
+);
+
 // What history_during_period actually returns for this window: the state carried
 // forward to the window's start, then every change inside it.  The 16:26:35 reading
 // is nearly four seconds before the window and is not one of them — it arrives as

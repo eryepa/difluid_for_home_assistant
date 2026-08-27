@@ -385,6 +385,80 @@ async def test_a_detector_set_up_before_its_scale_recovers_when_the_scale_arrive
     await _unload_all(hass)
 
 
+async def test_reloading_the_scale_does_not_deafen_a_loaded_detector(
+    hass: HomeAssistant,
+) -> None:
+    """Reload the scale and the detector must still be fed by it.
+
+    The failure this pins looks completely healthy from the outside, which is why it
+    survived three releases.  `add_brew_consumer` binds the session to the coordinator
+    *object* that existed when the detector set up, and it is called exactly once.
+    Reloading the scale — the obvious thing to do on this install after a BLE drop —
+    replaces that object with one whose consumer list is empty.  The scale then
+    reconnects, weight and flow stream normally, the detector still reads LOADED with
+    every entity present, and `BrewSession.feed` is never called again: no dose, no
+    pour, no brew_count, and nothing logged at any level.
+
+    Asserted against the objects that are live *now*, and with the coordinator identity
+    checked first, so the test cannot pass by the scale having quietly not reloaded.
+    """
+    from homeassistant.config_entries import ConfigEntryState
+
+    scale = MockConfigEntry(
+        domain=DOMAIN,
+        title="Microbalance 304268",
+        data={CONF_DEVICE_TYPE: DEVICE_TYPE_MICROBALANCE, "address": "AA:BB:CC:DD:EE:FF"},
+    )
+    scale.add_to_hass(hass)
+    detector = MockConfigEntry(
+        domain=DOMAIN,
+        title="Brew Detector",
+        data={
+            CONF_DEVICE_TYPE: DEVICE_TYPE_DETECTOR,
+            CONF_SCALE_ENTRY: scale.entry_id,
+            CONF_UID_PREFIX: scale.entry_id,
+            CONF_DETECTOR_IMPORTED_KEY: True,
+        },
+    )
+    detector.add_to_hass(hass)
+
+    await hass.config_entries.async_setup(detector.entry_id)
+    await hass.async_block_till_done()
+    assert scale.state is ConfigEntryState.LOADED
+    assert detector.state is ConfigEntryState.LOADED
+
+    before = hass.data[DOMAIN][scale.entry_id]
+    assert hass.data[DOMAIN][detector.entry_id] in before._brew_consumers, (
+        "the detector was never subscribed in the first place"
+    )
+
+    await hass.config_entries.async_reload(scale.entry_id)
+    await hass.async_block_till_done()
+
+    after = hass.data[DOMAIN][scale.entry_id]
+    assert after is not before, (
+        "the scale did not actually rebuild its coordinator, so this test proves "
+        "nothing about what happens when it does"
+    )
+    assert detector.state is ConfigEntryState.LOADED
+
+    session = hass.data[DOMAIN][detector.entry_id]
+    assert session in after._brew_consumers, (
+        "the detector is loaded but subscribed to a coordinator that no longer "
+        "exists — every brew from here on is silently undetected"
+    )
+
+    # And the stream really does arrive, rather than merely being wired up: the
+    # subscription is only worth anything if feed() runs.
+    seen: list[float] = []
+    session.feed = lambda weight, flow: seen.append(weight)
+    for consumer in after._brew_consumers:
+        consumer.feed(18.0, 0.0)
+    assert seen == [18.0]
+
+    await _unload_all(hass)
+
+
 async def test_the_detector_offers_a_measured_yield_control(
     hass: HomeAssistant,
 ) -> None:
@@ -622,6 +696,85 @@ def test_typing_a_dose_with_nothing_measured_does_nothing() -> None:
     session = _session()
     assert session.set_measured_dose(18.0) is None
     assert session.measurements == []
+
+
+def test_a_late_pour_leaves_the_measurements_in_order() -> None:
+    """Completing a brew moves its `at` forward by minutes; the list must follow.
+
+    Everything downstream reads this list positionally, so an unsorted list does not
+    degrade — it reports a different cup.  The sequence below is two documented
+    incidents back to back: the beans are ground and the link drops (2026-08-26), and
+    while it is down the portafilter goes back on the scale and is taken for a dose
+    (2026-08-17), so there are two yieldless points when the real pour finally lands.
+    """
+    session = _session()
+    session.last_dose = _dose(18.1, 1000.0)          # the beans
+    session.record_measurement(10.13)
+    session.last_dose = _dose(19.3, 1070.0)          # the portafilter, read again
+    session.record_measurement(10.20)
+    assert [m.at for m in session.measurements] == [1000.0, 1070.0]
+
+    # The cup is weighed at last and pairs with the beans.
+    session._complete_measurement(
+        _pair(18.0, 37.0, 1930.0, pour_seconds=17.0, dose_at=1000.4)
+    )
+
+    ats = [m.at for m in session.measurements]
+    assert ats == sorted(ats), "the completed brew was left out of order"
+    assert session.last_measurement.at == 1930.0, (
+        "last_measurement returned a different cup than the one just completed"
+    )
+
+
+def test_a_completed_brew_agrees_with_its_own_numbers() -> None:
+    """EXT is stored, not derived, so it has to come from the dose in the same record.
+
+    It was computed from the pair's dose while the record kept the dose it had been
+    anchored on, so a stored brew could report an extraction its own dose and yield do
+    not produce — and the chart's ratio diagonals are drawn from exactly that relation.
+    """
+    session = _session()
+    session.last_dose = _dose(18.1, 1000.0)
+    session.record_measurement(10.13)
+
+    session._complete_measurement(
+        _pair(18.0, 37.0, 1930.0, pour_seconds=17.0, dose_at=1000.4)
+    )
+
+    point = session.last_measurement
+    assert point.dose == 18.0, "the pairer's considered dose was not adopted"
+    assert point.yield_g == 37.0
+    assert point.seconds == 17.0
+    assert point.ext == round(point.tds * point.yield_g / point.dose, 2)
+    assert point.ext == 20.82                        # 10.13 * 37.0 / 18.0
+
+
+def test_typing_the_yield_does_not_block_the_real_pour_from_arriving() -> None:
+    """The remedy must not disable the recovery.
+
+    set_measured_yield exists for a shot whose pour the scale missed — the same point
+    _complete_measurement is written to complete.  Requiring the yield to still be
+    missing meant using the documented remedy made the point permanently unmatchable:
+    its `at` stayed on the dose, so the card called the cup in your hand stale and a
+    second reading of it started a twin.
+    """
+    session = _session()
+    session.last_dose = _dose(18.1, 1000.0)
+    session.record_measurement(10.13)
+    session.set_measured_yield(36.0)                 # a guess, while the link is down
+    assert session.last_measurement.at == 1000.0
+
+    session._complete_measurement(
+        _pair(18.0, 37.0, 1930.0, pour_seconds=17.0, dose_at=1000.4)
+    )
+
+    assert len(session.measurements) == 1, "the late pour started a second point"
+    point = session.last_measurement
+    assert point.at == 1930.0, "the point never moved onto the pour it belongs to"
+    assert point.yield_g == 37.0, (
+        "the typed stand-in outlived the pour the scale actually weighed"
+    )
+    assert point.ext == round(point.tds * point.yield_g / point.dose, 2)
 
 
 def test_a_late_pour_completes_the_brew_that_was_already_measured() -> None:

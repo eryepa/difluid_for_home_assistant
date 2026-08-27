@@ -263,10 +263,21 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
             await self._do_connect()
         except Exception as err:
             _LOGGER.info(
-                "Device %s not available at startup (%s) — will connect when seen in BLE scan",
+                "Device %s not available at startup (%s) — will connect when seen in "
+                "BLE scan, or on the next retry",
                 self.address, err,
             )
-            # Don't raise — entities stay unavailable until the BT callback fires
+            # Don't raise — entities stay unavailable until we get in.
+            #
+            # But do arm the retry loop, rather than leaving the BLE advertisement
+            # callback as the only way back.  The callback fires on a *change* in what
+            # the scanner sees, so a scale that was already advertising when this
+            # failed may not produce another one for a long time — and this file's own
+            # notes record it silently failing to fire on 2026-08-14.  The loop checks
+            # presence before every attempt and backs off to _ABSENT_POLL_SECONDS when
+            # the device is not there, so arming it for a scale that is simply switched
+            # off costs one address lookup per poll.
+            self._ensure_reconnect_loop()
 
     async def async_stop(self) -> None:
         if self._bt_cancel:
@@ -372,26 +383,52 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         )
         self._client = client
 
-        if self._encrypted_uuid:
-            try:
-                await self._run_handshake(client)
-            except Exception as err:
-                _LOGGER.warning("Cloud handshake failed (%s); trying cleartext channel directly", err)
-                fallback_uuid = self._cleartext_uuid or write_uuid
-                self._write_char_uuid = fallback_uuid
-                await client.write_gatt_char(fallback_uuid, _CMD_AUTO_SEND_ON, response=False)
+        # Everything below can raise — six GATT writes over a proxy link this install
+        # loses for minutes at a time — and from the line above the client is reachable
+        # through self._client.  So a failure here used to leave self._client holding a
+        # *connected* client that nothing would ever replace:
+        #
+        #   - _on_bt_advertisement returns early for as long as is_connected, so the
+        #     fast path never fires again,
+        #   - the entities' `available` reads the same field and reports True,
+        #   - async_start's handler logs at INFO and arms no retry.
+        #
+        # One transient write error at startup and the scale sat there "available" at
+        # 0.0 g until Home Assistant was restarted, with a single INFO line to say so.
+        # Cleaning up here is what makes the failure look like a failure to every one
+        # of those three.
+        #
+        # BaseException rather than Exception: a cancellation mid-connect has to put
+        # the half-built client down too, or it leaks the device's one connection slot.
+        try:
+            if self._encrypted_uuid:
+                try:
+                    await self._run_handshake(client)
+                except Exception as err:
+                    _LOGGER.warning("Cloud handshake failed (%s); trying cleartext channel directly", err)
+                    fallback_uuid = self._cleartext_uuid or write_uuid
+                    self._write_char_uuid = fallback_uuid
+                    await client.write_gatt_char(fallback_uuid, _CMD_AUTO_SEND_ON, response=False)
+                    await asyncio.sleep(1.0)
+                    await client.write_gatt_char(fallback_uuid, _CMD_GET_STATUS, response=False)
+                    _LOGGER.info("Sent AUTO_SEND_ON to cleartext channel %s", fallback_uuid)
+            else:
+                await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=False)
                 await asyncio.sleep(1.0)
-                await client.write_gatt_char(fallback_uuid, _CMD_GET_STATUS, response=False)
-                _LOGGER.info("Sent AUTO_SEND_ON to cleartext channel %s", fallback_uuid)
-        else:
-            await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=False)
-            await asyncio.sleep(1.0)
-            await client.write_gatt_char(write_uuid, _CMD_GET_STATUS, response=False)
-            _LOGGER.info("Auto-send enabled; waiting for notifications")
+                await client.write_gatt_char(write_uuid, _CMD_GET_STATUS, response=False)
+                _LOGGER.info("Auto-send enabled; waiting for notifications")
 
-        # Query current mode settings so the select entity shows the right value.
-        await client.write_gatt_char(self._write_char_uuid, _CMD_GET_AUTO_DETECT, response=False)
-        await client.write_gatt_char(self._write_char_uuid, _CMD_GET_AUTO_STOP, response=False)
+            # Query current mode settings so the select entity shows the right value.
+            await client.write_gatt_char(self._write_char_uuid, _CMD_GET_AUTO_DETECT, response=False)
+            await client.write_gatt_char(self._write_char_uuid, _CMD_GET_AUTO_STOP, response=False)
+        except BaseException:
+            self._client = None
+            self.data.connected = False
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001 - we are already failing; say so once
+                pass
+            raise
 
         self.data.connected = True
         self._last_weight_change_time = asyncio.get_event_loop().time()
@@ -493,6 +530,15 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
             _LOGGER.info("Difluid Microbalance %s disconnected (power-off cooldown, won't reconnect for 60 s)", self.address)
             return
         _LOGGER.warning("Difluid Microbalance %s disconnected, will retry", self.address)
+        self._ensure_reconnect_loop()
+
+    def _ensure_reconnect_loop(self) -> None:
+        """Start the reconnect loop unless one is already running.
+
+        One place rather than two, because the guard is the whole of it: a second loop
+        would race the first for the scale's single connection slot, and each would see
+        the other's half-open client as the reason it could not get in.
+        """
         if self._reconnect_task and not self._reconnect_task.done():
             return
         self._reconnect_task = self.hass.async_create_background_task(

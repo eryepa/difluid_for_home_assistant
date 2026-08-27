@@ -47,13 +47,33 @@ PLATFORMS = [Platform.SENSOR, Platform.BUTTON, Platform.NUMBER, Platform.SELECT]
 DETECTOR_PLATFORMS = [Platform.SENSOR, Platform.BUTTON, Platform.NUMBER]
 
 
-def _async_wake_waiting_detectors(hass: HomeAssistant, scale_entry: ConfigEntry) -> None:
-    """Reload any detector that gave up waiting for this scale.
+#: The two states a detector can be in when this scale finishes setting up, both of
+#: which mean it is not connected to the coordinator that now exists.
+#:
+#: SETUP_RETRY is the one this started as: a detector set up before its scale raises
+#: ConfigEntryNotReady, and Home Assistant answers with a retry on a backoff that grows
+#: to minutes.  Nothing is broken in the meantime, but nothing is being detected
+#: either, purely because of the order the two entries happened to be set up in.
+#:
+#: LOADED is the one that took three releases to notice, because everything about it
+#: looks healthy.  add_brew_consumer binds the session to the *coordinator object* that
+#: existed when the detector set up, and it is called exactly once, from the detector's
+#: own setup.  Reloading the scale throws that object away and builds another with an
+#: empty consumer list — so the scale reconnects, weight and flow stream perfectly, the
+#: detector still reads "Loaded" with every entity present, and BrewSession.feed is
+#: never called again.  Every dose and pour from that moment is invisible: brew_count
+#: freezes and nothing is logged at any level.  Hitting Reload on the scale entry after
+#: a BLE drop is the obvious thing to do on this install, and it silently turned the
+#: detector off until the next Home Assistant restart.
+#:
+#: A LOADED detector here is *always* stale, never a false positive: it can only have
+#: reached LOADED by finding a coordinator for this scale in hass.data, and the one
+#: sitting there now was put there moments ago by this very setup.
+_STALE_DETECTOR_STATES = (ConfigEntryState.SETUP_RETRY, ConfigEntryState.LOADED)
 
-    A detector set up before its scale raises ConfigEntryNotReady, and Home Assistant
-    answers that with a retry on a backoff that grows to minutes.  Nothing is broken
-    in the meantime, but nothing is being detected either, purely because of the order
-    the two entries happened to be set up in.
+
+def _async_wake_waiting_detectors(hass: HomeAssistant, scale_entry: ConfigEntry) -> None:
+    """Reload any detector that is not attached to this scale's live coordinator.
 
     The nudge runs from the scale rather than from the detector, and that is the whole
     point.  1.6.0-beta.1 had the detector subscribe to a dispatcher signal before
@@ -63,14 +83,25 @@ def _async_wake_waiting_detectors(hass: HomeAssistant, scale_entry: ConfigEntry)
     detector sat in setup_retry with every statistic missing until something reloaded
     it by hand.  A caller that owns nothing and simply reloads has no such lifecycle
     to get wrong.
+
+    Reloading rather than re-subscribing in place, for the same reason: the detector
+    entry owns its session, and handing it a new coordinator from outside would mean
+    two entries writing one entry's state.  A reload rebuilds the session from disk,
+    and the unload that precedes it flushes what was in memory — see
+    BrewSession.async_flush.
     """
     for other in hass.config_entries.async_entries(DOMAIN):
         if (
             other.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_DETECTOR
             and other.data.get(CONF_SCALE_ENTRY) == scale_entry.entry_id
-            and other.state is ConfigEntryState.SETUP_RETRY
+            and other.state in _STALE_DETECTOR_STATES
         ):
-            _LOGGER.info("Scale is up; reloading the brew detector that was waiting")
+            _LOGGER.info(
+                "Scale is up; reloading the brew detector that was %s so it feeds "
+                "from the coordinator that now exists",
+                "waiting" if other.state is ConfigEntryState.SETUP_RETRY
+                else "attached to the previous one",
+            )
             hass.config_entries.async_schedule_reload(other.entry_id)
 
 # Lovelace card bundled with the integration.  We serve the whole www/

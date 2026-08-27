@@ -270,3 +270,73 @@ async def test_a_calibration_is_not_a_brew(hass: HomeAssistant) -> None:
     await hass.async_block_till_done()
 
     assert session.recorded == []
+
+
+# ── the device's own units, and the packets that are not readings ────────────────
+# Both fixtures below are the protocol document's worked examples, checksums included,
+# rather than anything invented here: docs/protocolR2.md:162 for the Fahrenheit
+# temperatures and :142 for what a calibration answers with.
+
+#: protocolR2.md:162 — `DF DF 03 00 06 01 03 17 03 14 01 FA`, i.e. prism 79.1 and
+#: sample 78.8 with Data5 = 0x01 = Fahrenheit.
+_F_TEMPS = bytes.fromhex("dfdf030006010317031401fa")
+
+#: A calibration result: same shape as a single test, cmd 0x02, concentration 0.
+_CALIBRATION_RESULT = bytes.fromhex("dfdf0302070200000002093d14")
+
+
+async def test_a_fahrenheit_device_is_published_in_celsius(hass: HomeAssistant) -> None:
+    """The R2 reports in whatever its own display is set to; the sensors say Celsius.
+
+    Nothing converted, so a prism at 26.2 C reached Home Assistant as 79.1 tagged
+    Celsius — a 53-degree error written straight into long-term statistics with nothing
+    logged at any level.  The scale's coordinator has always done this correctly for
+    ounces; the R2 tracked the unit and then ignored it.
+    """
+    coordinator = _coordinator(hass)
+
+    coordinator._on_data_notification(None, bytearray(_F_TEMPS))
+
+    assert coordinator.data.prism_temperature == 26.2      # 79.1 F
+    assert coordinator.data.sample_temperature == 26.0     # 78.8 F
+    assert coordinator.data.temperature_unit == "°F", (
+        "the unit the device reported in is still worth recording, it is just not "
+        "the unit of the value we store"
+    )
+
+
+async def test_a_celsius_device_is_left_exactly_as_it_reported(
+    hass: HomeAssistant,
+) -> None:
+    """The control case: conversion must not touch the readings that were already right."""
+    coordinator = _coordinator(hass)
+
+    coordinator._on_data_notification(None, bytearray(_LOOP_TEMPS))
+
+    assert coordinator.data.prism_temperature == 26.9
+    assert coordinator.data.sample_temperature == 27.6
+    assert coordinator.data.temperature_unit == "°C"
+
+
+async def test_a_calibration_result_does_not_overwrite_the_last_reading(
+    hass: HomeAssistant,
+) -> None:
+    """protocolR2.md:142 — a successful calibration answers with concentration 0.
+
+    Taken as a reading, that replaces the last real TDS with 0.00 in the entity and in
+    recorder history, for a packet whose whole meaning is "the prism was just zeroed on
+    distilled water".  The status package is still read, so the calibration itself stays
+    visible — it is only its result that must not be mistaken for coffee.
+    """
+    coordinator = _coordinator(hass)
+    coordinator._on_data_notification(None, bytearray(_LOOP_RESULT))
+    assert coordinator.data.concentration == 11.03
+
+    coordinator._on_data_notification(None, bytearray(_CALIBRATION_RESULT))
+
+    assert coordinator.data.concentration == 11.03, (
+        "a calibration zeroed the last measured shot"
+    )
+    assert coordinator.data.refractive_index == 1.35264, (
+        "and took the refractive index with it"
+    )
