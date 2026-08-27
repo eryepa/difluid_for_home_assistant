@@ -48,16 +48,3 @@ views:
             icon: mdi:flask-outline
           - type: custom:difluid-card
             device: YOUR_R2_DEVICE_ID
-
-      # Not on the author's dashboard, but this is where the Brew Detector's own
-      # cards go if you want them. The detector is a separate device hung off the
-      # scale, so it has its own device id.
-      #
-      # - type: grid
-      #   cards:
-      #     - type: custom:difluid-card
-      #       device: YOUR_BREW_DETECTOR_DEVICE_ID
-      #       sections: [statistics]
-      #     - type: custom:difluid-card
-      #       device: YOUR_BREW_DETECTOR_DEVICE_ID
-      #       sections: [diagnostic]
