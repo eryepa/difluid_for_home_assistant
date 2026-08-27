@@ -39,7 +39,8 @@ function loadCardHelpers() {
   vm.runInContext(
     src.slice(0, cut) +
       "\n;globalThis.__exported = { SENSOR_ORDER, CONTROL_ORDER, EXCLUDE_CONTROLS," +
-      " STATS_ORDER, DIAG_ORDER, rank, inList, isStat, statRank, DOMAIN," +
+      " STATS_ORDER, DIAG_ORDER, SECTIONS, SECTION_LABELS, rank, inList, isStat," +
+      " statRank, DOMAIN," +
       " pourWindow, cleanSamples, linePath, controlFrame, ratioSegment," +
       " CONTROL_FRAMES, ESPRESSO_TDS, brewLabel, legendRow, whenLabel, cardTitle," +
       " isCurrent, staleNote, pourBrew, timeFormat, axisTo, timeStep, AXIS_STEPS };",
@@ -74,6 +75,23 @@ function loadPointsFn() {
   return new Function(`return function () {${body}\n};`)();
 }
 
+// The same trick as loadClusterFn, generalised: lift one method out of the class and
+// hand it the module-level constants it closes over.  Only for methods that touch no
+// DOM — everything below is config and naming, which is exactly the part a browser is
+// not needed to check and a reimplementation here would freeze in place.
+function loadMethod(signature, consts = {}) {
+  const src = fs.readFileSync(CARD, "utf8");
+  const start = src.indexOf(`  ${signature} {`);
+  if (start < 0) throw new Error(`no ${signature} in the card — did it get renamed?`);
+  const end = src.indexOf("\n  }", start);
+  const body = src.slice(src.indexOf("{", start) + 1, end);
+  const params = signature.slice(signature.indexOf("(") + 1, signature.lastIndexOf(")"));
+  const names = Object.keys(consts);
+  return new Function(...names, `return function (${params}) {${body}\n};`)(
+    ...names.map((n) => consts[n])
+  );
+}
+
 const DOMAIN_NAME = "difluid_microbalance";
 
 // Device ids.  SCALE is the real one this install has; DETECTOR is the service device
@@ -101,10 +119,15 @@ const DEVICES = {
   },
 };
 
-// The 22 entities, in registry order, as ha_get_device reports them, each with the
+// The 26 entities, in registry order, as ha_get_device reports them, each with the
 // device that owns it after the split.  Registry order matters: it is the tie-breaker
 // the sort falls back on, so a fixture that silently sorted them would hide the very
 // ambiguity worth catching.
+//
+// The four `brew_detector_*` at the end are the ones registered after the entity
+// naming changed, and they are in this fixture because leaving them out is how two of
+// them went unnoticed in the live sensor list for three releases: a fixture that only
+// holds the entities somebody remembered to add cannot report a misfiled one.
 const ENTITIES = [
   ["sensor.microbalance_304268_weight", SCALE],
   ["sensor.microbalance_304268_flow_rate", SCALE],
@@ -128,6 +151,10 @@ const ENTITIES = [
   ["sensor.kitchen_microbalance_304268_coffee_ground_period", DETECTOR],
   ["sensor.kitchen_microbalance_304268_coffee_per_day", DETECTOR],
   ["button.kitchen_microbalance_304268_reset_period", DETECTOR],
+  ["sensor.brew_detector_last_tds", DETECTOR],
+  ["sensor.brew_detector_extraction", DETECTOR],
+  ["number.brew_detector_measured_yield", DETECTOR],
+  ["number.brew_detector_measured_dose", DETECTOR],
 ];
 
 const IDS = ENTITIES.map(([id]) => id);
@@ -152,7 +179,9 @@ function partition(h, ids) {
 }
 
 const short = (ids) =>
-  ids.map((x) => x.split(".")[1].replace(/^(kitchen_)?microbalance_304268_/, ""));
+  ids.map((x) =>
+    x.split(".")[1].replace(/^(kitchen_)?microbalance_304268_|^brew_detector_/, "")
+  );
 
 let ok = true;
 function check(label, got, want) {
@@ -186,14 +215,46 @@ check(
 check(
   "Diagnostic holds the last shot's working parts",
   short(diagnostics),
-  ["brew_dose", "brew_yield", "brew_ratio", "last_dose", "last_yield",
-   "integration_version"]
+  ["brew_dose", "brew_yield", "brew_ratio", "last_tds", "extraction",
+   "last_dose", "last_yield", "integration_version"]
+);
+
+// The specific regression: both are EntityCategory.DIAGNOSTIC in Python, matched
+// nothing in DIAG_ORDER, and so fell through into the live readings — where a TDS from
+// yesterday sat next to a weight from this second looking like the same kind of thing.
+check(
+  "the refractometer's verdict is filed with the shot, not with the live weight",
+  ["last_tds", "extraction"].map((k) => short(sensors).includes(k)),
+  [false, false]
 );
 
 check(
-  "the scale's own buttons stay reachable from the dashboard",
+  "the scale's own buttons stay reachable, with the two hand-typed figures after them",
   short(controls),
-  ["tare", "timer_start", "mode"]
+  ["tare", "timer_start", "mode", "measured_dose", "measured_yield"]
+);
+
+// `inList` and `rank` match anywhere inside the entity_id, so a control whose name
+// contains a diagnostic's key would be claimed by Diagnostic and rendered as a read-
+// only row — the input silently becoming a label.  "measured_dose" against "last_dose"
+// and "brew_dose" is exactly that shape of near-miss.
+check(
+  "the two number inputs are not swallowed by the dose and yield sensors",
+  ["number.brew_detector_measured_dose", "number.brew_detector_measured_yield"]
+    .map((id) => h.isStat(id) || h.inList(id, h.DIAG_ORDER)),
+  [false, false]
+);
+
+check(
+  "each control ranks distinctly, so dose comes before yield by the card's own order",
+  new Set(controls.map((id) => h.rank(id, h.CONTROL_ORDER))).size,
+  controls.length
+);
+
+check(
+  "each diagnostic ranks distinctly too",
+  new Set(diagnostics.map((id) => h.rank(id, h.DIAG_ORDER))).size,
+  diagnostics.length
 );
 
 // Equal ranks leave the sort with nothing to decide, and the row order falls back to
@@ -205,7 +266,7 @@ check(
   stats.length
 );
 
-// Auto-disconnect Bluetooth is deliberately excluded, so 21 of 22 are placed.  Any
+// Auto-disconnect Bluetooth is deliberately excluded, so 25 of 26 are placed.  Any
 // other entity going missing means it matched nothing and nothing noticed.
 check(
   "every entity is placed exactly once, bar the excluded auto-disconnect",
@@ -255,9 +316,144 @@ const entitiesFor = (device) => {
   return ENTITIES.filter(([, dev]) => cluster.has(dev)).map(([id]) => id);
 };
 check(
-  "configured either way, the card draws the same 22 entities",
-  entitiesFor(DETECTOR).length,
-  entitiesFor(SCALE).length
+  "configured either way, the card draws the same 26 entities",
+  [entitiesFor(DETECTOR).length, entitiesFor(SCALE).length],
+  [IDS.length, IDS.length]
+);
+
+// ── sections ────────────────────────────────────────────────────────────────
+// One card of everything was fine while there was one device.  With the detector split
+// off, the statistics and the last shot's working parts are the detector's, and they
+// were being rendered under a heading naming the scale — with the diagnostics folded
+// shut underneath the scale's own buttons.  `sections:` puts each group on a card of
+// its own; a config that does not ask still gets all three.
+console.log("\ndifluid-card — sections\n");
+
+const setConfigFn = loadMethod("setConfig(config)", { SECTIONS: h.SECTIONS });
+const sectionsFn = loadMethod("_sections()", { SECTIONS: h.SECTIONS });
+const deviceNameFn = loadMethod("_deviceName()");
+const headerFn = loadMethod("_defaultHeader()", { SECTION_LABELS: h.SECTION_LABELS });
+
+// A stand-in for the card: the four methods above plus the state they read.
+const cardWith = (config) => ({
+  _config: config,
+  _hass: { devices: DEVICES },
+  _sections: sectionsFn,
+  _deviceName: deviceNameFn,
+  _defaultHeader: headerFn,
+});
+
+const refused = (config) => {
+  try {
+    setConfigFn.call({}, config);
+    return false;
+  } catch (e) {
+    return true;
+  }
+};
+
+// Silently falling back to "everything" on a typo is the failure worth preventing: it
+// looks exactly like the card ignoring `sections`, which is a long thing to debug.
+check(
+  "a misspelled or empty section is refused outright, and a good one is not",
+  [
+    refused({ device: SCALE, sections: ["statistcs"] }),
+    refused({ device: SCALE, sections: [] }),
+    refused({ device: SCALE, sections: "statistics" }),
+    refused({ device: SCALE, sections: ["statistics", "diagnostic"] }),
+    refused({ device: SCALE }),
+  ],
+  [true, true, true, false, false]
+);
+
+check(
+  "a card that does not ask gets every section",
+  sectionsFn.call({ _config: { device: SCALE } }),
+  h.SECTIONS
+);
+
+// The heading is the whole point of splitting them: "Kitchen Microbalance 304268" over
+// a column of brew statistics names a device that contributed none of the rows under
+// it, and two cards both headed "Brew Detector" have to be read to be told apart.
+check(
+  "each card is headed by the device that owns its rows, and names the group",
+  [
+    headerFn.call(cardWith({ device: SCALE })),
+    headerFn.call(cardWith({ device: SCALE, sections: ["live"] })),
+    headerFn.call(cardWith({ device: DETECTOR, sections: ["statistics"] })),
+    headerFn.call(cardWith({ device: DETECTOR, sections: ["diagnostic"] })),
+    // Two groups on one card: neither name would be the whole truth, so neither is
+    // used and the heading stays the device's.
+    headerFn.call(cardWith({ device: DETECTOR, sections: ["statistics", "diagnostic"] })),
+  ],
+  [
+    "Kitchen Microbalance 304268",
+    "Kitchen Microbalance 304268",
+    "Brew Detector · Statistics",
+    "Brew Detector · Diagnostic",
+    "Brew Detector",
+  ]
+);
+
+// The climb to the parent device existed so a card configured on the detector would
+// not head its live weight "Brew Detector". It must not fire for a card with no live
+// rows, and it must still fire for every config written before sections existed.
+check(
+  "the climb to the physical device happens only where there is a live reading",
+  [
+    deviceNameFn.call(cardWith({ device: DETECTOR })),
+    deviceNameFn.call(cardWith({ device: DETECTOR, sections: ["live"] })),
+    deviceNameFn.call(cardWith({ device: DETECTOR, sections: ["statistics"] })),
+  ],
+  ["Kitchen Microbalance 304268", "Kitchen Microbalance 304268", "Brew Detector"]
+);
+
+// The harness has no DOM, so _build cannot be run — and a helper nobody calls passes
+// forever.  These read the source instead.
+const buildSrc = (() => {
+  const src = fs.readFileSync(CARD, "utf8");
+  const start = src.indexOf("  _build() {");
+  if (start < 0) throw new Error("no _build() in the card — did it get renamed?");
+  return src.slice(start, src.indexOf("\n  }", start));
+})();
+
+check(
+  "_build gates each group on the sections it was asked for",
+  [
+    /const sections = this\._sections\(\);/.test(buildSrc),
+    /if \(sections\.includes\("live"\)\)/.test(buildSrc),
+    /if \(sections\.includes\("statistics"\) && stats\.length\)/.test(buildSrc),
+    /if \(sections\.includes\("diagnostic"\) && diagnostics\.length\)/.test(buildSrc),
+  ],
+  [true, true, true, true]
+);
+
+// Order matters and not only for tidiness: a group has to be claimed before it can be
+// skipped.  Partition after the gate and a card asked for `live` would find the
+// statistics unclaimed and render them in among the weight — the exact failure the
+// three-way partition exists to prevent.
+check(
+  "the partition still runs over every entity before any section is skipped",
+  buildSrc.indexOf("const stats = ids") < buildSrc.indexOf("const sections = this._sections()"),
+  true
+);
+
+// A card whose entire contents are a closed <details> is a title bar.
+check(
+  "the diagnostics unfold when they are the only thing on the card",
+  [
+    /const solo = sections\.length === 1;/.test(buildSrc),
+    /if \(solo\) \{\n\s*for \(const id of diagnostics\) body\.appendChild/.test(buildSrc),
+    // And the in-card heading is dropped for the same reason: the card header says it.
+    /if \(!solo\) body\.appendChild\(this\._sectionHeader\("Statistics"\)\);/.test(buildSrc),
+  ],
+  [true, true, true]
+);
+
+check(
+  "the card header comes from _defaultHeader, so the naming above is what renders",
+  /card\.header = this\._config\.title \|\| this\._defaultHeader\(\);/.test(buildSrc),
+  true
 );
 
 // ── the pour curve ──────────────────────────────────────────────────────────

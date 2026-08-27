@@ -1,7 +1,11 @@
 /**
  * DiFluid card — a Lovelace card bundled with the difluid_microbalance
  * integration.  It groups all entities of a chosen DiFluid device (scale or
- * R2) into an ordered sensor section + interactive control section.
+ * R2) into live readings, controls, statistics and the last shot's diagnostics.
+ *
+ * `sections:` picks which of those groups one card shows, so the detector's
+ * statistics can sit on a card headed by the detector instead of under the
+ * scale's buttons.  A card that does not ask shows all of them — see SECTIONS.
  *
  * Registered automatically by the integration; appears in the "Add card"
  * picker as "DiFluid Microbalance / R2".
@@ -15,9 +19,11 @@ const SENSOR_ORDER = [
   "concentration", "refractive", "prism", "sample", "test_status",
   "status", "battery",
 ];
-// Display order for the control rows.
+// Display order for the control rows.  The two manual figures come last and read
+// dose before yield, the order the brew happened in — they are also the only two
+// controls here that change a stored number rather than poke the hardware.
 const CONTROL_ORDER = [
-  "tare", "start", "test", "mode",
+  "tare", "start", "test", "mode", "measured_dose", "measured_yield",
 ];
 // Control entities to hide from the card (still available on the device page).
 const EXCLUDE_CONTROLS = ["auto_disconnect", "auto_shutdown"];
@@ -41,11 +47,39 @@ const STATS_ORDER = [
 // looks wrong, noise every other day.  On the device page these share the Diagnostic
 // card with the statistics above, because HA has nowhere else to put either; the split
 // between the two exists only here.
+//
+// Ordered as the brew reads: what the pairer decided went in and came out, the ratio
+// of the two, the refractometer's verdict on them, then the raw weighings the pairer
+// chose *from* — which is the pair to compare against when a ratio looks wrong.
+//
+// last_tds and extraction were missing from this list until 1.9.0-beta.4, and missing
+// from a list here does not mean "unplaced": unmatched entities fall through to the
+// plain sensor group, so the two of them sat in among the live weight and flow rate on
+// every card.  Both are EntityCategory.DIAGNOSTIC on the Python side, so the card and
+// the device page had been disagreeing about them since they were added.
 const DIAG_ORDER = [
   "brew_dose", "brew_yield", "brew_ratio",
+  "last_tds", "extraction",
   "last_dose", "last_yield",
   "integration_version",
 ];
+
+// The parts of a card, and the values `sections:` accepts.
+//
+//   live         what the device reads now, plus its buttons and inputs
+//   statistics   the odometers, trip meters and daily rates
+//   diagnostic   the working parts of the last shot
+//
+// A card that does not ask gets all three, which is what every config written before
+// 1.9.0-beta.4 means and what a single card of everything still is.  Asking for one
+// puts that group on a card of its own — the detector's statistics do not belong under
+// a heading naming the scale, and the diagnostics are worth a card you can leave open.
+const SECTIONS = ["live", "statistics", "diagnostic"];
+const SECTION_LABELS = {
+  live: "Live",
+  statistics: "Statistics",
+  diagnostic: "Diagnostic",
+};
 
 // ── pour curve ──────────────────────────────────────────────────────────────
 // Seconds of the hold to keep after the pour stops.  Enough to show the reading
@@ -415,9 +449,30 @@ const isStat = (entityId) => statRank(entityId) >= 0;
 
 class DifluidCard extends HTMLElement {
   setConfig(config) {
+    // Thrown rather than ignored, and thrown here rather than at render time: a
+    // misspelled section that silently fell back to "everything" would look like the
+    // card ignoring the config, which is a much longer thing to debug than a card that
+    // refuses to load and says which word it did not recognise.
+    const asked = config && config.sections;
+    if (asked !== undefined) {
+      if (!Array.isArray(asked) || !asked.length) {
+        throw new Error(`sections must be a non-empty list of: ${SECTIONS.join(", ")}`);
+      }
+      const unknown = asked.filter((s) => !SECTIONS.includes(s));
+      if (unknown.length) {
+        throw new Error(
+          `unknown section ${unknown.join(", ")} — pick from: ${SECTIONS.join(", ")}`
+        );
+      }
+    }
     this._config = { ...config };
     this._built = false;
     this.innerHTML = "";
+  }
+
+  //: The groups this card was asked for, defaulting to all of them.
+  _sections() {
+    return (this._config && this._config.sections) || SECTIONS;
   }
 
   set hass(hass) {
@@ -488,12 +543,32 @@ class DifluidCard extends HTMLElement {
 
   _deviceName() {
     const devices = this._hass.devices || {};
-    // Name the card after the physical device even when it is configured on the
-    // detector: "Brew Detector" is a poor heading for a card whose first row is the
-    // live weight.
     const own = devices[this._config.device];
-    const dev = (own && own.via_device_id && devices[own.via_device_id]) || own;
+    // Name the card after the physical device when it shows live readings, even if it
+    // is configured on the detector: "Brew Detector" is a poor heading for a card whose
+    // first row is the live weight.
+    //
+    // Conditional rather than unconditional as it was before sections existed, because
+    // the reverse is just as true the other way round — a card of nothing but the
+    // detector's own statistics headed "Kitchen Microbalance 304268" names a device
+    // that contributed none of the rows under it.  A config that asks for no sections
+    // includes `live`, so its heading is unchanged.
+    const climb = this._sections().includes("live");
+    const dev = (climb && own && own.via_device_id && devices[own.via_device_id]) || own;
     return (dev && (dev.name_by_user || dev.name)) || "DiFluid";
+  }
+
+  //: The card's heading when the config does not give one.
+  //
+  //: A card showing exactly one group names it, because two cards both headed "Brew
+  //: Detector" are two cards you have to read to tell apart.  `live` is the exception:
+  //: it is the device itself rather than one view of it, and "… · Live" would add a
+  //: word without adding a distinction.
+  _defaultHeader() {
+    const sections = this._sections();
+    const only = sections.length === 1 ? sections[0] : null;
+    const suffix = only && only !== "live" ? ` · ${SECTION_LABELS[only]}` : "";
+    return this._deviceName() + suffix;
   }
 
   // ── build (once) ──────────────────────────────────────────────────────────
@@ -501,7 +576,7 @@ class DifluidCard extends HTMLElement {
     if (!this._hass || !this._config) return;
 
     const card = document.createElement("ha-card");
-    card.header = this._config.title || this._deviceName();
+    card.header = this._config.title || this._defaultHeader();
 
     const body = document.createElement("div");
     body.className = "difluid-body";
@@ -576,16 +651,29 @@ class DifluidCard extends HTMLElement {
 
     this._rows = [];
 
-    for (const id of sensors) body.appendChild(this._sensorRow(id));
-    if (sensors.length && controls.length) {
-      const div = document.createElement("div");
-      div.className = "divider";
-      body.appendChild(div);
-    }
-    for (const id of controls) body.appendChild(this._controlRow(id));
+    // The partition above always runs over every entity, whichever sections were
+    // asked for.  It has to: a group is claimed before it can be skipped, and doing it
+    // the other way round — partitioning only what a section wants — would put an
+    // unclaimed statistic into the live sensor list on a card configured for `live`,
+    // which is precisely the failure the three-way partition exists to prevent.
+    const sections = this._sections();
+    // Exactly one group on this card, so its name is already in the header and the
+    // in-card heading would only repeat it.  It also decides whether the diagnostics
+    // fold away: a card whose entire contents are a closed <details> is a title bar.
+    const solo = sections.length === 1;
 
-    if (stats.length) {
-      body.appendChild(this._sectionHeader("Statistics"));
+    if (sections.includes("live")) {
+      for (const id of sensors) body.appendChild(this._sensorRow(id));
+      if (sensors.length && controls.length) {
+        const div = document.createElement("div");
+        div.className = "divider";
+        body.appendChild(div);
+      }
+      for (const id of controls) body.appendChild(this._controlRow(id));
+    }
+
+    if (sections.includes("statistics") && stats.length) {
+      if (!solo) body.appendChild(this._sectionHeader("Statistics"));
       for (const id of stats) {
         body.appendChild(
           id.startsWith("sensor.") ? this._sensorRow(id) : this._controlRow(id)
@@ -593,22 +681,32 @@ class DifluidCard extends HTMLElement {
       }
     }
 
-    if (diagnostics.length) {
-      const details = document.createElement("details");
-      details.className = "diag";
-      const summary = document.createElement("summary");
-      summary.textContent = "Diagnostic";
-      details.appendChild(summary);
-      for (const id of diagnostics) details.appendChild(this._sensorRow(id));
-      body.appendChild(details);
+    if (sections.includes("diagnostic") && diagnostics.length) {
+      if (solo) {
+        for (const id of diagnostics) body.appendChild(this._sensorRow(id));
+      } else {
+        const details = document.createElement("details");
+        details.className = "diag";
+        const summary = document.createElement("summary");
+        summary.textContent = "Diagnostic";
+        details.appendChild(summary);
+        for (const id of diagnostics) details.appendChild(this._sensorRow(id));
+        body.appendChild(details);
+      }
     }
 
-    if (!sensors.length && !controls.length && !stats.length && !diagnostics.length) {
+    if (!body.childElementCount) {
       const empty = document.createElement("div");
       empty.className = "row label";
-      empty.textContent = this._config.device
-        ? "No entities found for this device."
-        : "Select a DiFluid device in the card settings.";
+      empty.textContent = !this._config.device
+        ? "Select a DiFluid device in the card settings."
+        : sections.length === SECTIONS.length
+          ? "No entities found for this device."
+          // Distinguished from the above because the two have different fixes: this
+          // card found entities and none belonged to the group it was asked for, so
+          // the answer is a different device or a different section, not a broken
+          // integration.
+          : `Nothing in ${sections.join(" or ")} for this device.`;
       body.appendChild(empty);
     }
 
@@ -773,6 +871,13 @@ class DifluidCard extends HTMLElement {
 }
 
 // ── visual editor ────────────────────────────────────────────────────────────
+
+const EDITOR_LABELS = {
+  device: "DiFluid device",
+  title: "Title (optional)",
+  sections: "Sections (all of them if none is picked)",
+};
+
 class DifluidCardEditor extends HTMLElement {
   setConfig(config) {
     this._config = { ...config };
@@ -795,15 +900,27 @@ class DifluidCardEditor extends HTMLElement {
           })
         );
       });
-      this._form.computeLabel = (s) =>
-        s.name === "device" ? "DiFluid device" : "Title (optional)";
+      this._form.computeLabel = (s) => EDITOR_LABELS[s.name] || s.name;
       this.appendChild(this._form);
     }
     this._form.hass = this._hass;
     this._form.schema = [
       { name: "device", selector: { device: { integration: DOMAIN } } },
       { name: "title", selector: { text: {} } },
+      {
+        name: "sections",
+        selector: {
+          select: {
+            multiple: true,
+            mode: "list",
+            options: SECTIONS.map((s) => ({ value: s, label: SECTION_LABELS[s] })),
+          },
+        },
+      },
     ];
+    // Left absent rather than defaulted to all three, because ha-form writes back
+    // whatever it is given: seeding the box would turn every card that had never
+    // expressed an opinion into one that had, the moment its editor was opened.
     this._form.data = this._config;
   }
 }

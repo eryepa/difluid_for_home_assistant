@@ -32,13 +32,12 @@ async def async_setup_entry(
 
     if entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_DETECTOR:
         session: BrewSession = hass.data[DOMAIN][entry.entry_id]
+        uid_prefix = entry.data.get(CONF_UID_PREFIX) or entry.entry_id
+        device_info = detector_device_info(entry)
         async_add_entities(
             [
-                MeasuredYieldNumber(
-                    session,
-                    entry.data.get(CONF_UID_PREFIX) or entry.entry_id,
-                    detector_device_info(entry),
-                )
+                MeasuredDoseNumber(session, uid_prefix, device_info),
+                MeasuredYieldNumber(session, uid_prefix, device_info),
             ]
         )
         return
@@ -54,42 +53,42 @@ async def async_setup_entry(
     async_add_entities([AutoShutdownNumber(coordinator, entry, device_info)])
 
 
-class MeasuredYieldNumber(NumberEntity):
-    """The yield of the brew that was measured last, typed in when the scale missed it.
+class _MeasuredNumber(NumberEntity):
+    """One half of the last measured brew, typed in by hand.
 
     Reads the stored measurement rather than holding a value of its own, so it shows
     what the chart is actually plotting and cannot drift out of step with it.  Not a
     RestoreEntity for the same reason: there is nothing here to restore that the
     session does not already keep.
 
-    Deliberately not EntityCategory.CONFIG.  It is not a setting — it is a reading, and
-    it belongs in Controls next to Reset Period, which is where somebody looking at a
-    measurement with no extraction will go.
+    Deliberately not EntityCategory.CONFIG.  Neither is a setting — each is a reading,
+    and they belong in Controls, which is where somebody looking at a measurement whose
+    numbers are wrong will go.
 
     Always available, like the rest of the detector's entities: the scale being off the
-    air is precisely when this gets used.
+    air, or having weighed the wrong thing, is precisely when these get used.
     """
 
     _attr_has_entity_name = True
-    _attr_name = "Measured Yield"
-    _attr_icon = "mdi:cup-outline"
     _attr_device_class = SensorDeviceClass.WEIGHT
     _attr_native_unit_of_measurement = UnitOfMass.GRAMS
-    # The detector's own plausible-pour range, widened a little at both ends: this is
-    # for the cases the detector did not judge, so its thresholds are guidance here
-    # rather than law.
     _attr_native_min_value = 0
-    _attr_native_max_value = 200
     _attr_native_step = 0.1
     _attr_mode = NumberMode.BOX
     _attr_should_poll = False
 
+    #: entity_id suffix and the field of BrewMeasurement this one shows.  Subclasses
+    #: set both; nothing here has a default, because a subclass that forgot one would
+    #: otherwise silently become a second copy of the other control.
+    _key: str
+    _field: str
+
     def __init__(self, session: BrewSession, uid_prefix: str, device_info: DeviceInfo):
         self._session = session
         # Same prefix rule as the brew sensors — see DifluidBrewSensor.__init__.  The
-        # `sensor.…_brew_yield` that already exists is a different domain, so this
-        # unique_id cannot collide with it.
-        self._attr_unique_id = f"{uid_prefix}_measured_yield"
+        # `sensor.…_brew_yield` and `sensor.…_last_dose` that already exist are a
+        # different domain, so these unique_ids cannot collide with them.
+        self._attr_unique_id = f"{uid_prefix}_{self._key}"
         self._attr_device_info = device_info
 
     async def async_added_to_hass(self) -> None:
@@ -110,7 +109,44 @@ class MeasuredYieldNumber(NumberEntity):
     @property
     def native_value(self) -> float | None:
         point = self._session.last_measurement
-        return None if point is None else point.yield_g
+        return None if point is None else getattr(point, self._field)
+
+
+class MeasuredDoseNumber(_MeasuredNumber):
+    """What went in, corrected by hand when the detector weighed the wrong thing.
+
+    The case it answers is not a missing dose — a reading with no dose at all is never
+    recorded, because current_brew has nothing to anchor it to — but a dose that is
+    confidently wrong: a portafilter set back on the scale outranking the beans, which
+    is what happened on 2026-08-17.  See BrewSession.set_measured_dose.
+    """
+
+    _key = "measured_dose"
+    _field = "dose"
+    _attr_name = "Measured Dose"
+    _attr_icon = "mdi:coffee-outline"
+    # A dose, not a pour: the detector's own dose range with a lot of room either side,
+    # since this is for the cases it judged wrongly and its thresholds are guidance
+    # here rather than law.  100 g is already several portafilters.
+    _attr_native_max_value = 100
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._session.set_measured_dose(value)
+
+
+class MeasuredYieldNumber(_MeasuredNumber):
+    """The yield of the brew that was measured last, typed in when the scale missed it.
+
+    See BrewSession.set_measured_yield.
+    """
+
+    _key = "measured_yield"
+    _field = "yield_g"
+    _attr_name = "Measured Yield"
+    _attr_icon = "mdi:cup-outline"
+    # The detector's own plausible-pour range, widened a little at both ends, for the
+    # same reason the dose's is.
+    _attr_native_max_value = 200
 
     async def async_set_native_value(self, value: float) -> None:
         self._session.set_measured_yield(value)

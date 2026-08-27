@@ -416,10 +416,18 @@ async def test_the_detector_offers_a_measured_yield_control(
     await hass.async_block_till_done()
 
     registry = er.async_get(hass)
-    entity_id = registry.async_get_entity_id(
+    yield_id = registry.async_get_entity_id(
         "number", DOMAIN, f"{scale.entry_id}_measured_yield"
     )
-    assert entity_id is not None, "the detector has no Measured Yield control"
+    assert yield_id is not None, "the detector has no Measured Yield control"
+    dose_id = registry.async_get_entity_id(
+        "number", DOMAIN, f"{scale.entry_id}_measured_dose"
+    )
+    assert dose_id is not None, "the detector has no Measured Dose control"
+    assert dose_id != yield_id, (
+        "both controls resolved to one entity — the two share a base class, and a "
+        "subclass that inherited the other's _key would silently be a second copy of it"
+    )
 
     session = hass.data[DOMAIN][detector.entry_id]
     session._save = lambda: None
@@ -430,13 +438,30 @@ async def test_the_detector_offers_a_measured_yield_control(
     await hass.services.async_call(
         "number",
         "set_value",
-        {"entity_id": entity_id, "value": 37.0},
+        {"entity_id": yield_id, "value": 37.0},
         blocking=True,
     )
 
     assert session.last_measurement.yield_g == 37.0
     assert session.last_measurement.ext == 20.71
-    assert hass.states.get(entity_id).state == "37.0"
+    assert hass.states.get(yield_id).state == "37.0"
+
+    # And the dose the same way round: the entity reads the stored measurement rather
+    # than a value of its own, so a correction has to come back out of the session.
+    await hass.services.async_call(
+        "number",
+        "set_value",
+        {"entity_id": dose_id, "value": 18.0},
+        blocking=True,
+    )
+
+    assert session.last_measurement.dose == 18.0
+    assert session.last_measurement.ext == 20.82      # 10.13 * 37.0 / 18.0
+    assert hass.states.get(dose_id).state == "18.0"
+    assert hass.states.get(yield_id).state == "37.0", (
+        "correcting the dose moved the yield — the two controls are writing over "
+        "each other's field"
+    )
 
     await _unload_all(hass)
 
@@ -536,6 +561,66 @@ def test_typing_a_yield_with_nothing_measured_does_nothing() -> None:
     silently overriding a pour the scale did see is worse than doing nothing."""
     session = _session()
     assert session.set_measured_yield(37.0) is None
+    assert session.measurements == []
+
+
+def test_typing_the_dose_corrects_the_extraction() -> None:
+    """The 2026-08-17 defect, after the fact.
+
+    current_brew anchors on last_dose, which is the last thing weighed in the dose
+    range and not the pairer's considered choice — so the portafilter set back on the
+    scale at 19.3 g became the dose for a shot ground at 18.0 g.  Every figure derived
+    from it was then arithmetically perfect about the wrong quantity of beans.
+    """
+    session = _session()
+    session.last_pair = _pair(19.3, 37.4, 1000.0)
+    session.record_measurement(11.03)
+    assert session.last_measurement.ext == 21.37       # 11.03 * 37.4 / 19.3
+
+    updated = session.set_measured_dose(18.0)
+
+    assert updated.dose == 18.0
+    assert updated.ext == 22.92                        # 11.03 * 37.4 / 18.0
+    assert updated.yield_g == 37.4, "correcting the dose moved the yield"
+    assert round(updated.ratio, 2) == 2.08, "the ratio still divides the old dose"
+    assert len(session.measurements) == 1, "it edited the brew rather than adding one"
+    assert session.last_measurement.ext == 22.92
+
+
+def test_correcting_the_dose_of_a_brew_with_no_pour_is_not_an_extraction() -> None:
+    """The two failures can land on the same cup: the dose was wrong *and* the link
+    dropped before the pour.  Fixing one of them must not manufacture the other —
+    and the log line has to survive formatting a yield that is still None."""
+    session = _session()
+    session.last_dose = _dose(19.3, 2000.0)
+    session.record_measurement(11.03)
+
+    updated = session.set_measured_dose(18.0)
+
+    assert updated.dose == 18.0
+    assert updated.yield_g is None
+    assert updated.ext is None, "extraction is not computable without a yield"
+    assert updated.ratio is None
+
+
+def test_a_dose_of_zero_says_unknown_rather_than_nothing() -> None:
+    """0 is the only value in the control's range that cannot be a real dose, so it is
+    how you say you do not know — and it must blank the derived figures rather than
+    divide by itself."""
+    session = _session()
+    session.last_pair = _pair(19.3, 37.4, 1000.0)
+    session.record_measurement(11.03)
+
+    updated = session.set_measured_dose(0)
+
+    assert updated.dose == 0
+    assert updated.ext is None
+    assert updated.ratio is None
+
+
+def test_typing_a_dose_with_nothing_measured_does_nothing() -> None:
+    session = _session()
+    assert session.set_measured_dose(18.0) is None
     assert session.measurements == []
 
 

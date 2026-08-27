@@ -4,6 +4,8 @@ Only test_migration.py needs it — test_detector.py is a plain script over the 
 detector and runs without pytest or Home Assistant installed.
 """
 
+from unittest.mock import patch
+
 import pytest
 
 pytest_plugins = ["pytest_homeassistant_custom_component"]
@@ -13,6 +15,39 @@ pytest_plugins = ["pytest_homeassistant_custom_component"]
 def auto_enable_custom_integrations(enable_custom_integrations):
     """Let Home Assistant see custom_components/ at all."""
     yield
+
+
+@pytest.fixture(autouse=True)
+def no_bluez_mgmt_socket():
+    """Stop habluetooth from opening a real BlueZ management socket.
+
+    The harness already has an autouse `mock_bluetooth_adapters`, which patches
+    bluetooth_adapters into reporting an hci0 that is not there.  That used to be the
+    whole story; since habluetooth grew its own BlueZ channel, believing in hci0 is
+    exactly what makes it try to *talk* to it — MGMTBluetoothCtl.setup opens an
+    AF_BLUETOOTH socket, pytest-socket refuses, and setting up `bluetooth` fails.  Our
+    manifest depends on `bluetooth`, so every test that sets the integration up dies
+    there: four of them did, on any machine without a usable BlueZ mgmt socket, which
+    is every CI runner and most desks.
+
+    Patched to raise habluetooth's own BluetoothSocketError rather than to succeed,
+    because "the socket cannot be opened" is a state it already knows how to be in —
+    it is what a host with no adapter looks like from in there.  Faking a working
+    socket would be inventing a Bluetooth stack for the tests to talk to, and none of
+    these tests is about Bluetooth: they are about config-entry migration and which
+    entities get registered.
+
+    Narrow on purpose.  It patches one function, so anything else habluetooth does is
+    still live and a real failure in it still surfaces.
+    """
+    from habluetooth.channels import bluez
+
+    with patch.object(
+        bluez.btmgmt_socket,
+        "open",
+        side_effect=bluez.BluetoothSocketError("no BlueZ socket in tests"),
+    ):
+        yield
 
 
 #: What Home Assistant's own Bluetooth integration leaves behind on a host with no

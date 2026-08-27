@@ -495,34 +495,76 @@ class BrewSession:
     def set_measured_yield(self, yield_g: float) -> Optional[BrewMeasurement]:
         """Fill in, or correct, the yield of the brew that was measured last.
 
-        The manual half of the pour going missing.  It edits the stored point rather
-        than the brew: brew_count and the ground-coffee odometer count what the
-        detector actually saw, and a number typed in afterwards is not that — mixing
-        the two would make the odometer a total of two different things.
+        The manual half of the pour going missing: the BLE link on this install drops
+        for minutes at a time, and a shot pulled through one of those gaps has a dose
+        and a TDS but nothing that came out.
+        """
+        return self._amend_measurement("Measured Yield", yield_g, yield_g=yield_g)
 
-        Typing a yield before anything has been measured does nothing, deliberately.
-        There is no cup to attach it to yet, and remembering it for the next reading
-        would mean a figure typed an hour ago silently overriding a pour the scale did
-        see.
+    def set_measured_dose(self, dose: float) -> Optional[BrewMeasurement]:
+        """Fill in, or correct, the dose of the brew that was measured last.
+
+        The other half of set_measured_yield, and it exists for the opposite failure.
+        A yield goes missing when the scale is off the air; a dose goes *wrong* while
+        the scale is working perfectly.  current_brew anchors on last_dose, which is
+        whatever was last weighed in the dose range and deliberately not the pairer's
+        considered choice between candidates — so a portafilter set back on the scale
+        becomes the dose, as one did on 2026-08-17 when Last Dose read 19.3 g for a
+        shot that was ground at 18.0 g.  The reading is then arithmetically perfect
+        about the wrong quantity of beans, and every figure derived from it — the
+        ratio, the extraction, the dot's place on the control chart — is wrong with
+        it.  Correcting the dose is the only way to make that brew mean anything, and
+        it is a correction the refractometer cannot make for you.
+
+        Zero is accepted and is not a rejection: extraction() and ratio both treat a
+        falsy dose as "not computable" and return None, so typing 0 says the dose is
+        unknown rather than asserting the beans weighed nothing.
+        """
+        return self._amend_measurement("Measured Dose", dose, dose=dose)
+
+    def _amend_measurement(
+        self, what: str, value: float, **changes
+    ) -> Optional[BrewMeasurement]:
+        """Edit one field of the last measured brew and recompute what depends on it.
+
+        Shared by the two manual controls, because they are one operation on different
+        fields and the part that is easy to get wrong is the part they have in common:
+        `ext` is stored rather than derived at read time (see BrewMeasurement), so any
+        edit to a dose or a yield that does not recompute it leaves the point carrying
+        an extraction from the numbers it used to have.
+
+        It edits the stored point rather than the brew, deliberately.  brew_count and
+        the ground-coffee odometer count what the detector actually weighed, and a
+        number typed in afterwards is not that — mixing the two would make the odometer
+        a total of two different things.
+
+        Typing anything before a brew has been measured does nothing, also
+        deliberately.  There is no cup to attach it to yet, and remembering it for the
+        next reading would mean a figure typed an hour ago silently overriding what the
+        scale did see.
         """
         point = self.last_measurement
         if point is None:
             _LOGGER.warning(
-                "Measured Yield set to %.1f g with nothing measured yet; ignoring",
-                yield_g,
+                "%s set to %.1f g with nothing measured yet; ignoring", what, value
             )
             return None
 
+        merged = replace(point, **changes)
         updated = replace(
-            point,
-            yield_g=yield_g,
-            ext=BrewMeasurement.extraction(point.dose, yield_g, point.tds),
+            merged,
+            ext=BrewMeasurement.extraction(merged.dose, merged.yield_g, merged.tds),
         )
         self.measurements[-1] = updated
+        # Both figures are formatted rather than passed through %.1f: either can be
+        # None here — a dose amended on a brew whose pour was never seen still has no
+        # yield — and a crash in the logging call would take the amendment with it.
         _LOGGER.info(
-            "Measured Yield set by hand: %.1f g in, %.1f g out, TDS %.2f%%, "
-            "extraction %s",
-            updated.dose, yield_g, updated.tds,
+            "%s set by hand: %s g in, %s g out, TDS %.2f%%, extraction %s",
+            what,
+            "?" if not updated.dose else f"{updated.dose:.1f}",
+            "?" if updated.yield_g is None else f"{updated.yield_g:.1f}",
+            updated.tds,
             "unknown" if updated.ext is None else f"{updated.ext:.2f}%",
         )
         self._save()
