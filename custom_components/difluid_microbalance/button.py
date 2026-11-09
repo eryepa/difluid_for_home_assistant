@@ -19,18 +19,11 @@ from .const import (
 from .coordinator import DifluidMicrobalanceCoordinator
 from .coordinator_r2 import DifluidR2Coordinator
 
-# ── Microbalance commands ──────────────────────────────────────────────────────
-# DF DF 03 02 01 01  CS=C5  Power Button single click → Tare
 _CMD_TARE         = bytes.fromhex("dfdf03020101c5")
-# DF DF 03 02 01 00  CS=C4  DLink Button single click → Timer start / resume
 _CMD_TIMER_START  = bytes.fromhex("dfdf03020100c4")
-# DF DF 03 01 01 00  CS=C3  DLink Button press → Timer stop / pause
 _CMD_TIMER_STOP   = bytes.fromhex("dfdf03010100c3")
 
-# ── R2 commands ────────────────────────────────────────────────────────────────
-# DF DF 03 00 00  CS=C1  Single test
 _CMD_R2_TEST      = bytes.fromhex("dfdf030000c1")
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -76,9 +69,6 @@ async def async_setup_entry(
             ]
         )
 
-
-# ── base classes ───────────────────────────────────────────────────────────────
-
 class _MicrobalanceButton(CoordinatorEntity[DifluidMicrobalanceCoordinator], ButtonEntity):
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.CONFIG
@@ -94,7 +84,6 @@ class _MicrobalanceButton(CoordinatorEntity[DifluidMicrobalanceCoordinator], But
     def available(self) -> bool:
         client = self.coordinator._client
         return client is not None and client.is_connected
-
 
 class _R2Button(CoordinatorEntity[DifluidR2Coordinator], ButtonEntity):
     _attr_has_entity_name = True
@@ -112,9 +101,6 @@ class _R2Button(CoordinatorEntity[DifluidR2Coordinator], ButtonEntity):
         client = self.coordinator._client
         return client is not None and client.is_connected
 
-
-# ── Microbalance buttons ───────────────────────────────────────────────────────
-
 class TareButton(_MicrobalanceButton):
     def __init__(self, coordinator, entry, device_info):
         super().__init__(coordinator, entry, device_info, "tare", "Tare", "mdi:scale-balance")
@@ -122,14 +108,12 @@ class TareButton(_MicrobalanceButton):
     async def async_press(self) -> None:
         await self.coordinator.async_send_command(_CMD_TARE)
 
-
 class TimerStartStopButton(_MicrobalanceButton):
     def __init__(self, coordinator, entry, device_info):
         super().__init__(coordinator, entry, device_info, "timer_start", "Start/Stop", "mdi:timer-play-outline")
 
     async def async_press(self) -> None:
         await self.coordinator.async_send_command(_CMD_TIMER_START)
-
 
 class ResetPeriodButton(ButtonEntity):
     """Start a new statistics period — the trip-meter reset.
@@ -156,7 +140,6 @@ class ResetPeriodButton(ButtonEntity):
 
     def __init__(self, session: BrewSession, uid_prefix: str, device_info: DeviceInfo):
         self._session = session
-        # Same prefix rule as the brew sensors — see DifluidBrewSensor.__init__.
         self._attr_unique_id = f"{uid_prefix}_reset_period"
         self._attr_device_info = device_info
 
@@ -166,9 +149,6 @@ class ResetPeriodButton(ButtonEntity):
 
     async def async_press(self) -> None:
         self._session.reset_period()
-
-
-# ── R2 buttons ─────────────────────────────────────────────────────────────────
 
 class R2TestButton(_R2Button):
     def __init__(self, coordinator, entry, device_info):

@@ -1,18 +1,13 @@
 DOMAIN = "difluid_microbalance"
 
-# Microbalance
 SERVICE_UUID_MICROBALANCE = "000000ee-0000-1000-8000-00805f9b34fb"
 CHARACTERISTIC_UUID_MICROBALANCE = "0000ff01-0000-1000-8000-00805f9b34fb"
 
-# Microbalance Ti
 SERVICE_UUID_MICROBALANCE_TI = "000000dd-0000-1000-8000-00805f9b34fb"
 CHARACTERISTIC_UUID_MICROBALANCE_TI = "0000aa01-0000-1000-8000-00805f9b34fb"
 
-# R2 Extract
 SERVICE_UUID_R2 = "000000ff-0000-1000-8000-00805f9b34fb"
 R2_API_URL = "https://cloud-gateway-os.digitizefluid.com/system"
-# Public demo key from the DiFluid SDK demo repository (r2Detail.vue).
-# Used as the default when no key is provided.
 R2_DEFAULT_LICENSE_KEY = "b0b978c8d7fe4ac782767996f34a6ce1"
 
 CONF_IS_TI = "is_ti"
@@ -20,9 +15,6 @@ CONF_DEVICE_TYPE = "device_type"
 CONF_LICENSE_KEY = "license_key"
 CONF_MODEL = "model"
 
-# ── brew detector options ─────────────────────────────────────────────────────
-# The tunable threshold names live in brew_detect.TUNABLE_FIELDS, next to the
-# dataclass they map onto, so the two cannot drift apart.
 CONF_RECORD_DATASET = "record_dataset"
 
 DEVICE_TYPE_MICROBALANCE = "microbalance"
@@ -32,7 +24,6 @@ DEVICE_TYPE_R2 = "r2"
 #: derived from it.
 DEVICE_TYPE_DETECTOR = "detector"
 
-# ── detector entry data ───────────────────────────────────────────────────────
 #: entry_id of the scale whose weight stream this detector reads.  Required.
 CONF_SCALE_ENTRY = "scale_entry"
 #: entry_id of the R2 whose TDS this detector reads.  Optional — the pairing of a
@@ -76,9 +67,6 @@ CONF_DETECTOR_IMPORTED = "detector_imported"
 #: from scratch gets its own key.  See brew_session._DEFAULT_STORE_KEY.
 CONF_STORE_KEY = "store_key"
 
-# Device model identifiers sent to the DiFluid cloud during the encrypted
-# handshake. Newer firmware encrypts its BLE traffic (frames start with 0xDADA)
-# and only streams cleartext sensor data after a license-authenticated handshake.
 DEFAULT_MODEL_MICROBALANCE = "DFT-S101"
 DEFAULT_MODEL_MICROBALANCE_TI = "DFT-S102"
 DEFAULT_MODEL_R2 = "DFT-R102"
