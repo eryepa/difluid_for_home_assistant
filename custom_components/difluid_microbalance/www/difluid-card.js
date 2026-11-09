@@ -13,50 +13,22 @@
 
 const DOMAIN = "difluid_microbalance";
 
-// Display order for the sensor rows (matched as substrings of the entity_id).
 const SENSOR_ORDER = [
   "weight", "flow", "timer",
   "concentration", "refractive", "prism", "sample", "test_status",
   "status", "battery",
 ];
-// Display order for the control rows.  The two manual figures come last and read
-// dose before yield, the order the brew happened in — they are also the only two
-// controls here that change a stored number rather than poke the hardware.
 const CONTROL_ORDER = [
   "tare", "start", "test", "mode", "measured_dose", "measured_yield",
 ];
-// Control entities to hide from the card (still available on the device page).
 const EXCLUDE_CONTROLS = ["auto_disconnect", "auto_shutdown"];
 
-// The Statistics section, in display order: each quantity reads total -> period ->
-// per day, so a column of numbers can be scanned down rather than hunted through.
-//
-// These are entity_id *suffixes*, and they are not the `key` of the sensor
-// description they came from: entity_ids are built from the display name, so
-// key="coffee_total" name="Coffee Ground" produces `..._coffee_ground`.  Writing the
-// keys here is what put Coffee Ground and Coffee Ground (Period) in among the weight
-// and the flow rate — they matched nothing, and unmatched entities fall through to
-// the plain sensor list.
 const STATS_ORDER = [
   "brew_count", "brew_count_period", "brews_per_day",
   "coffee_ground", "coffee_ground_period", "coffee_per_day",
   "reset_period",
 ];
 
-// The working parts of the last shot.  Present but folded away: useful when a result
-// looks wrong, noise every other day.  On the device page these share the Diagnostic
-// card with the statistics above, because HA has nowhere else to put either; the split
-// between the two exists only here.
-//
-// Ordered as the brew reads: what the pairer decided went in and came out, the ratio
-// of the two, the refractometer's verdict on them, then the raw weighings the pairer
-// chose *from* — which is the pair to compare against when a ratio looks wrong.
-//
-// last_tds and extraction were missing from this list until 1.9.0-beta.4, and missing
-// from a list here does not mean "unplaced": unmatched entities fall through to the
-// plain sensor group, so the two of them sat in among the live weight and flow rate on
-// every card.  Both are EntityCategory.DIAGNOSTIC on the Python side, so the card and
-// the device page had been disagreeing about them since they were added.
 const DIAG_ORDER = [
   "brew_dose", "brew_yield", "brew_ratio",
   "last_tds", "extraction",
@@ -64,16 +36,6 @@ const DIAG_ORDER = [
   "integration_version",
 ];
 
-// The parts of a card, and the values `sections:` accepts.
-//
-//   live         what the device reads now, plus its buttons and inputs
-//   statistics   the odometers, trip meters and daily rates
-//   diagnostic   the working parts of the last shot
-//
-// A card that does not ask gets all three, which is what every config written before
-// 1.9.0-beta.4 means and what a single card of everything still is.  Asking for one
-// puts that group on a card of its own — the detector's statistics do not belong under
-// a heading naming the scale, and the diagnostics are worth a card you can leave open.
 const SECTIONS = ["live", "statistics", "diagnostic"];
 const SECTION_LABELS = {
   live: "Live",
@@ -81,18 +43,8 @@ const SECTION_LABELS = {
   diagnostic: "Diagnostic",
 };
 
-// ── pour curve ──────────────────────────────────────────────────────────────
-// Seconds of the hold to keep after the pour stops.  Enough to show the reading
-// settle, short enough to stay clear of what ends it — see pourWindow.
 const POUR_TAIL_SECONDS = 4;
-//: How far short of detected_at the window must always stop, however short the
-//: plateau was.  detected_at is the moment the weighing closed, i.e. the moment the
-//: cup was already coming off, and the samples at and just before it are the lift —
-//: this install's last brew reads -200.4, -142.7, 160.0, 685.4, 831.6 g there.  A
-//: fifth of a second is one notification at the scale's 5 Hz, which is the smallest
-//: gap that can exclude a sample at all.
 const POUR_TAIL_MARGIN_MS = 200;
-//: Seconds of flat line before the rise, so a pour does not start at the y-axis.
 const POUR_LEAD_SECONDS = 2;
 
 /**
@@ -123,15 +75,6 @@ const pourWindow = (attrs) => {
   const riseStart = pourEnd - riseSeconds * 1000;
   return {
     start: riseStart - POUR_LEAD_SECONDS * 1000,
-    // Bounded *below* detected_at, not merely by a tail no larger than the plateau.
-    //
-    // This read `pourEnd + Math.min(plateau, POUR_TAIL_SECONDS) * 1000`, and since
-    // pourEnd is `detected - plateau * 1000`, any plateau of POUR_TAIL_SECONDS or less
-    // cancels out to exactly `detected` — the instant this function exists to stay
-    // away from.  That is not a rare case: brew_detect's stable_seconds is 3.0 s and a
-    // cup lifted as soon as the pour stops never holds much longer, so pour plateaus
-    // cluster at 3–4 s and the guard was a no-op precisely when it was needed.  The
-    // fixture happens to use 9.8 s, which is why every assertion stayed green.
     end: Math.min(
       pourEnd + POUR_TAIL_SECONDS * 1000,
       detected - POUR_TAIL_MARGIN_MS,
@@ -162,8 +105,6 @@ const cleanSamples = (samples, expected) => {
   );
 };
 
-//: Horizontal gridlines, and therefore how many steps each vertical axis is cut into.
-//: Both axes share the lines, so both have to share the count.
 const AXIS_STEPS = 4;
 
 /**
@@ -190,29 +131,17 @@ const axisTo = (peak, steps = AXIS_STEPS, minStep = 0) => {
   return { step, max: step * steps };
 };
 
-//: Seconds between the vertical gridlines.  Ten, until a pour is long enough that ten
-//: would draw a fence — a filter brew runs for minutes.
 const timeStep = (xMax) => (xMax > 90 ? 30 : 10);
 
 /** An SVG path through points already mapped to chart coordinates. */
 const linePath = (pts) =>
   pts.length ? pts.map((p, i) => `${i ? "L" : "M"}${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join("") : "";
 
-// ── brewing control chart ───────────────────────────────────────────────────
-// TDS against extraction, with a diagonal per brew ratio.  The relationship the whole
-// chart rests on is EXT = TDS x yield / dose, so on these axes a ratio r is the line
-// TDS = EXT / r — which is why a brew always sits on its own ratio diagonal and TDS
-// alone decides where along it.
-//
-// Two frames, because espresso and filter do not share an axis: at 10% TDS a filter
-// frame has nothing on it, and at 1.3% an espresso frame has everything in the bottom
-// pixel.  Which one applies is decided by the coffee, not configured.
 const CONTROL_FRAMES = {
   espresso: { x0: 14, x1: 26, y0: 4, y1: 16, box: [18, 22, 8, 12], ratios: [1, 2, 3, 4, 5, 6] },
   filter:   { x0: 14, x1: 26, y0: 0.8, y1: 1.8, box: [18, 22, 1.15, 1.45], ratios: [12, 14, 16, 18, 20] },
 };
 
-//: Above this TDS the cup is an espresso.  Nothing sane lands between 1.8 and 4.
 const ESPRESSO_TDS = 3;
 
 /**
@@ -263,8 +192,6 @@ const ratioSegment = (ratio, frame) => {
   return { from, to };
 };
 
-// 18 rather than 18.0, and 37.4 rather than 37.40 — the numbers as a person writing a
-// brew down would write them.
 const trim1 = (v) => String(Math.round(v * 10) / 10);
 
 /**
@@ -279,16 +206,11 @@ const trim1 = (v) => String(Math.round(v * 10) / 10);
 const brewLabel = (p) => [
   Number.isFinite(p.dose) && Number.isFinite(p.yieldG)
     ? `${trim1(p.dose)} → ${trim1(p.yieldG)} g`
-    // The dose alone, when the scale saw the grind but not the pour.  Not "18 → 0 g".
     : Number.isFinite(p.dose) ? `${trim1(p.dose)} g` : null,
   Number.isFinite(p.ratio) ? `1:${p.ratio.toFixed(1)}` : null,
   Number.isFinite(p.seconds) ? `${Math.round(p.seconds)} s` : null,
 ].filter(Boolean).join(" · ");
 
-//: How far apart the pour card's two sources can be and still be the same brew.  They
-//: are two publications of one plateau — Last Yield's detected_at and Brew Ratio's
-//: paired_at — so they match exactly; the slack costs nothing and a mismatch here is
-//: read as "different brews", which is the safe direction.
 const SAME_POUR_SECONDS = 1;
 
 /**
@@ -322,10 +244,6 @@ const pourBrew = (ratioState, detectedAt, riseSeconds) => {
     : { seconds: riseSeconds };
 };
 
-//: How far apart two timestamps can be and still name the same brew.  They come from
-//: the same stored pair by two routes — the point copied it when it was written, the
-//: attribute reads it now — so they agree exactly today; the slack is here so that a
-//: rounding change on the Python side cannot silently turn every point stale.
 const SAME_BREW_SECONDS = 0.5;
 
 /**
@@ -371,8 +289,6 @@ const timeFormat = (hass) => {
   };
 };
 
-//: Which calendar day an instant falls on, in the same zone the time is rendered in —
-//: otherwise a "server" setting could print yesterday's time without its date.
 const dayKey = (d, lang, opts) =>
   d.toLocaleDateString(lang, {
     ...(opts.timeZone ? { timeZone: opts.timeZone } : {}),
@@ -449,14 +365,6 @@ const inList = (entityId, list) => {
   return list.some((key) => id.includes(key));
 };
 
-// Statistics match on the end of the entity_id rather than anywhere inside it, which
-// the other lists here can afford to do because none of their keys is a prefix of
-// another.  "brew_count" is a prefix of "brew_count_period" and "coffee_ground" of
-// "coffee_ground_period": under a substring match each pair collapses to a single
-// rank, the sort has nothing left to decide, and the row order falls back to
-// hass.entities iteration order — the order the entities were registered in.  That
-// happens to read correctly today, which is worse than reading wrongly: it would go
-// wrong the first time a fresh install registered them in another order.
 const statRank = (entityId) => {
   const id = idPart(entityId);
   for (let i = 0; i < STATS_ORDER.length; i++)
@@ -468,10 +376,6 @@ const isStat = (entityId) => statRank(entityId) >= 0;
 
 class DifluidCard extends HTMLElement {
   setConfig(config) {
-    // Thrown rather than ignored, and thrown here rather than at render time: a
-    // misspelled section that silently fell back to "everything" would look like the
-    // card ignoring the config, which is a much longer thing to debug than a card that
-    // refuses to load and says which word it did not recognise.
     const asked = config && config.sections;
     if (asked !== undefined) {
       if (!Array.isArray(asked) || !asked.length) {
@@ -489,7 +393,6 @@ class DifluidCard extends HTMLElement {
     this.innerHTML = "";
   }
 
-  //: The groups this card was asked for, defaulting to all of them.
   _sections() {
     return (this._config && this._config.sections) || SECTIONS;
   }
@@ -512,27 +415,12 @@ class DifluidCard extends HTMLElement {
     const ours = Object.values(hass.devices || {}).filter((d) =>
       (d.identifiers || []).some((ident) => ident[0] === DOMAIN)
     );
-    // Prefer a device nothing else hangs off: the scale, not the detector service
-    // device that hangs off it and not the R2, which is linked to neither.  Any of
-    // them resolves to the same cluster, but the scale is the one whose name reads
-    // like a heading.
     const parents = new Set(ours.map((d) => d.via_device_id).filter(Boolean));
     const dev = ours.find((d) => parents.has(d.id)) || ours[0];
     return { type: "custom:difluid-card", device: dev ? dev.id : "" };
   }
 
-  // ── entity resolution ─────────────────────────────────────────────────────
 
-  // The devices this card draws from: the configured one plus anything linked to it
-  // by via_device, followed in both directions.
-  //
-  // A card used to be one device's worth of rows, which stopped being true when the
-  // brew detector moved onto a service device of its own: the scale holds the weight
-  // and the flow rate, the detector holds every statistic, and a card showing one
-  // without the other is half a card.  Following the link in both directions means a
-  // config pointing at either device produces the same rows, so the configs people
-  // already have keep working — they point at the scale, which is where all of this
-  // used to live.
   _clusterIds() {
     const devices = this._hass.devices || {};
     const root = this._config.device;
@@ -540,9 +428,9 @@ class DifluidCard extends HTMLElement {
     const cluster = new Set([root]);
     for (const [id, dev] of Object.entries(devices)) {
       if (!isOurs(dev)) continue;
-      if (dev.via_device_id === root) cluster.add(id);          // children of root
+      if (dev.via_device_id === root) cluster.add(id);
       const rootDev = devices[root];
-      if (rootDev && rootDev.via_device_id === id) cluster.add(id);  // root's parent
+      if (rootDev && rootDev.via_device_id === id) cluster.add(id);
     }
     return cluster;
   }
@@ -563,26 +451,11 @@ class DifluidCard extends HTMLElement {
   _deviceName() {
     const devices = this._hass.devices || {};
     const own = devices[this._config.device];
-    // Name the card after the physical device when it shows live readings, even if it
-    // is configured on the detector: "Brew Detector" is a poor heading for a card whose
-    // first row is the live weight.
-    //
-    // Conditional rather than unconditional as it was before sections existed, because
-    // the reverse is just as true the other way round — a card of nothing but the
-    // detector's own statistics headed "Kitchen Microbalance 304268" names a device
-    // that contributed none of the rows under it.  A config that asks for no sections
-    // includes `live`, so its heading is unchanged.
     const climb = this._sections().includes("live");
     const dev = (climb && own && own.via_device_id && devices[own.via_device_id]) || own;
     return (dev && (dev.name_by_user || dev.name)) || "DiFluid";
   }
 
-  //: The card's heading when the config does not give one.
-  //
-  //: A card showing exactly one group names it, because two cards both headed "Brew
-  //: Detector" are two cards you have to read to tell apart.  `live` is the exception:
-  //: it is the device itself rather than one view of it, and "… · Live" would add a
-  //: word without adding a distinction.
   _defaultHeader() {
     const sections = this._sections();
     const only = sections.length === 1 ? sections[0] : null;
@@ -590,7 +463,6 @@ class DifluidCard extends HTMLElement {
     return this._deviceName() + suffix;
   }
 
-  // ── build (once) ──────────────────────────────────────────────────────────
   _build() {
     if (!this._hass || !this._config) return;
 
@@ -645,11 +517,6 @@ class DifluidCard extends HTMLElement {
     `;
     card.appendChild(style);
 
-    // Three groups, partitioned before anything is ranked: statistics and diagnostics
-    // are claimed first, and whatever is left is a live reading or a control.  Doing
-    // it in that order is what keeps a new entity from silently landing in the plain
-    // sensor list — the card enumerates every entity the device has, so anything not
-    // deliberately placed ends up in the middle of the weight and the flow rate.
     const ids = this._deviceEntities();
     const stats = ids
       .filter(isStat)
@@ -670,15 +537,7 @@ class DifluidCard extends HTMLElement {
 
     this._rows = [];
 
-    // The partition above always runs over every entity, whichever sections were
-    // asked for.  It has to: a group is claimed before it can be skipped, and doing it
-    // the other way round — partitioning only what a section wants — would put an
-    // unclaimed statistic into the live sensor list on a card configured for `live`,
-    // which is precisely the failure the three-way partition exists to prevent.
     const sections = this._sections();
-    // Exactly one group on this card, so its name is already in the header and the
-    // in-card heading would only repeat it.  It also decides whether the diagnostics
-    // fold away: a card whose entire contents are a closed <details> is a title bar.
     const solo = sections.length === 1;
 
     if (sections.includes("live")) {
@@ -721,10 +580,6 @@ class DifluidCard extends HTMLElement {
         ? "Select a DiFluid device in the card settings."
         : sections.length === SECTIONS.length
           ? "No entities found for this device."
-          // Distinguished from the above because the two have different fixes: this
-          // card found entities and none belonged to the group it was asked for, so
-          // the answer is a different device or a different section, not a broken
-          // integration.
           : `Nothing in ${sections.join(" or ")} for this device.`;
       body.appendChild(empty);
     }
@@ -784,10 +639,6 @@ class DifluidCard extends HTMLElement {
     if (domain === "button") {
       control = document.createElement("button");
       control.className = "df-btn value";
-      // Reset is the one button here that destroys something: Tare and Start/Stop are
-      // undone by pressing them again, while a period, once ended, cannot be restored
-      // — the odometers survive but the trip figures do not. It also sits in the same
-      // column as five sensor rows, so a mis-tap is a realistic way to lose a month.
       const isReset = idPart(id).includes("reset_period");
       control.textContent = isReset ? "Reset" : "Press";
       control.addEventListener("click", () => {
@@ -837,7 +688,6 @@ class DifluidCard extends HTMLElement {
     return row;
   }
 
-  // ── update (each hass change) ─────────────────────────────────────────────
   _update() {
     if (!this._built || !this._rows) return;
     const hass = this._hass;
@@ -850,10 +700,6 @@ class DifluidCard extends HTMLElement {
       if (iconName && r.icon.getAttribute("icon") !== iconName)
         r.icon.setAttribute("icon", iconName);
 
-      // Disable controls (and dim the row) when the entity is unavailable —
-      // e.g. the device is powered off / disconnected — mirroring the device page.
-      // Note: a button's normal "available" state is "unknown" (never pressed),
-      // so only "unavailable" means offline.
       const available = st.state !== "unavailable";
       if (r.kind !== "sensor" && r.control) {
         r.control.disabled = !available;
@@ -875,7 +721,7 @@ class DifluidCard extends HTMLElement {
   _formatState(st) {
     try {
       if (this._hass.formatEntityState) return this._hass.formatEntityState(st);
-    } catch (e) { /* fall through */ }
+    } catch (e) {}
     const unit = st.attributes.unit_of_measurement;
     return unit ? `${st.state} ${unit}` : st.state;
   }
@@ -889,7 +735,6 @@ class DifluidCard extends HTMLElement {
   }
 }
 
-// ── visual editor ────────────────────────────────────────────────────────────
 
 const EDITOR_LABELS = {
   device: "DiFluid device",
@@ -937,9 +782,6 @@ class DifluidCardEditor extends HTMLElement {
         },
       },
     ];
-    // Left absent rather than defaulted to all three, because ha-form writes back
-    // whatever it is given: seeding the box would turn every card that had never
-    // expressed an opinion into one that had, the moment its editor was opened.
     this._form.data = this._config;
   }
 }
@@ -961,8 +803,6 @@ class DifluidPourCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: "open" });
-    //: Live samples, newest last.  Cleared whenever the scale disconnects, so a
-    //: reconnect never draws a line across the gap between two different brews.
     this._live = [];
     this._history = null;
     this._fetchedFor = null;
@@ -1001,13 +841,12 @@ class DifluidPourCard extends HTMLElement {
       if (Number.isFinite(t) && Number.isFinite(v) && (!last || last.t !== t)) {
         const flow = Number((hass.states[ids.flow] || {}).state);
         this._live.push({ t, v, f: Number.isFinite(flow) ? flow : 0 });
-        // A pour is under a minute; anything older is a previous trip to the scale.
         const cutoff = t - 120000;
         while (this._live.length && this._live[0].t < cutoff) this._live.shift();
       }
     } else if (this._live.length) {
       this._live = [];
-      this._fetchedFor = null; // re-read the recorder: it now has the finished brew
+      this._fetchedFor = null;
     }
 
     this._maybeFetch(ids);
@@ -1055,13 +894,10 @@ class DifluidPourCard extends HTMLElement {
         entity_ids,
         minimal_response: true,
         no_attributes: true,
-        // The detector runs on every sample and so does this chart; the recorder's
-        // idea of a significant change would drop most of the rise.
         significant_changes_only: false,
       });
       this._history = { win, rows: res || {} };
     } catch (err) {
-      // Most likely the window has aged out of the recorder's retention.
       this._history = null;
       console.warn("difluid-pour-card: history fetch failed", err);
     } finally {
@@ -1070,8 +906,6 @@ class DifluidPourCard extends HTMLElement {
     }
   }
 
-  // The compressed history format uses `lu` (epoch seconds) and `s`; be tolerant of
-  // the uncompressed one too, since which arrives depends on the request flags.
   _rowsToSamples(rows) {
     return (rows || []).map((r) => ({
       t: Number.isFinite(r.lu)
@@ -1125,9 +959,6 @@ class DifluidPourCard extends HTMLElement {
 
     const secs = (s) => (s.t - series.t0) / 1000;
     const xMax = Math.max(1, ...series.weight.map(secs));
-    // Flow down the left, weight down the right — the two swapped sides in 1.9.0 and
-    // this line did not follow.  Only flow asks for whole numbers (minStep 1): tenths
-    // of a gram per second carry nothing a person reads off an axis.
     const wAxis = axisTo(Math.max(1, ...series.weight.map((s) => s.v)));
     const fAxis = axisTo(Math.max(0.5, ...series.flow.map((s) => s.v)), AXIS_STEPS, 1);
 
@@ -1144,8 +975,6 @@ class DifluidPourCard extends HTMLElement {
       ? `${linePath(wPts)}L${wPts[wPts.length - 1].x.toFixed(1)} ${(padT + innerH).toFixed(1)}L${wPts[0].x.toFixed(1)} ${(padT + innerH).toFixed(1)}Z`
       : "";
 
-    // Flow on the left, weight on the right.  One set of lines serves both, which is
-    // why the two axes are cut into the same number of steps.
     const gridY = [];
     for (let i = 0; i <= AXIS_STEPS; i++) {
       const y = padT + innerH - (i / AXIS_STEPS) * innerH;
@@ -1156,8 +985,6 @@ class DifluidPourCard extends HTMLElement {
       );
     }
 
-    // Vertical lines to match, so a point on the curve can be read off in both
-    // directions instead of only downwards.
     const secTicks = [];
     const step = timeStep(xMax);
     for (let s = 0; s <= xMax; s += step) {
@@ -1168,10 +995,6 @@ class DifluidPourCard extends HTMLElement {
       );
     }
 
-    // When the drawn pour happened.  Only for the recorded one — "Pouring" is now by
-    // definition, and the curve is moving while you read it.  Taken from the same
-    // detected_at the history window was fetched for, so the header cannot name one
-    // brew while the chart draws another.
     const detectedAt = ((this._hass.states[ids.lastYield] || {}).attributes || {})
       .detected_at;
 
@@ -1183,22 +1006,8 @@ class DifluidPourCard extends HTMLElement {
       ? `${last.v.toFixed(1)} g · ${secs(last).toFixed(0)} s`
       : brewLabel(brew) || `${last.v.toFixed(1)} g`;
 
-    // Where the pour actually ended.
-    //
-    // The curve runs on past it — deliberately, so the reading can be seen settling —
-    // and that is what makes the chart read wrong at a glance: the axis goes to 20 s
-    // while the brew took 17, and nothing says which of the two the caption means.
-    // So the end names itself, on both axes at once.
     const endAt = series.live ? null : series.riseSeconds;
     const endWeight = brew && Number.isFinite(brew.yieldG) ? brew.yieldG : last.v;
-    // Two independent readings, and deliberately no dot where they cross.
-    //
-    // The first version drew one, and it was a point that never happened: the vertical
-    // is where the pour stopped and the horizontal is what ended up in the cup, and
-    // those are 1.5 seconds apart.  On 2026-08-26 the scale read 36.5 g when the flow
-    // died and 37.2 g once the crema had gone down, so a dot at the crossing claimed
-    // "37.2 g at 17 s" about an instant at which there was 36.5 g.  Each line on its
-    // own is true; their intersection is not.
     const endMark = Number.isFinite(endAt) && endAt > 0 && endAt <= xMax
       ? (() => {
           const x = X(series.t0 + endAt * 1000), y = Yw(endWeight);
@@ -1311,7 +1120,6 @@ class DifluidControlCard extends HTMLElement {
     return null;
   }
 
-  //: When the detector last completed a brew, measured or not — see isCurrent.
   _lastBrewAt() {
     const id = this._extractionEntity();
     if (!id) return null;
@@ -1323,16 +1131,9 @@ class DifluidControlCard extends HTMLElement {
     const id = this._extractionEntity();
     if (!id) return [];
     const attrs = (this._hass.states[id] || {}).attributes || {};
-    // Positional, and the tail is optional: dose, yield and pour time were added in
-    // 1.7.0, and a point stored before that — or a pour whose start was never seen —
-    // simply has none.  Destructuring past the end gives undefined, which every
-    // consumer below already treats as "do not show it".
     return (attrs.points || [])
       .map(([at, ext, tds, ratio, dose, yieldG, seconds, measuredAt]) =>
         ({ at, ext, tds, ratio, dose, yieldG, seconds, measuredAt }))
-      // A reading with no TDS is not a reading.  A reading with no EXT is one whose
-      // pour the scale never saw: it is a real measurement and it is kept, but it
-      // cannot be placed on an extraction axis until somebody supplies the yield.
       .filter((p) => Number.isFinite(p.tds));
   }
 
@@ -1353,10 +1154,6 @@ class DifluidControlCard extends HTMLElement {
       return;
     }
 
-    // Measured, but with no yield there is no extraction and therefore no x for the
-    // dot.  Saying "nothing measured yet" here would be a lie about the one number
-    // the refractometer cannot produce again, so the card says what is missing and
-    // where to put it.
     const plottable = points.filter((p) => Number.isFinite(p.ext));
     if (!plottable.length) {
       const p = points[points.length - 1];
@@ -1380,8 +1177,6 @@ class DifluidControlCard extends HTMLElement {
     const X = (ext) => padL + ((ext - f.x0) / (f.x1 - f.x0)) * iW;
     const Y = (tds) => padT + iH - ((tds - f.y0) / (f.y1 - f.y0)) * iH;
 
-    // Grid + axis labels.  Whole numbers on EXT; TDS steps depend on the frame, since
-    // an espresso axis counts in percent and a filter one in tenths.
     const xStep = (f.x1 - f.x0) > 16 ? 2 : 1;
     const yStep = (f.y1 - f.y0) > 4 ? 1 : 0.1;
     const grid = [];
@@ -1410,14 +1205,9 @@ class DifluidControlCard extends HTMLElement {
     const box = `<rect class="ideal" x="${X(bx0)}" y="${Y(by1)}"
                        width="${X(bx1) - X(bx0)}" height="${Y(by0) - Y(by1)}"/>`;
 
-    // The newest brew that can be drawn, which is not always the newest measured —
-    // one still waiting for its yield stays off the chart until it has one.
     const p = plottable[plottable.length - 1];
     const current = isCurrent(p, this._lastBrewAt());
 
-    // Oldest faintest, so the drift is legible as a direction and not just a cloud.
-    // The newest keeps full opacity either way — it is still the last thing measured
-    // — but only wears the highlight while it is also the last thing brewed.
     const dots = plottable.map((q, i) => {
       const newest = i === plottable.length - 1;
       const lit = newest && current;
