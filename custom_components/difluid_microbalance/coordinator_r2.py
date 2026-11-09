@@ -26,34 +26,16 @@ _LOGGER = logging.getLogger(__name__)
 
 _HEADER = bytes([0xDF, 0xDF])
 _R2_SERVICE_UUID = "000000ff-0000-1000-8000-00805f9b34fb"
-_DIRECT_PROBE_TIMEOUT = 3.0  # seconds to wait for aa01 response before trying handshake
-
+_DIRECT_PROBE_TIMEOUT = 3.0
 
 def _build_cmd(func: int, cmd: int, data: bytes = b"") -> bytes:
     frame = bytes([func, cmd, len(data)]) + data
     full = _HEADER + frame
     return full + bytes([sum(full) & 0xFF])
 
-
 _CMD_GET_FIRMWARE = _build_cmd(0x00, 0x02)
 
-#: Device Action commands whose responses carry a reading, all packaged the same way:
-#: package 0 is the status, 1 the temperatures, 2 the concentration.
-#:
-#: 0x00 single test, 0x01 average test and 0x02 calibrate are in protocolR2.md.  0x03 is
-#: not, and leaving it out is why a test started on the device itself showed nothing in
-#: Home Assistant: the R2 answers a single-test command straight away only when the
-#: prism is already at the sample's temperature, and otherwise re-tests in a loop until
-#: it settles — status 7/8/9, "Loop Test Start/Ongoing/Finished" — over command 0x03.
-#: Pressing the button in Home Assistant on an already-warm prism took the first path
-#: and worked; putting a fresh sample on the prism took the second, and every packet of
-#: it was dropped here, so the reading only ever reached the device's own screen.
-#:
-#: Observed on 2026-08-26, e.g. `dfdf 03 03 07 02 044f 00021060 92` — package 2, TDS
-#: 11.03 %, RI 1.35264.  Bounded rather than open-ended because 0xFE and 0xFF are error
-#: codes in the same func, and an error is not a reading.
 _R2_TEST_COMMANDS = frozenset({0x00, 0x01, 0x02, 0x03})
-
 
 def _to_celsius(value: float, fahrenheit: bool) -> float:
     """The R2's temperature in Celsius, whichever unit it reported it in.
@@ -65,7 +47,6 @@ def _to_celsius(value: float, fahrenheit: bool) -> float:
     """
     return round((value - 32.0) * 5.0 / 9.0, 1) if fahrenheit else value
 
-
 @dataclass
 class R2Data:
     concentration: float = 0.0
@@ -76,7 +57,6 @@ class R2Data:
     test_status: str = "Unknown"
     authenticated: bool = False
 
-
 class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
 
     def __init__(
@@ -86,8 +66,8 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         self.address = address
         self.license_key = license_key or R2_DEFAULT_LICENSE_KEY
         self._client: Optional[BleakClientWithServiceCache] = None
-        self._uuid_encrypted: Optional[str] = None  # ff01
-        self._uuid_cleartext: Optional[str] = None  # aa01
+        self._uuid_encrypted: Optional[str] = None
+        self._uuid_cleartext: Optional[str] = None
         self._auth_response: Optional[asyncio.Future] = None
         self._direct_probe: Optional[asyncio.Future] = None
         self._reconnect_task: Optional[asyncio.Task] = None
@@ -101,9 +81,6 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         self.data = R2Data()
 
     async def async_start(self) -> None:
-        # PASSIVE — see the matching note in coordinator.py.  The R2's name is in
-        # its advertisement, so a scan response buys us nothing and active scanning
-        # would cost battery on every BLE sensor in the house.
         self._bt_cancel = bluetooth.async_register_callback(
             self.hass,
             self._on_bt_advertisement,
@@ -227,7 +204,6 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             for char in svc.characteristics:
                 _LOGGER.info("    Characteristic: %s  props=%s", char.uuid, char.properties)
 
-        # Locate the two R2 data channels by UUID suffix within the R2 service.
         r2_chars = [
             c
             for svc in client.services
@@ -255,10 +231,6 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
 
         self._client = client
 
-        # Subscribe to the cleartext channel and probe it directly.
-        # On some firmware the aa01 channel works without any cloud handshake,
-        # just like the Microbalance.  If GET_FIRMWARE gets a DF DF response
-        # within 3 s we skip the handshake entirely.
         await client.start_notify(self._uuid_cleartext, self._on_data_notification)
 
         loop = asyncio.get_event_loop()
@@ -290,7 +262,6 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         """3-step cloud handshake to unlock the R2 cleartext channel."""
         headers = {"Content-Type": "application/json", "license": self.license_key}
 
-        # Also subscribe to the encrypted channel to relay device responses.
         await client.start_notify(self._uuid_encrypted, self._on_auth_notification)
 
         try:
@@ -330,7 +301,6 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         self.async_set_updated_data(self.data)
         _LOGGER.info("R2 %s: handshake complete (SN=%s)", self.address, self._sn)
 
-        # Initial query on cleartext channel
         await client.write_gatt_char(self._uuid_cleartext, _CMD_GET_FIRMWARE, response=False)
 
         import time as _time
@@ -340,8 +310,6 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         self._shutdown_task = self.hass.async_create_background_task(
             self._auto_shutdown_loop(), name="difluid_r2_auto_shutdown"
         )
-
-    # ── server helpers ──────────────────────────────────────────────────────
 
     async def _srv_cmd_request(
         self,
@@ -401,8 +369,6 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
 
         return await asyncio.wait_for(self._auth_response, timeout=timeout)
 
-    # ── notification handlers ───────────────────────────────────────────────
-
     def _on_auth_notification(self, _sender: Any, raw: bytearray) -> None:
         if self._auth_response and not self._auth_response.done():
             self._auth_response.set_result(bytes(raw))
@@ -411,11 +377,9 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         _LOGGER.info("R2 notification: %s", bytes(raw).hex())
 
         if len(raw) >= 2 and raw[0] == 0xDA and raw[1] == 0xDA:
-            # Encrypted packet on the cleartext channel means handshake not done yet.
             _LOGGER.debug("R2: encrypted DA DA packet on aa01 — handshake required")
             return
 
-        # Resolve the direct-probe future on the first DF DF packet.
         if self._direct_probe and not self._direct_probe.done():
             if len(raw) >= 2 and raw[0] == 0xDF and raw[1] == 0xDF:
                 self._direct_probe.set_result(bytes(raw))
@@ -431,7 +395,6 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         updated = False
 
         if func == 0x00 and cmd == 0x02:
-            # Firmware version (string)
             try:
                 version = payload.decode("ascii", errors="replace").rstrip("\x00")
                 _LOGGER.info("R2 firmware version: %s", version)
@@ -448,31 +411,12 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             elif pkg_no == 0x01 and data_len >= 6:
                 prism_raw = int.from_bytes(payload[1:3], "big", signed=True)
                 sample_raw = int.from_bytes(payload[3:5], "big", signed=True)
-                # protocolR2.md: "Data5: Temperature Unit (0:℃,1:℉)".  The R2 reports in
-                # whatever its own display is set to, and that is a per-device setting
-                # nothing here controls.  Both temperature sensors declare Celsius, so
-                # the value has to *be* Celsius before it is stored — publishing 79.1
-                # from a °F device as 79.1 °C is a 53-degree error that goes straight
-                # into long-term statistics with nothing logged.
-                #
-                # Converted here rather than published in the device's own unit, to
-                # match what the scale already does with ounces: coordinator.py stores
-                # grams and keeps `weight_unit` for diagnostics only.  One canonical
-                # unit in the data means every consumer can do arithmetic without
-                # asking which one it got.
                 fahrenheit = payload[5] == 1
                 self.data.temperature_unit = "°F" if fahrenheit else "°C"
                 self.data.prism_temperature = _to_celsius(prism_raw / 10.0, fahrenheit)
                 self.data.sample_temperature = _to_celsius(sample_raw / 10.0, fahrenheit)
                 updated = True
 
-            # cmd 0x02 is Calibrate, and protocolR2.md is explicit that it answers in
-            # the single-test shape: "calibration success will respond with
-            # concentration result as 0".  Taking that as a reading overwrites the last
-            # real TDS with 0.00 — in the entity and in recorder history — for a packet
-            # that says the prism was just zeroed on distilled water.  The status
-            # package above is still read, so a calibration is still visible; only its
-            # result is not mistaken for coffee.
             elif pkg_no == 0x02 and data_len >= 7 and cmd != 0x02:
                 conc_raw = int.from_bytes(payload[1:3], "big", signed=True)
                 ri_raw = int.from_bytes(payload[3:7], "big", signed=True)
@@ -488,8 +432,6 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             import time as _time
             self._last_activity_time = _time.monotonic()
             self.async_set_updated_data(self.data)
-
-    # ── disconnect / reconnect ──────────────────────────────────────────────
 
     def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
         import time as _time

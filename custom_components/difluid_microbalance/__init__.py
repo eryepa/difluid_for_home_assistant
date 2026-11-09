@@ -41,36 +41,9 @@ from .coordinator_r2 import DifluidR2Coordinator
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.SENSOR, Platform.BUTTON, Platform.NUMBER, Platform.SELECT]
-#: No select: that one drives the scale's display mode over BLE, which the detector has
-#: no link for.  Number is here for Measured Yield, which touches nothing but the stored
-#: measurement.
 DETECTOR_PLATFORMS = [Platform.SENSOR, Platform.BUTTON, Platform.NUMBER]
 
-
-#: The two states a detector can be in when this scale finishes setting up, both of
-#: which mean it is not connected to the coordinator that now exists.
-#:
-#: SETUP_RETRY is the one this started as: a detector set up before its scale raises
-#: ConfigEntryNotReady, and Home Assistant answers with a retry on a backoff that grows
-#: to minutes.  Nothing is broken in the meantime, but nothing is being detected
-#: either, purely because of the order the two entries happened to be set up in.
-#:
-#: LOADED is the one that took three releases to notice, because everything about it
-#: looks healthy.  add_brew_consumer binds the session to the *coordinator object* that
-#: existed when the detector set up, and it is called exactly once, from the detector's
-#: own setup.  Reloading the scale throws that object away and builds another with an
-#: empty consumer list — so the scale reconnects, weight and flow stream perfectly, the
-#: detector still reads "Loaded" with every entity present, and BrewSession.feed is
-#: never called again.  Every dose and pour from that moment is invisible: brew_count
-#: freezes and nothing is logged at any level.  Hitting Reload on the scale entry after
-#: a BLE drop is the obvious thing to do on this install, and it silently turned the
-#: detector off until the next Home Assistant restart.
-#:
-#: A LOADED detector here is *always* stale, never a false positive: it can only have
-#: reached LOADED by finding a coordinator for this scale in hass.data, and the one
-#: sitting there now was put there moments ago by this very setup.
 _STALE_DETECTOR_STATES = (ConfigEntryState.SETUP_RETRY, ConfigEntryState.LOADED)
-
 
 def _async_wake_waiting_detectors(hass: HomeAssistant, scale_entry: ConfigEntry) -> None:
     """Reload any detector that is not attached to this scale's live coordinator.
@@ -104,14 +77,10 @@ def _async_wake_waiting_detectors(hass: HomeAssistant, scale_entry: ConfigEntry)
             )
             hass.config_entries.async_schedule_reload(other.entry_id)
 
-# Lovelace card bundled with the integration.  We serve the whole www/
-# directory (a directory static path is more reliable than a single-file one)
-# and auto-load the module so the card shows up in the "Add card" picker.
 _WWW_DIR = Path(__file__).parent / "www"
 _CARD_URL_BASE = f"/{DOMAIN}"
 _CARD_FILE_URL = f"{_CARD_URL_BASE}/difluid-card.js"
 _FRONTEND_KEY = f"{DOMAIN}_frontend_registered"
-
 
 async def _async_register_card(hass: HomeAssistant) -> None:
     """Serve the custom card and auto-load it so it shows in the card picker."""
@@ -119,21 +88,17 @@ async def _async_register_card(hass: HomeAssistant) -> None:
         return
     hass.data[_FRONTEND_KEY] = True
 
-    # Serve the www/ directory statically.  cache_headers=True lets the browser
-    # cache the module (busted by the ?v={version} query on version bump) — with
-    # no caching every load re-downloads and can lose the render race.
     try:
         from homeassistant.components.http import StaticPathConfig
 
         await hass.http.async_register_static_paths(
             [StaticPathConfig(_CARD_URL_BASE, str(_WWW_DIR), True)]
         )
-    except ImportError:  # older HA
+    except ImportError:
         hass.http.register_static_path(_CARD_URL_BASE, str(_WWW_DIR), True)
     except Exception as err:  # noqa: BLE001 - already registered / path issue
         _LOGGER.warning("Could not register DiFluid card static path: %s", err)
 
-    # Version string is used only for cache-busting the module URL.
     version = ""
     try:
         from homeassistant.loader import async_get_integration
@@ -145,17 +110,12 @@ async def _async_register_card(hass: HomeAssistant) -> None:
 
     url = f"{_CARD_FILE_URL}?v={version}"
 
-    # Primary: register as a Lovelace resource.  Resources are delivered to every
-    # client over the websocket on each dashboard load, so the module loads
-    # reliably everywhere — including cached/PWA frontends on phones, where
-    # add_extra_js_url() often never reaches the client.
     if await _async_register_lovelace_resource(hass, url):
         _LOGGER.info(
             "DiFluid dashboard card registered as Lovelace resource at %s", url
         )
         return
 
-    # Fallback (e.g. YAML-mode Lovelace where resources are read-only).
     try:
         from homeassistant.components.frontend import add_extra_js_url
 
@@ -165,7 +125,6 @@ async def _async_register_card(hass: HomeAssistant) -> None:
         )
     except Exception as err:  # noqa: BLE001
         _LOGGER.warning("Could not auto-load DiFluid card: %s", err)
-
 
 async def _async_register_lovelace_resource(hass: HomeAssistant, url: str) -> bool:
     """Register the card as a storage-mode Lovelace resource.
@@ -178,7 +137,6 @@ async def _async_register_lovelace_resource(hass: HomeAssistant, url: str) -> bo
         resources = getattr(lovelace, "resources", None)
         if resources is None and isinstance(lovelace, dict):
             resources = lovelace.get("resources")
-        # YAML-mode collection has no async_create_item -> not writable.
         if resources is None or not hasattr(resources, "async_create_item"):
             return False
 
@@ -200,7 +158,6 @@ async def _async_register_lovelace_resource(hass: HomeAssistant, url: str) -> bo
     except Exception as err:  # noqa: BLE001
         _LOGGER.debug("Lovelace resource registration failed: %s", err)
         return False
-
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await _async_register_card(hass)
@@ -229,7 +186,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             model=entry.data.get(CONF_MODEL) or default_model,
         )
 
-    # Register coordinator before forwarding platforms so entity setup can access it.
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -237,10 +193,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _async_wake_waiting_detectors(hass, entry)
         await _async_import_detector(hass, entry)
 
-    # async_start never raises — if device is off it silently waits for BLE advertisement.
     await coordinator.async_start()
     return True
-
 
 async def _async_setup_detector(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up a detector entry: a session fed by a scale that it does not own."""
@@ -249,9 +203,6 @@ async def _async_setup_detector(hass: HomeAssistant, entry: ConfigEntry) -> bool
     scale_entry_id = entry.data.get(CONF_SCALE_ENTRY)
     coordinator = hass.data.setdefault(DOMAIN, {}).get(scale_entry_id)
     if not isinstance(coordinator, DifluidMicrobalanceCoordinator):
-        # The scale is not set up yet — or at all.  Home Assistant retries on a
-        # backoff, and the scale reloads us the moment it finishes its own setup; see
-        # _async_wake_waiting_detectors for why the waking is done from that side.
         raise ConfigEntryNotReady(
             f"Waiting for the scale ({scale_entry_id}) this detector reads"
         )
@@ -265,30 +216,12 @@ async def _async_setup_detector(hass: HomeAssistant, entry: ConfigEntry) -> bool
     hass.data[DOMAIN][entry.entry_id] = session
     entry.async_on_unload(coordinator.add_brew_consumer(session))
     _async_watch_refractometer(hass, entry, session)
-    # Changing a threshold in the options flow reloads the entry, which rebuilds the
-    # detector with the new config.
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
 
     await hass.config_entries.async_forward_entry_setups(entry, DETECTOR_PLATFORMS)
     return True
 
-
-#: How long a finished test's own result is worth waiting for.
-#:
-#: The R2 answers a test in three packets in a fixed order — status, temperatures,
-#: concentration — and the last one trails the first.  Measured on 2026-08-26: 216 ms.
-#: So reading TDS at the instant the status says "Test Finished" reads what the
-#: *previous* test left in the entity, and that is what happened to the first shot this
-#: ever measured — 11.03 % recorded for a shot the R2 read as 11.04 %.  The error was
-#: invisible because the two shots were nearly identical; a calibration followed by an
-#: espresso would have recorded the distilled water.
-#:
-#: Three seconds is a wait, not a deadline: the moment the concentration arrives the
-#: wait ends.  It only runs out when the value did not change at all, which is a real
-#: outcome — two samples that read the same write no state change — and then the value
-#: already in the entity is the right one.
 _TDS_SETTLE_SECONDS = 3.0
-
 
 def _async_watch_refractometer(
     hass: HomeAssistant, entry: ConfigEntry, session
@@ -325,8 +258,6 @@ def _async_watch_refractometer(
         )
         return
 
-    # At most one entry, the pending timer's cancel callback.  A list because these are
-    # @callback closures and a list is the plainest thing they can all agree on.
     armed: list = []
 
     @callback
@@ -341,7 +272,6 @@ def _async_watch_refractometer(
         try:
             tds = float(state.state)
         except (TypeError, ValueError):
-            # unknown or unavailable: the R2 went off the air between the two packets.
             _LOGGER.debug("Refractometer finished a test but reported %s", state.state)
             return
         if tds <= 0:
@@ -351,8 +281,6 @@ def _async_watch_refractometer(
 
     @callback
     def _settled(_now) -> None:
-        # The timer that fired cannot be cancelled, so drop the handle rather than
-        # calling it.
         armed.clear()
         _record(hass.states.get(tds_id))
 
@@ -365,14 +293,6 @@ def _async_watch_refractometer(
         if old is not None and old.state == new.state:
             return
         if old is None or old.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            # Coming back from the dead, not finishing a test.  The R2 is a handheld
-            # that spends its life switched off, and its sensors go unavailable with
-            # it; the coordinator keeps the last reading in memory, so reconnecting
-            # republishes "Test Finished" with the TDS of whatever was measured last.
-            # Seen on 2026-08-26 10:02:45, where a reconnect re-recorded the 08:49
-            # reading — harmless only because no cup had been pulled in between.  With
-            # one that had, the rule that every reading belongs to the most recent brew
-            # would have pinned a stale number onto a brew nobody measured.
             _LOGGER.debug("Refractometer came back as %s; not a new test", new.state)
             return
         _disarm()
@@ -381,9 +301,6 @@ def _async_watch_refractometer(
     @callback
     def _reading(event) -> None:
         if not armed:
-            # A reading with no finished test behind it: the live value of a loop test
-            # still hunting for a stable temperature.  It belongs on the card, which
-            # reads the entity, and not in the record.
             return
         _disarm()
         _record(event.data.get("new_state"))
@@ -395,7 +312,6 @@ def _async_watch_refractometer(
         async_track_state_change_event(hass, [tds_id], _reading)
     )
     entry.async_on_unload(_disarm)
-
 
 def _async_seed_detector_identity(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Fix this detector's unique_id prefix and storage key, once and for good.
@@ -417,7 +333,6 @@ def _async_seed_detector_identity(hass: HomeAssistant, entry: ConfigEntry) -> No
         seeded[CONF_STORE_KEY] = f"{DEFAULT_STORE_KEY}.{entry.entry_id}"
     if seeded:
         hass.config_entries.async_update_entry(entry, data={**entry.data, **seeded})
-
 
 async def _async_import_detector(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Give a scale that has no detector one, once.
@@ -444,8 +359,6 @@ async def _async_import_detector(hass: HomeAssistant, entry: ConfigEntry) -> Non
         and other.data.get(CONF_SCALE_ENTRY) == entry.entry_id
         for other in hass.config_entries.async_entries(DOMAIN)
     ):
-        # Already has one — from a previous run, or added by hand.  Mark it so this
-        # never runs again for this scale.
         hass.config_entries.async_update_entry(
             entry, data={**entry.data, CONF_DETECTOR_IMPORTED: True}
         )
@@ -466,15 +379,8 @@ async def _async_import_detector(hass: HomeAssistant, entry: ConfigEntry) -> Non
     flow_data = {
         CONF_SCALE_ENTRY: entry.entry_id,
         CONF_R2_ENTRY: r2,
-        # Whatever was tuned through the old options form, if anything.  Left in place
-        # on the scale rather than cleared: it is dead weight there now, but if this
-        # migration ever goes wrong again the thresholds are still written down
-        # somewhere, and the options flow refuses to open on a scale entry anyway.
         "options": dict(entry.options),
     }
-    # Not awaited: creating an entry sets it up, and that setup reaches back into
-    # hass.data for this scale's coordinator.  Starting it as its own task keeps the
-    # scale's setup from waiting on an entry that is waiting on the scale.
     hass.async_create_task(
         hass.config_entries.flow.async_init(
             DOMAIN, context={"source": SOURCE_IMPORT}, data=flow_data
@@ -484,10 +390,8 @@ async def _async_import_detector(hass: HomeAssistant, entry: ConfigEntry) -> Non
         entry, data={**entry.data, CONF_DETECTOR_IMPORTED: True}
     )
 
-
 async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     await hass.config_entries.async_reload(entry.entry_id)
-
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Tear down one entry.
@@ -507,12 +411,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if held is None:
             return unload_ok
         if is_detector:
-            # The weight-stream subscription is already gone via async_on_unload.
             await held.async_flush()
         else:
             await held.async_stop()
     return unload_ok
-
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Forget a detector's stored state when its entry is deleted.
