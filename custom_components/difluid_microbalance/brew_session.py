@@ -44,31 +44,16 @@ EVENT_PLATEAU_DETECTED = f"{DOMAIN}_plateau_detected"
 
 _STORE_VERSION = 1
 
-#: Where the one and only session stored itself back when there was one and only
-#: session.  A detector entry created by importing an existing install keeps this
-#: key, which is the whole reason brew_count and the last pair survive the move to
-#: a config entry of their own; a detector created from scratch gets a key derived
-#: from its entry_id.  Either way the key is decided once, at entry creation, and
-#: stored in entry.data as CONF_STORE_KEY — see const.py.
 DEFAULT_STORE_KEY = f"{DOMAIN}.brew"
-_SAVE_DELAY = 5  # seconds; the scale streams fast, no need to hit disk per event
+_SAVE_DELAY = 5
 
 DATASET_FILENAME = "difluid_brew_dataset.jsonl"
-# Raw window kept per plateau for later analysis.  A brew window is ~120 samples of
-# two floats, so this is negligible even after months of daily use.
 _DATASET_WINDOW_SECONDS = 180.0
 _DATASET_MAX_SAMPLES = 400
 
-
-#: How close two timestamps have to be to be talking about the same dose.
-#: See BrewSession._complete_measurement for why this is a window and not equality.
 _SAME_DOSE_SECONDS = 1.0
 
-
-#: How many measured brews to keep.  One point per refractometer reading, and nobody
-#: measures every shot, so this is months of them; the chart plots the tail of it.
 MAX_MEASUREMENTS = 50
-
 
 @dataclass
 class BrewMeasurement:
@@ -84,32 +69,12 @@ class BrewMeasurement:
     was true then, rather than the number this version's formula would produce today.
     """
 
-    #: When the brew this belongs to happened; also the identity of the point, so a
-    #: second reading of the same brew replaces the first instead of adding a twin.
-    #: The pour's time when there is a pour, the dose's when there is not.
     at: float
     dose: float
-    #: What came out, or ``None`` when the scale never saw it.
-    #:
-    #: Optional because the pour is the half of a brew most easily lost: the BLE link
-    #: on this install drops for minutes at a time, and on 2026-08-26 it died 25
-    #: seconds after the dose was weighed and stayed down through the shot.  The dose
-    #: and the refractometer reading both survived that; only the pour did not, and
-    #: refusing to record the other two would have thrown away the one number the R2
-    #: cannot produce again.  Filled in by hand afterwards through the Measured Yield
-    #: control — see BrewSession.set_measured_yield.
     yield_g: Optional[float]
     tds: float
-    #: Extraction percentage: TDS × yield / dose.  The same figure the DiFluid app
-    #: plots, and the one its ratio diagonals are drawn for — a 1:2 line is TDS = EXT/2.
-    #: ``None`` whenever the yield is: it is not computable, and 0.0 would plot the
-    #: brew at the far left of the chart as if it had extracted nothing.
     ext: Optional[float]
     measured_at: float
-    #: How long the pour took, or ``None`` when it was not observed — BrewPair.
-    #: pour_seconds, copied for the same reason `ext` is: a point plotted a month from
-    #: now should carry the brew it was, not whatever the session holds today.
-    #: Defaulted so that a measurement stored by an earlier version still loads.
     seconds: Optional[float] = None
 
     @property
@@ -137,7 +102,6 @@ class BrewMeasurement:
             seconds=brew.pour_seconds,
         )
 
-
 @dataclass(frozen=True)
 class BrewAnchor:
     """The brew a reading taken right now belongs to.
@@ -152,42 +116,12 @@ class BrewAnchor:
     yield_g: Optional[float]
     pour_seconds: Optional[float]
 
-
 @dataclass
 class WeighEvent:
     value: float
-    #: When the load came off the scale, as a POSIX wall-clock timestamp — *not* the
-    #: detector's own clock, which is monotonic and means nothing outside this
-    #: process.  See the "clocks" section of BrewSession for why the two exist and
-    #: where the conversion happens.
     at: float
     hold_seconds: float
-    #: How long the load took to arrive, or ``None`` when that was never observed.
-    #:
-    #: Three-state on purpose, and ``None`` is not a missing ``0.0``.  A rise of 0.0
-    #: is a positive observation — the scale was seen empty and the load was there in
-    #: the very next sample, so it came out of a container and was set down.  ``None``
-    #: says the detector never saw the scale empty before this weighing and therefore
-    #: knows nothing at all about how the load got there: it was already sitting on
-    #: the scale after an HA restart mid-session, after a BLE reconnect, or after a
-    #: gap in the stream reset the detector.
-    #:
-    #: The two are opposite findings and BrewPairer.offer reads the difference as
-    #: evidence for which candidate is the real dose.  Collapsing ``None`` to 0.0 is
-    #: what silently reverted that rule to the hold-time heuristic and let a
-    #: portafilter set back on the scale beat the beans on 2026-08-17.  See
-    #: brew_detect.Plateau.rise_seconds and brew_detect._arrival_rank.
-    #:
-    #: Survives Store unchanged: ``asdict`` yields None, ``json`` writes ``null``, and
-    #: _restore hands None straight back to this field.  Defaulted for the same reason
-    #: ``steps`` is — state written by an earlier version still loads — and here the
-    #: default is also the honest answer, since a stored record that carries no rise
-    #: is exactly one whose rise is unknown.
     rise_seconds: Optional[float] = None
-    #: Every stable reading of this weighing; more than one means it was topped up
-    #: or was still settling.  Kept so a surprising value can be explained after the
-    #: fact without digging through recorder history.  Defaulted so that state
-    #: stored by an earlier version still loads.
     steps: list = field(default_factory=list)
 
     @classmethod
@@ -204,16 +138,9 @@ class WeighEvent:
             value=round(plateau.value, 2),
             at=plateau.t_end,
             hold_seconds=round(plateau.duration, 1),
-            # None stays None.  round() raises on it, which is the immediate bug, but
-            # substituting 0.0 to avoid that would be worse than the crash: it would
-            # publish "set down in one go" as the arrival of a load nobody watched
-            # arrive, which is the claim the 2026-08-17 wrong ratio was built on.
-            # sensor.py already publishes the attribute as null, so nothing downstream
-            # needs a number here.
             rise_seconds=None if rise is None else round(rise, 1),
             steps=list(plateau.steps),
         )
-
 
 class BrewSession:
     """Detects dose/pour plateaus on the weight stream and remembers the last pair."""
@@ -232,70 +159,27 @@ class BrewSession:
         self._listeners: list = []
         self._recent: list[Sample] = []
         self.record_dataset = False
-        #: Wall clock minus detector clock, maintained by _sync_clock.  Seeded here
-        #: so that a flush triggered before any sample has been fed still converts,
-        #: rather than depending on feed() having run at least once.
         self._clock_offset: float = time.time() - time.monotonic()
 
         self.last_dose: Optional[WeighEvent] = None
         self.last_yield: Optional[WeighEvent] = None
         self.last_pair: Optional[BrewPair] = None
-        # Monotonic count of completed pairs.  Exists to give alerting something
-        # unambiguous to trigger on: "the ratio changed" misses two shots in a row
-        # that happen to land on the same ratio, and "the yield changed" fires for
-        # anything at all put on the scale — it emailed about a bowl of porridge.
         self.brew_count: int = 0
-        # Odometer + trip meter.  brew_count stays the sole owner of the brew count;
-        # see BrewTotals for why the trip figures are derived rather than counted.
         self.totals = BrewTotals()
-        #: Brews that were measured on the refractometer, oldest first.
         self.measurements: list[BrewMeasurement] = []
-
-    # ── lifecycle ────────────────────────────────────────────────────────────
 
     async def async_load(self) -> None:
         data = await self._store.async_load()
         if not data:
-            # Nothing stored: this is a first install, so the period starts now rather
-            # than at the epoch.  Done here as well as below so that the two paths
-            # cannot disagree about what an unstarted period means.
             self.totals.period_started = time.time()
             return
-        # Every stored field is restored independently, and that is the whole point
-        # of the four calls below rather than one try block around all of them.
-        #
-        # They used to share a block, in the order last_dose, last_yield, last_pair,
-        # brew_count.  A stored dict that no longer matches its dataclass raises
-        # TypeError — one field added to BrewPair in a future version is enough —
-        # and the handler then skipped everything after it, so a stale last_pair
-        # took brew_count down with it and it came back as 0.  brew_count feeds a
-        # TOTAL_INCREASING sensor: Home Assistant reads a drop to zero as a counter
-        # reset, writes that into long-term statistics, and nothing afterwards can
-        # undo it.  Losing a last_pair is cosmetic and self-healing — the next shot
-        # replaces it — while losing the count is permanent, so the field with the
-        # worst failure must not depend on the field most likely to fail.
         self.last_dose = self._restore(WeighEvent, data, "last_dose")
         self.last_yield = self._restore(WeighEvent, data, "last_yield")
         self.last_pair = self._restore(BrewPair, data, "last_pair")
         self.brew_count = self._restore_count(data)
-        # Its own call for the same reason as brew_count's, and field-by-field rather
-        # than through _restore: the odometer of ground coffee cannot be rebuilt from
-        # anything else.  last_dose and last_pair are replaced by the next shot, so
-        # dropping one of those wholesale on a TypeError is cheap; dropping the
-        # odometer is permanent, and one field added to BrewTotals in a later version
-        # would be enough to do it.  _restore_totals keeps whatever it recognises.
         self.totals = self._restore_totals(data)
-        # Per-record rather than all-or-nothing, and for the same reason the fields
-        # above are restored separately: these are the only copy.  A refractometer
-        # reading cannot be recovered from anywhere else — the R2 keeps its own log,
-        # but nothing here can re-associate it with the brew it belonged to — so one
-        # record written by a future version must not discard the months before it.
         self.measurements = self._restore_measurements(data)
         if not self.totals.period_started:
-            # Either a first run, or state written before this field existed.  Starting
-            # the period now is the only defensible reading: the alternative — leaving
-            # it at 0.0 — makes elapsed_days ~20000 and publishes a daily average of
-            # zero indefinitely, which looks like a working sensor reporting no coffee.
             self.totals.period_started = time.time()
 
     @staticmethod
@@ -403,10 +287,6 @@ class BrewSession:
         self.last_yield = None
         self.last_pair = None
         self.brew_count = 0
-        # A fresh period rather than BrewTotals(): this only runs when the config entry
-        # is deleted, and the next install must not inherit a period that started
-        # before it existed.  async_load reseeds it too, but only when there is no
-        # stored state to load — and there is none precisely because of the line below.
         self.totals = BrewTotals(period_started=time.time())
         self.measurements = []
         await self._store.async_remove()
@@ -477,8 +357,6 @@ class BrewSession:
             self.measurements.sort(key=lambda m: m.at)
             del self.measurements[:-MAX_MEASUREMENTS]
 
-        # Formatted rather than passed through %.1f because either can be None, and a
-        # crash in the logging call would take the measurement down with it.
         _LOGGER.info(
             "Brew measured: %.1f g in, %s g out, TDS %.2f%%, extraction %s (%s)",
             point.dose,
@@ -556,9 +434,6 @@ class BrewSession:
             ext=BrewMeasurement.extraction(merged.dose, merged.yield_g, merged.tds),
         )
         self.measurements[-1] = updated
-        # Both figures are formatted rather than passed through %.1f: either can be
-        # None here — a dose amended on a brew whose pour was never seen still has no
-        # yield — and a crash in the logging call would take the amendment with it.
         _LOGGER.info(
             "%s set by hand: %s g in, %s g out, TDS %.2f%%, extraction %s",
             what,
@@ -639,17 +514,6 @@ class BrewSession:
                 "unknown" if self.measurements[i].ext is None
                 else f"{self.measurements[i].ext:.2f}%",
             )
-            # The point just moved from its dose's time to its pour's, minutes later,
-            # so it may no longer be in the right place.  Everything downstream reads
-            # this list positionally — last_measurement is [-1], _amend_measurement
-            # writes to [-1], and the card takes the last plottable point as the newest
-            # dot — so an unsorted list does not degrade gracefully, it reports a
-            # different cup.  record_measurement sorts on every append and
-            # _restore_measurements sorts on load for the same reason; this was the
-            # one path that moved an `at` and did not.
-            #
-            # Sorting rather than re-inserting: the list is at most MAX_MEASUREMENTS
-            # long and already nearly ordered, and this runs once per brew.
             self.measurements.sort(key=lambda m: m.at)
             return
 
@@ -699,41 +563,6 @@ class BrewSession:
             _LOGGER.exception("Failed to flush plateau on reset")
         self._detector.reset()
         self._recent.clear()
-
-    # ── clocks ───────────────────────────────────────────────────────────────
-    #
-    # There are two of them here on purpose, and this must not be "simplified" back
-    # into one.  They answer different questions and neither can do the other's job.
-    #
-    # The detector needs a clock that only ever moves forward, at one second per
-    # second.  Every rule in brew_detect is written as elapsed time — the trailing
-    # stability window, the hold thresholds, the gap reset — and _trim_window drops
-    # samples older than ``now - stable_seconds``.  Feed it a ``now`` that steps
-    # *backwards* and the cutoff steps back with it, so nothing is ever popped and
-    # the window grows without bound.  That is not hypothetical: this ran on
-    # time.time(), and an NTP correction of -600 s — routine on a Raspberry Pi that
-    # has just come back from a power cut, which is what this box is — took the
-    # window from 16 samples to 317 over sixty seconds of stream and it was still
-    # climbing.  _time_within_tol is O(window) per sample at 5 Hz, so the cost grows
-    # quadratically for as long as the wall clock takes to catch up.  A *forward*
-    # jump was always handled correctly, because it looks like a long hole in the
-    # stream and trips the gap-reset path — which is the other half of the argument:
-    # that reset is only meaningful if a gap in ``t`` is real elapsed time, and
-    # wall-clock deltas are not.
-    #
-    # But the timestamps that come back out of the detector are read by people.
-    # BrewPair.dose_at / yield_at and WeighEvent.at become entity attributes that
-    # sensor.py renders as ISO timestamps on the dashboard and in the notification
-    # email, and all three are written through Store, where they have to still name
-    # the same instant in the next process.  time.monotonic() counts from an
-    # arbitrary epoch — uptime, on Linux — that changes at every reboot, so a
-    # monotonic timestamp is meaningless the moment it leaves this process, and a
-    # persisted one is actively wrong.
-    #
-    # So: monotonic goes in, wall clock comes out, and the offset between the two is
-    # the only thing that has to be carried.  Nothing monotonic is ever persisted or
-    # handed to a consumer — see _to_wall_clock, which is the single place the two
-    # meet.
 
     def _sync_clock(self) -> float:
         """Read the detector's clock, re-measuring its offset from the wall clock.
@@ -787,8 +616,6 @@ class BrewSession:
             t_end=self._to_wall_clock(plateau.t_end),
         )
 
-    # ── the hot path ─────────────────────────────────────────────────────────
-
     def feed(self, weight: float, flow: float) -> None:
         """Called from the BLE notification handler, ~5 times per second.
 
@@ -796,9 +623,6 @@ class BrewSession:
         updates for the whole device.
         """
         try:
-            # _sync_clock, not time.time(): brew_detect.Sample documents ``t`` as
-            # "seconds, monotonic within a session" and means it.  See the clocks
-            # section above for what a backwards wall-clock step did to the window.
             sample = Sample(t=self._sync_clock(), weight=weight, flow=flow)
             if self.record_dataset:
                 self._remember(sample)
@@ -817,12 +641,6 @@ class BrewSession:
             del self._recent[: len(self._recent) - _DATASET_MAX_SAMPLES]
 
     def _on_plateau(self, plateau: Plateau) -> None:
-        # `plateau` arrives on the detector's monotonic clock and the pairer has to
-        # see it that way: BrewPairer.offer measures this weighing's t_start from the
-        # pending dose's t_end and checks it against pair_window_seconds, and both
-        # sides must be on one clock.  So offer the original first and convert only
-        # what comes back out — from here down everything is wall-clock and is on its
-        # way out of the session.
         kind, pair = self._pairer.offer(plateau)
         reported = self._plateau_to_wall_clock(plateau)
         if pair is not None:
@@ -838,12 +656,6 @@ class BrewSession:
         elif kind == "yield":
             self.last_yield = event
 
-        # "unknown", not 0.0 and not the empty string: the whole point of the three
-        # states is that somebody reading this line can tell a load that was set down
-        # in a single sample (rise 0.0 s) from one whose arrival was never observed,
-        # and %.1f can express only the first of those — it raises on the second.
-        # Formatted eagerly rather than passed lazily because this runs once per
-        # weighing, not once per sample.
         rise = plateau.rise_seconds
         rise_text = "unknown" if rise is None else f"{rise:.1f} s"
         _LOGGER.info(
@@ -858,11 +670,6 @@ class BrewSession:
             self.last_pair = pair
             self._complete_measurement(pair)
             self.brew_count += 1
-            # Only paired doses count towards the odometer, so it and brew_count always
-            # describe the same population and total_dose_g / brew_count is the average
-            # dose.  A dose with no pour after it is an aborted brew or a misdetection;
-            # either way no cup came of it, and adding it would make the two disagree
-            # by an amount nothing records.
             self.totals.add(pair.dose)
             _LOGGER.info(
                 "Brew pair: dose %.1f g -> yield %.1f g (1:%.2f)",
@@ -881,36 +688,11 @@ class BrewSession:
             )
 
         if self.record_dataset:
-            # Snapshot the window here, on the event loop, and hand the copy to the
-            # writer.  _recent is appended to and pop(0)'d from by _remember on every
-            # sample, i.e. five times a second, and the writer used to iterate the
-            # live list from an executor thread.  CPython will not crash on that, but
-            # a list that shifts under a comprehension silently skips or truncates
-            # elements — so the recorded window could come back missing exactly the
-            # samples around the plateau it exists to document, and nothing would
-            # indicate the file was short.
-            #
-            # Filtering here too keeps the copy to the ~70 s that gets written rather
-            # than the full 180 s buffer.
-            #
-            # The filter compares the *unconverted* plateau against the samples'
-            # own timestamps, because both are on the detector's monotonic clock;
-            # `reported` must not be used here, as mixing the two clocks in one
-            # comparison is a difference of decades and would select nothing.  The
-            # timestamps that get written out are converted, because the file exists
-            # to be read next to recorder history and the log, and those are
-            # wall-clock — a monotonic column could not be lined up against either,
-            # and every line already in an existing file is wall-clock.
             window = [
                 [round(self._to_wall_clock(s.t), 3), s.weight, s.flow]
                 for s in self._recent
                 if plateau.t_start - 60.0 <= s.t <= plateau.t_end + 10.0
             ]
-            # async_create_task, not a bare async_add_executor_job whose future is
-            # dropped on the floor: Home Assistant waits for tracked tasks while
-            # shutting down, so a stop that lands mid-write still gets the row out.
-            # Not async_create_background_task — those are cancelled at shutdown,
-            # which is the case this is meant to survive.
             self.hass.async_create_task(
                 self.hass.async_add_executor_job(
                     self._append_dataset, kind, reported, window
@@ -921,8 +703,6 @@ class BrewSession:
         self._save()
         for callback in list(self._listeners):
             callback()
-
-    # ── persistence ──────────────────────────────────────────────────────────
 
     def _save(self) -> None:
         self._store.async_delay_save(self._snapshot, _SAVE_DELAY)
@@ -979,12 +759,6 @@ class BrewSession:
             "hold_seconds": round(plateau.duration, 2),
             "final_hold_seconds": round(plateau.final_hold_seconds, 2),
             "steps": list(plateau.steps),
-            # ``null``, not 0, when the arrival was never observed.  This is analysis
-            # data and the two are different findings — a row claiming a rise of zero
-            # is a row claiming the load was set down out of a container, which is the
-            # single feature that separates a dose from a portafilter.  Writing 0 here
-            # would put that lie into every offline study of the file, including the
-            # ones used to tune dose_min_rise_seconds itself.
             "rise_seconds": None if rise is None else round(rise, 2),
             "peak_flow": round(plateau.peak_flow, 2),
             "window": window,
@@ -994,7 +768,6 @@ class BrewSession:
                 fh.write(json.dumps(record) + "\n")
         except Exception as err:  # noqa: BLE001 - dataset capture is best-effort
             _LOGGER.warning("Could not append brew dataset to %s: %s", path, err)
-
 
 def detector_device_info(entry) -> "DeviceInfo":
     """The device a detector entry's entities belong to.
@@ -1022,7 +795,6 @@ def detector_device_info(entry) -> "DeviceInfo":
         entry_type=DeviceEntryType.SERVICE,
         via_device=(DOMAIN, entry.data[CONF_SCALE_ENTRY]),
     )
-
 
 async def async_create_session(
     hass: HomeAssistant, config: DetectorConfig, record_dataset: bool, store_key: str
