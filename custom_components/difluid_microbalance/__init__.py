@@ -223,6 +223,46 @@ async def _async_setup_detector(hass: HomeAssistant, entry: ConfigEntry) -> bool
 
 _TDS_SETTLE_SECONDS = 3.0
 
+def _refractometer_entities(
+    hass: HomeAssistant, r2_entry_id: str
+) -> tuple[str | None, str | None]:
+    """The R2's own status and concentration entities, by unique_id suffix.
+
+    Resolved from the registry rather than from the coordinator so that a detector
+    can be set up before the R2 has ever been seen.
+    """
+    status_id = tds_id = None
+    for item in er.async_entries_for_config_entry(er.async_get(hass), r2_entry_id):
+        if item.unique_id.endswith("_test_status"):
+            status_id = item.entity_id
+        elif item.unique_id.endswith("_concentration"):
+            tds_id = item.entity_id
+    return status_id, tds_id
+
+
+def _is_finished_test(event) -> bool:
+    """Did this state change mean a test just finished, rather than something else?
+
+    Three ways it does not mean that, and each cost a real defect to learn:
+
+    - the state is not a finished one at all, so this is a test starting;
+    - the finished state was republished unchanged, which writes no meaningful event;
+    - the entity was unavailable or unknown and has come back — the R2 is a handheld
+      whose sensors go dark when it is switched off, and the coordinator keeps the
+      last reading, so a reconnect republishes "Test Finished" with a stale TDS.
+    """
+    new = event.data.get("new_state")
+    if new is None or new.state not in R2_SAMPLE_FINISHED:
+        return False
+    old = event.data.get("old_state")
+    if old is not None and old.state == new.state:
+        return False
+    if old is None or old.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+        _LOGGER.debug("Refractometer came back as %s; not a new test", new.state)
+        return False
+    return True
+
+
 def _async_watch_refractometer(
     hass: HomeAssistant, entry: ConfigEntry, session
 ) -> None:
@@ -243,13 +283,7 @@ def _async_watch_refractometer(
     if not r2_entry_id:
         return
 
-    registry = er.async_get(hass)
-    status_id = tds_id = None
-    for item in er.async_entries_for_config_entry(registry, r2_entry_id):
-        if item.unique_id.endswith("_test_status"):
-            status_id = item.entity_id
-        elif item.unique_id.endswith("_concentration"):
-            tds_id = item.entity_id
+    status_id, tds_id = _refractometer_entities(hass, r2_entry_id)
     if not status_id or not tds_id:
         _LOGGER.warning(
             "Refractometer entry %s has no test-status/concentration entities; "
@@ -286,14 +320,7 @@ def _async_watch_refractometer(
 
     @callback
     def _finished(event) -> None:
-        new = event.data.get("new_state")
-        if new is None or new.state not in R2_SAMPLE_FINISHED:
-            return
-        old = event.data.get("old_state")
-        if old is not None and old.state == new.state:
-            return
-        if old is None or old.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            _LOGGER.debug("Refractometer came back as %s; not a new test", new.state)
+        if not _is_finished_test(event):
             return
         _disarm()
         armed.append(async_call_later(hass, _TDS_SETTLE_SECONDS, _settled))

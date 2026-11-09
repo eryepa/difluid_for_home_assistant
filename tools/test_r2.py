@@ -24,7 +24,8 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
-from homeassistant.core import HomeAssistant
+import pytest
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
@@ -373,3 +374,43 @@ async def test_a_truncated_result_leaves_the_last_reading_alone(
 
     assert coordinator.data.refractive_index == before
     assert coordinator.data.concentration == 11.03
+
+
+# ── the predicate, on its own ────────────────────────────────────────────────────
+# It used to be four ifs inside a closure that only a real state change could reach,
+# which meant three of its four branches could be deleted with the suite green.
+
+def _status_event(old_state, new_state):
+    from types import SimpleNamespace
+
+    def state(value):
+        return None if value is None else State("sensor.r2_test_status", value)
+
+    return SimpleNamespace(
+        data={"old_state": state(old_state), "new_state": state(new_state)}
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        # The ordinary case: a test started and has now finished.
+        ("Test Start", "Test Finished", True),
+        ("Loop Test Ongoing", "Loop Test Finished", True),
+        # Finished again with the same state republished: no new test.
+        ("Test Finished", "Test Finished", False),
+        # Coming back from the dead is not a test finishing — the coordinator still
+        # holds the previous reading and republishes it with this status.
+        ("unavailable", "Test Finished", False),
+        ("unknown", "Test Finished", False),
+        (None, "Test Finished", False),
+        # Nothing finished at all.
+        ("Test Start", "Test Start", False),
+        ("Test Start", "Loop Test Ongoing", False),
+        ("Calibration Start", "Calibration Finished", False),
+    ],
+)
+def test_only_a_real_finish_counts_as_one(old, new, expected) -> None:
+    from custom_components.difluid_microbalance import _is_finished_test
+
+    assert _is_finished_test(_status_event(old, new)) is expected
