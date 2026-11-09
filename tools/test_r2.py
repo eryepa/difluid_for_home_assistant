@@ -340,3 +340,36 @@ async def test_a_calibration_result_does_not_overwrite_the_last_reading(
     assert coordinator.data.refractive_index == 1.35264, (
         "and took the refractive index with it"
     )
+
+
+# A package-2 header that claims seven payload bytes and carries three: the frame
+# announces more than arrived, which is what a dropped notification looks like.
+_TRUNCATED_RESULT = bytes.fromhex("dfdf0303070204 4f".replace(" ", ""))
+
+
+def test_a_short_frame_is_rejected_rather_than_parsed_short() -> None:
+    """`data_len` comes off the wire, so it cannot be trusted to bound the slice.
+
+    Without the length check the parser slices `payload[3:7]` off a payload of three
+    bytes, gets an empty slice, and publishes a refractive index of 0.0 — a number
+    shaped like a reading, from a packet that did not contain one.
+    """
+    from custom_components.difluid_microbalance.coordinator_r2 import _decode_frame
+
+    assert _decode_frame(_TRUNCATED_RESULT) is None
+    assert _decode_frame(b"\xdf\xdf\x03") is None
+    assert _decode_frame(b"\xda\xda\x00\x00\x00") is None
+    assert _decode_frame(_LOOP_RESULT) is not None
+
+
+async def test_a_truncated_result_leaves_the_last_reading_alone(
+    hass: HomeAssistant,
+) -> None:
+    coordinator = _coordinator(hass)
+    coordinator._on_data_notification(None, bytearray(_LOOP_RESULT))
+    before = coordinator.data.refractive_index
+
+    coordinator._on_data_notification(None, bytearray(_TRUNCATED_RESULT))
+
+    assert coordinator.data.refractive_index == before
+    assert coordinator.data.concentration == 11.03

@@ -37,6 +37,89 @@ _CMD_GET_FIRMWARE = _build_cmd(0x00, 0x02)
 
 _R2_TEST_COMMANDS = frozenset({0x00, 0x01, 0x02, 0x03})
 
+_R2_FUNC_FIRMWARE = 0x00
+_R2_FUNC_SETTINGS = 0x01
+_R2_FUNC_ACTION = 0x03
+_R2_CMD_GET_FIRMWARE = 0x02
+_R2_CMD_CALIBRATE = 0x02
+_R2_PKG_STATUS = 0x00
+_R2_PKG_TEMPERATURES = 0x01
+_R2_PKG_RESULT = 0x02
+
+_Firmware = dict
+_Fields = dict
+
+
+def _decode_frame(raw: bytes) -> Optional[tuple[int, int, bytes]]:
+    """Split a DF DF frame into (func, cmd, payload), or None if it is not one.
+
+    The length check is the whole defence here: `data_len` comes off the wire, so
+    slicing by it without asking whether that many bytes actually arrived is how a
+    truncated packet turns into a reading built from whatever followed it in memory.
+    """
+    if len(raw) < 6 or raw[0] != 0xDF or raw[1] != 0xDF:
+        return None
+    func, cmd, data_len = raw[2], raw[3], raw[4]
+    if len(raw) < 5 + data_len + 1:
+        return None
+    return func, cmd, bytes(raw[5 : 5 + data_len])
+
+
+def _parse_status(payload: bytes, _cmd: int) -> Optional[_Fields]:
+    if len(payload) < 2:
+        return None
+    return {"test_status": R2_STATUS_MAP.get(payload[1], "Unknown")}
+
+
+def _parse_temperatures(payload: bytes, _cmd: int) -> Optional[_Fields]:
+    if len(payload) < 6:
+        return None
+    prism_raw = int.from_bytes(payload[1:3], "big", signed=True)
+    sample_raw = int.from_bytes(payload[3:5], "big", signed=True)
+    fahrenheit = payload[5] == 1
+    return {
+        "temperature_unit": "°F" if fahrenheit else "°C",
+        "prism_temperature": _to_celsius(prism_raw / 10.0, fahrenheit),
+        "sample_temperature": _to_celsius(sample_raw / 10.0, fahrenheit),
+    }
+
+
+def _parse_result(payload: bytes, cmd: int) -> Optional[_Fields]:
+    if cmd == _R2_CMD_CALIBRATE or len(payload) < 7:
+        return None
+    conc_raw = int.from_bytes(payload[1:3], "big", signed=True)
+    ri_raw = int.from_bytes(payload[3:7], "big", signed=True)
+    return {
+        "concentration": conc_raw / 100.0,
+        "refractive_index": ri_raw / 100000.0,
+    }
+
+
+_R2_PACKAGE_PARSERS = {
+    _R2_PKG_STATUS: _parse_status,
+    _R2_PKG_TEMPERATURES: _parse_temperatures,
+    _R2_PKG_RESULT: _parse_result,
+}
+
+
+def _parse_action(cmd: int, payload: bytes) -> Optional[_Fields]:
+    if cmd not in _R2_TEST_COMMANDS or not payload:
+        return None
+    parser = _R2_PACKAGE_PARSERS.get(payload[0])
+    return parser(payload, cmd) if parser else None
+
+
+def _parse_settings(cmd: int, payload: bytes) -> Optional[_Fields]:
+    if cmd != 0x00 or not payload:
+        return None
+    return {"temperature_unit": "°F" if payload[0] == 1 else "°C"}
+
+
+_R2_FUNC_PARSERS = {
+    _R2_FUNC_ACTION: _parse_action,
+    _R2_FUNC_SETTINGS: _parse_settings,
+}
+
 def _to_celsius(value: float, fahrenheit: bool) -> float:
     """The R2's temperature in Celsius, whichever unit it reported it in.
 
@@ -384,54 +467,29 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             if len(raw) >= 2 and raw[0] == 0xDF and raw[1] == 0xDF:
                 self._direct_probe.set_result(bytes(raw))
 
-        if len(raw) < 6 or raw[0] != 0xDF or raw[1] != 0xDF:
+        frame = _decode_frame(bytes(raw))
+        if frame is None:
             _LOGGER.warning("R2: unexpected packet on aa01: %s", bytes(raw).hex())
             return
 
-        func, cmd, data_len = raw[2], raw[3], raw[4]
-        if len(raw) < 5 + data_len + 1:
+        func, cmd, payload = frame
+        if func == _R2_FUNC_FIRMWARE and cmd == _R2_CMD_GET_FIRMWARE:
+            _LOGGER.info(
+                "R2 firmware version: %s",
+                payload.decode("ascii", errors="replace").rstrip("\x00"),
+            )
             return
-        payload = raw[5 : 5 + data_len]
-        updated = False
 
-        if func == 0x00 and cmd == 0x02:
-            try:
-                version = payload.decode("ascii", errors="replace").rstrip("\x00")
-                _LOGGER.info("R2 firmware version: %s", version)
-            except Exception:
-                pass
+        parser = _R2_FUNC_PARSERS.get(func)
+        fields = parser(cmd, payload) if parser else None
+        if not fields:
+            return
 
-        elif func == 0x03 and cmd in _R2_TEST_COMMANDS and data_len >= 1:
-            pkg_no = payload[0]
-
-            if pkg_no == 0x00 and data_len >= 2:
-                self.data.test_status = R2_STATUS_MAP.get(payload[1], "Unknown")
-                updated = True
-
-            elif pkg_no == 0x01 and data_len >= 6:
-                prism_raw = int.from_bytes(payload[1:3], "big", signed=True)
-                sample_raw = int.from_bytes(payload[3:5], "big", signed=True)
-                fahrenheit = payload[5] == 1
-                self.data.temperature_unit = "°F" if fahrenheit else "°C"
-                self.data.prism_temperature = _to_celsius(prism_raw / 10.0, fahrenheit)
-                self.data.sample_temperature = _to_celsius(sample_raw / 10.0, fahrenheit)
-                updated = True
-
-            elif pkg_no == 0x02 and data_len >= 7 and cmd != 0x02:
-                conc_raw = int.from_bytes(payload[1:3], "big", signed=True)
-                ri_raw = int.from_bytes(payload[3:7], "big", signed=True)
-                self.data.concentration = conc_raw / 100.0
-                self.data.refractive_index = ri_raw / 100000.0
-                updated = True
-
-        elif func == 0x01 and cmd == 0x00 and data_len >= 1:
-            self.data.temperature_unit = "°F" if payload[0] == 1 else "°C"
-            updated = True
-
-        if updated:
-            import time as _time
-            self._last_activity_time = _time.monotonic()
-            self.async_set_updated_data(self.data)
+        for name, value in fields.items():
+            setattr(self.data, name, value)
+        import time as _time
+        self._last_activity_time = _time.monotonic()
+        self.async_set_updated_data(self.data)
 
     def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
         import time as _time
