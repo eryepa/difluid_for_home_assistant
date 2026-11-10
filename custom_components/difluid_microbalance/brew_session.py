@@ -17,6 +17,7 @@ and the entities belong to a device that is the detector rather than the scale.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import time
@@ -24,6 +25,8 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Optional
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as _dr
+from homeassistant.helpers.device_registry import DeviceRegistry
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.storage import Store
 
@@ -778,6 +781,32 @@ class BrewSession:
 #: the process lives.
 _VIA_DEVICE_ID_SUPPORTED = "via_device_id" in getattr(DeviceInfo, "__annotations__", {})
 
+#: The registry lookup that replaced `async_get_device`, and whether it wants the
+#: config entry alongside the identifier.
+#:
+#: `async_get_device` was deprecated because identifiers are no longer unique across
+#: config entries; the replacement takes the entry id to disambiguate.  It does not
+#: exist on older cores, so both spellings have to be spoken, and which one this core
+#: speaks is decided from its signature rather than by catching TypeError at runtime.
+_GET_DEVICE_BY_IDENTIFIER = getattr(
+    DeviceRegistry, "async_get_device_by_identifier", None
+)
+_WANTS_CONFIG_ENTRY = _GET_DEVICE_BY_IDENTIFIER is not None and (
+    "config_entry_id" in inspect.signature(_GET_DEVICE_BY_IDENTIFIER).parameters
+)
+
+
+def _find_device(hass: HomeAssistant, identifier: tuple[str, str]):
+    """The device registered under one identifier, in whichever way this core asks."""
+    registry = _dr.async_get(hass)
+    if _GET_DEVICE_BY_IDENTIFIER is None:
+        return registry.async_get_device(identifiers={identifier})
+    if _WANTS_CONFIG_ENTRY:
+        return registry.async_get_device_by_identifier(
+            identifier, config_entry_id=identifier[1]
+        )
+    return registry.async_get_device_by_identifier(identifier)
+
 
 def detector_device_info(hass: HomeAssistant, entry) -> "DeviceInfo":
     """The device a detector entry's entities belong to.
@@ -795,7 +824,6 @@ def detector_device_info(hass: HomeAssistant, entry) -> "DeviceInfo":
     dropped and logged — silently losing it would leave the detector's entities on a
     card of their own with no explanation.
     """
-    from homeassistant.helpers import device_registry as dr
     from homeassistant.helpers.device_registry import DeviceEntryType
 
     from .const import CONF_SCALE_ENTRY
@@ -813,9 +841,7 @@ def detector_device_info(hass: HomeAssistant, entry) -> "DeviceInfo":
         info["via_device"] = (DOMAIN, scale_entry_id)
         return info
 
-    scale = dr.async_get(hass).async_get_device(
-        identifiers={(DOMAIN, scale_entry_id)}
-    )
+    scale = _find_device(hass, (DOMAIN, scale_entry_id))
     if scale is None:
         _LOGGER.warning(
             "Scale entry %s has no device yet; the brew detector will not be linked "

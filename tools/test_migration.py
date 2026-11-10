@@ -1070,3 +1070,51 @@ def test_a_scale_with_no_device_yet_drops_the_link_and_says_so(
 
     assert "via_device_id" not in info and "via_device" not in info
     assert "no device yet" in caplog.text
+
+
+def test_the_newer_registry_lookup_is_used_when_the_core_has_it(monkeypatch) -> None:
+    """The path the live install takes, and the only one that cannot run here.
+
+    This core's registry has `async_get_device` only, so the newer lookup has to be
+    driven through a stub — otherwise the branch that actually runs in production is
+    the one branch nothing exercises.
+    """
+    from custom_components.difluid_microbalance import brew_session
+
+    seen: list[tuple] = []
+
+    class _Registry:
+        def async_get_device_by_identifier(self, identifier, *, config_entry_id=None):
+            seen.append((identifier, config_entry_id))
+            return "THE-DEVICE"
+
+    monkeypatch.setattr(
+        brew_session, "_GET_DEVICE_BY_IDENTIFIER", _Registry.async_get_device_by_identifier
+    )
+    monkeypatch.setattr(brew_session, "_WANTS_CONFIG_ENTRY", True)
+    monkeypatch.setattr(brew_session._dr, "async_get", lambda _hass: _Registry())
+
+    assert brew_session._find_device(None, (DOMAIN, "entry-1")) == "THE-DEVICE"
+    assert seen == [((DOMAIN, "entry-1"), "entry-1")]
+
+
+def test_a_core_that_takes_only_the_identifier_gets_only_the_identifier(
+    monkeypatch,
+) -> None:
+    from custom_components.difluid_microbalance import brew_session
+
+    seen: list[tuple] = []
+
+    class _Registry:
+        def async_get_device_by_identifier(self, identifier):
+            seen.append(identifier)
+            return "THE-DEVICE"
+
+    monkeypatch.setattr(
+        brew_session, "_GET_DEVICE_BY_IDENTIFIER", _Registry.async_get_device_by_identifier
+    )
+    monkeypatch.setattr(brew_session, "_WANTS_CONFIG_ENTRY", False)
+    monkeypatch.setattr(brew_session._dr, "async_get", lambda _hass: _Registry())
+
+    assert brew_session._find_device(None, (DOMAIN, "entry-1")) == "THE-DEVICE"
+    assert seen == [(DOMAIN, "entry-1")]
