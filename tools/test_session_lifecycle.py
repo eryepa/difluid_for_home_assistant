@@ -21,16 +21,15 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
-from homeassistant.util import dt as dt_util
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from custom_components.difluid_microbalance.brew_detect import (  # noqa: E402
-    BrewPair,
     DetectorConfig,
 )
 from custom_components.difluid_microbalance import brew_session  # noqa: E402
@@ -44,10 +43,6 @@ _KEY = "difluid_microbalance.lifecycle"
 
 def _new_session(hass: HomeAssistant) -> BrewSession:
     return BrewSession(hass, DetectorConfig(), _KEY)
-
-
-def _pair(dose=18.0, yield_g=37.2, at=1000.0) -> BrewPair:
-    return BrewPair(dose=dose, dose_at=at - 200, yield_g=yield_g, yield_at=at)
 
 
 def _dose(value=18.0, at=900.0) -> WeighEvent:
@@ -135,9 +130,9 @@ async def test_first_load_starts_the_period_now_rather_than_at_the_epoch(
     sensor reporting no coffee.
     """
     session = _new_session(hass)
-    before = dt_util.utcnow().timestamp()
+    before = time.time()
     await session.async_load()
-    after = dt_util.utcnow().timestamp()
+    after = time.time()
 
     assert before <= session.totals.period_started <= after
 
@@ -166,44 +161,44 @@ async def test_applying_a_config_swaps_the_pairer_as_well_as_the_thresholds(
     assert session._pairer.cfg is tighter
 
 
-async def test_removing_a_session_leaves_nothing_behind(
-    hass: HomeAssistant, monkeypatch
-) -> None:
-    """A deleted detector must not come back on the next install.
+async def test_removal_delegates_to_the_store(hass: HomeAssistant) -> None:
+    """`async_remove` must hand the deletion to the Store, and clear memory first.
 
-    The delayed save is the trap: `Store.async_remove` cancels it, so a session
-    removed just after a brew does not rewrite its own state file seconds later.
+    What is asserted is the delegation, not the deletion, and that is a limit of the
+    harness rather than of the code: pytest-homeassistant-custom-component replaces
+    both `Store._async_write_data` and `Store.async_remove` with in-memory mocks, so
+    nothing is ever written to a file and the mock's `async_remove` does not cancel
+    the pending delayed save.  The cancellation lives in Home Assistant's own
+    `Store.async_remove` (`_async_cleanup_delay_listener`), which the harness never
+    reaches — read its source if you want to see it.
 
-    The delay is shortened to milliseconds here, and that is not a shortcut.
-    `Store.async_delay_save` schedules on the real event loop rather than through
-    Home Assistant's scheduler, so `async_fire_time_changed` does not reach it — a
-    version of this test built on that passed whether or not the save was ever
-    cancelled.  The delay is a parameter of the call, so the constant that feeds it
-    is what gets patched.
+    So the contract tested here is the one this repository owns: the session clears
+    itself and asks the store to delete.  A session that cleared itself and forgot to
+    ask would pass an in-memory assertion and leave the file behind on a real install.
     """
-    monkeypatch.setattr(brew_session, "_SAVE_DELAY", 0.01)
-
     session = _new_session(hass)
     await session.async_load()
-
     session.last_dose = _dose()
     session.brew_count = 3
-    session._save()
-    await asyncio.sleep(0.05)
 
-    with_state = _new_session(hass)
-    await with_state.async_load()
-    assert with_state.brew_count == 3, "the delayed write never reached disk at all"
+    removed = []
 
-    await with_state.async_remove()
+    class _RecordingStore:
+        path = "/nonexistent"
 
-    assert with_state.brew_count == 0
-    assert with_state.last_dose is None
-    assert with_state.measurements == []
+        async def async_remove(self) -> None:
+            removed.append(True)
 
-    await asyncio.sleep(0.05)
+    session._store = _RecordingStore()  # type: ignore[assignment]
+    session.add_listener(lambda: None)
 
-    fresh = _new_session(hass)
-    await fresh.async_load()
-    assert fresh.brew_count == 0, "a cancelled save resurrected the deleted state"
-    assert fresh.last_dose is None
+    await session.async_remove()
+
+    assert removed == [True], "the session never asked the store to delete its state"
+    assert session.brew_count == 0
+    assert session.last_dose is None
+    assert session.measurements == []
+    assert session._listeners == [], (
+        "a removed session kept its listeners — the entities would keep repainting "
+        "from a detector that no longer exists"
+    )
