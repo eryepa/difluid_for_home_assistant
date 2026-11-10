@@ -32,7 +32,7 @@ async def async_setup_entry(
     if entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_DETECTOR:
         session: BrewSession = hass.data[DOMAIN][entry.entry_id]
         uid_prefix = entry.data.get(CONF_UID_PREFIX) or entry.entry_id
-        device_info = detector_device_info(entry)
+        device_info = detector_device_info(hass, entry)
         async_add_entities(
             [
                 MeasuredDoseNumber(session, uid_prefix, device_info),

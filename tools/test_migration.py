@@ -982,3 +982,91 @@ async def test_the_import_flow_carries_the_prefix_store_key_and_thresholds(
     assert again["reason"] == "already_configured"
 
     await _unload_all(hass)
+
+
+# ── the link between the detector's device and the scale's ─────────────────────
+# Home Assistant renamed DeviceInfo's `via_device` to `via_device_id` and stops
+# reading the old one in 2027.8, but the new field does not exist on older cores — so
+# an integration shipped through HACS has to speak both.  The link is not cosmetic:
+# the dashboard card's cluster walk follows it to show the scale's live weight and the
+# detector's statistics on one card, so losing it silently splits them.
+
+def test_the_link_is_the_scales_device_id_where_that_is_what_is_asked(
+    hass: HomeAssistant, monkeypatch
+) -> None:
+    from custom_components.difluid_microbalance import brew_session
+    from custom_components.difluid_microbalance.brew_session import detector_device_info
+
+    scale = MockConfigEntry(
+        domain=DOMAIN, title="Microbalance 304268",
+        data={CONF_DEVICE_TYPE: DEVICE_TYPE_MICROBALANCE, "address": "AA:BB:CC:DD:EE:FF"},
+    )
+    scale.add_to_hass(hass)
+    detector = MockConfigEntry(
+        domain=DOMAIN, title="Brew Detector",
+        data={CONF_DEVICE_TYPE: DEVICE_TYPE_DETECTOR, CONF_SCALE_ENTRY: scale.entry_id},
+    )
+    detector.add_to_hass(hass)
+    scale_device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=scale.entry_id,
+        identifiers={(DOMAIN, scale.entry_id)},
+        name="Microbalance 304268",
+    )
+
+    monkeypatch.setattr(brew_session, "_VIA_DEVICE_ID_SUPPORTED", True)
+    info = detector_device_info(hass, detector)
+
+    assert info["via_device_id"] == scale_device.id
+    assert "via_device" not in info, "both fields at once is how the old one lingers"
+
+
+def test_an_older_core_still_gets_the_identifier_tuple(
+    hass: HomeAssistant, monkeypatch
+) -> None:
+    from custom_components.difluid_microbalance import brew_session
+    from custom_components.difluid_microbalance.brew_session import detector_device_info
+
+    scale = MockConfigEntry(
+        domain=DOMAIN, title="Microbalance 304268",
+        data={CONF_DEVICE_TYPE: DEVICE_TYPE_MICROBALANCE, "address": "AA:BB:CC:DD:EE:FF"},
+    )
+    scale.add_to_hass(hass)
+    detector = MockConfigEntry(
+        domain=DOMAIN, title="Brew Detector",
+        data={CONF_DEVICE_TYPE: DEVICE_TYPE_DETECTOR, CONF_SCALE_ENTRY: scale.entry_id},
+    )
+    detector.add_to_hass(hass)
+
+    monkeypatch.setattr(brew_session, "_VIA_DEVICE_ID_SUPPORTED", False)
+    info = detector_device_info(hass, detector)
+
+    assert info["via_device"] == (DOMAIN, scale.entry_id)
+    assert "via_device_id" not in info
+
+
+def test_a_scale_with_no_device_yet_drops_the_link_and_says_so(
+    hass: HomeAssistant, monkeypatch, caplog
+) -> None:
+    """The link is built from a device id, so it must fail loudly when there is none.
+
+    Silently returning a detector device with no parent leaves its entities on a card
+    of their own, and nothing anywhere says why.
+    """
+    from custom_components.difluid_microbalance import brew_session
+    from custom_components.difluid_microbalance.brew_session import detector_device_info
+
+    detector = MockConfigEntry(
+        domain=DOMAIN, title="Brew Detector",
+        data={
+            CONF_DEVICE_TYPE: DEVICE_TYPE_DETECTOR,
+            CONF_SCALE_ENTRY: "an-entry-with-no-device",
+        },
+    )
+    detector.add_to_hass(hass)
+
+    monkeypatch.setattr(brew_session, "_VIA_DEVICE_ID_SUPPORTED", True)
+    with caplog.at_level("WARNING"):
+        info = detector_device_info(hass, detector)
+
+    assert "via_device_id" not in info and "via_device" not in info
+    assert "no device yet" in caplog.text

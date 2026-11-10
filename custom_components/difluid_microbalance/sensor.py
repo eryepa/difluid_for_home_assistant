@@ -410,7 +410,7 @@ async def async_setup_entry(
     if device_type == DEVICE_TYPE_DETECTOR:
         session: BrewSession = held
         prefix = entry.data.get(CONF_UID_PREFIX) or entry.entry_id
-        device_info = detector_device_info(entry)
+        device_info = detector_device_info(hass, entry)
         async_add_entities(
             (DifluidBrewRateSensor if desc.ticks else DifluidBrewSensor)(
                 session, desc, prefix, device_info

@@ -41,7 +41,7 @@ async def async_setup_entry(
                 ResetPeriodButton(
                     session,
                     entry.data.get(CONF_UID_PREFIX) or entry.entry_id,
-                    detector_device_info(entry),
+                    detector_device_info(hass, entry),
                 )
             ]
         )

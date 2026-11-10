@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Optional
 
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.storage import Store
 
 from .brew_detect import (
@@ -769,32 +770,62 @@ class BrewSession:
         except Exception as err:  # noqa: BLE001 - dataset capture is best-effort
             _LOGGER.warning("Could not append brew dataset to %s: %s", path, err)
 
-def detector_device_info(entry) -> "DeviceInfo":
+#: Whether this Home Assistant wants `via_device_id` rather than `via_device`.
+#:
+#: Home Assistant renamed the field and the old spelling stops working in 2027.8, but
+#: the new one does not exist on older cores — so an integration on HACS has to speak
+#: both.  Checked once at import rather than per entity: the answer cannot change while
+#: the process lives.
+_VIA_DEVICE_ID_SUPPORTED = "via_device_id" in getattr(DeviceInfo, "__annotations__", {})
+
+
+def detector_device_info(hass: HomeAssistant, entry) -> "DeviceInfo":
     """The device a detector entry's entities belong to.
 
-    A service device rather than a physical one, hung off the scale with via_device so
-    the relationship is visible in the UI and the card can find one from the other.
+    A service device, hung off the scale so the relationship shows in the UI and the
+    card can find one device from the other.  It exists because Home Assistant's device
+    page renders exactly four cards and picks which one an entity lands in from its
+    domain plus entity_category, with no "statistics" card to ask for — on the scale's
+    page the statistics could only be squeezed in beside the weight and the flow rate,
+    or hidden under Diagnostic.
 
-    It exists because Home Assistant's device page renders exactly four cards and
-    decides which one an entity lands in from its domain plus entity_category — there
-    is no "statistics" card to ask for, and no way to order them.  On the scale's page
-    the statistics could only ever be squeezed in beside the weight and the flow rate,
-    or hidden under Diagnostic.  On a page of their own they are simply what the
-    device reads, which is what they are.
+    The link is what the card's cluster walk follows, so when the newer field is in use
+    the scale's device has to be looked up: `via_device_id` wants a device id, not the
+    identifier tuple.  If the scale has not registered a device yet the link is
+    dropped and logged — silently losing it would leave the detector's entities on a
+    card of their own with no explanation.
     """
+    from homeassistant.helpers import device_registry as dr
     from homeassistant.helpers.device_registry import DeviceEntryType
-    from homeassistant.helpers.entity import DeviceInfo
 
     from .const import CONF_SCALE_ENTRY
 
-    return DeviceInfo(
+    info = DeviceInfo(
         identifiers={(DOMAIN, entry.entry_id)},
         name="Brew Detector",
         manufacturer="Difluid",
         model="Brew Detector",
         entry_type=DeviceEntryType.SERVICE,
-        via_device=(DOMAIN, entry.data[CONF_SCALE_ENTRY]),
     )
+
+    scale_entry_id = entry.data[CONF_SCALE_ENTRY]
+    if not _VIA_DEVICE_ID_SUPPORTED:
+        info["via_device"] = (DOMAIN, scale_entry_id)
+        return info
+
+    scale = dr.async_get(hass).async_get_device(
+        identifiers={(DOMAIN, scale_entry_id)}
+    )
+    if scale is None:
+        _LOGGER.warning(
+            "Scale entry %s has no device yet; the brew detector will not be linked "
+            "to it and the dashboard card will not show their entities together",
+            scale_entry_id,
+        )
+        return info
+
+    info["via_device_id"] = scale.id
+    return info
 
 async def async_create_session(
     hass: HomeAssistant, config: DetectorConfig, record_dataset: bool, store_key: str
