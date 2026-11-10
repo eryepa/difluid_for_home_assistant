@@ -31,9 +31,6 @@ from .const import (
 from .coordinator import DifluidMicrobalanceCoordinator, MicrobalanceData
 from .coordinator_r2 import DifluidR2Coordinator, R2Data
 
-#: Measured brews published for the chart.  The session keeps more than this; a
-#: control chart with fifty dots on it stops showing where you are and starts showing
-#: where you have ever been.
 CHART_POINTS = 20
 
 @dataclass(frozen=True)
@@ -105,10 +102,6 @@ MICROBALANCE_SENSORS: tuple[DifluidSensorDescription, ...] = (
 class DifluidBrewSensorDescription(SensorEntityDescription):
     value_fn: Callable = lambda _: None
     attrs_fn: Callable | None = None
-    #: Set on the two per-day figures.  Their numerator only changes when a brew is
-    #: detected, but their *denominator* grows continuously, so unlike every other
-    #: sensor here they go stale on their own and need a clock.  See
-    #: DifluidBrewRateSensor.
     ticks: bool = False
 
 def _weigh_attrs(event) -> dict:

@@ -37,8 +37,6 @@ from .const import (
     SERVICE_UUID_R2,
 )
 
-#: Sentinel for "no refractometer" in the detector form.  vol.In needs a real key,
-#: and None is not selectable in a dropdown.
 _R2_NONE = "none"
 
 def _device_type(service_uuids: list[str]) -> str | None:
@@ -289,26 +287,8 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-#: Error surfaced when the entered values are individually in range but describe
-#: a band that runs backwards (see _misordered_pairs).
 ERROR_RANGE_ORDER = "invalid_range_order"
 
-#: Accepted range for every tunable, as (min, max) inclusive.
-#:
-#: Without this the form took any float at all, and some of them are not merely
-#: badly tuned but arithmetically impossible.  ``stable_seconds = 0`` is the worst
-#: of them: brew_detect divides the held time by it on every single sample, so a
-#: zero there raises ZeroDivisionError roughly five times a second for as long as
-#: the scale stays connected, and BrewSession.feed swallows each one — a dead
-#: detector, a flooded log, and nothing anywhere in the UI to say so.
-#:
-#: The bounds are deliberately much wider than any sensible brew setup.  This is a
-#: guard against the nonsensical, not an opinion about how anyone should tune their
-#: detector: masses cannot be negative, seconds and divisors must be positive, and a
-#: fraction of a window is by definition between 0 and 1.  Mass ceilings are kept at
-#: DetectorConfig.max_mass (500 g), above which the detector treats the reading as a
-#: cup being lifted rather than as something being weighed, so a threshold beyond it
-#: could never match anything.
 _OPTION_RANGES: dict[str, tuple[float, float]] = {
     "stable_tol": (0.01, 50.0),
     "stable_seconds": (0.5, 60.0),
@@ -327,19 +307,8 @@ _OPTION_RANGES: dict[str, tuple[float, float]] = {
     "gap_reset_seconds": (0.5, 3600.0),
 }
 
-#: Bounds used for a tunable that brew_detect exposes but this table does not know
-#: about yet.  Every field in DetectorConfig is a mass, a duration or a ratio, and
-#: none of those is ever negative, so a non-negative floor is a safe default that
-#: still keeps a new field from being validated as "anything at all" the moment it
-#: is added to TUNABLE_FIELDS.
 _FALLBACK_RANGE = (0.0, 86400.0)
 
-#: Pairs the detector reads as a band, low first.  brew_detect compares against them
-#: with `low <= v <= high` (classify) and `ratio_min <= ratio <= ratio_max`
-#: (BrewPairer.offer), so a band entered backwards is not a bad tuning — it is a
-#: band that nothing can ever fall into, and the detector goes quiet with no
-#: complaint from anywhere.  Individual vol.Range checks cannot catch this because
-#: each value on its own is perfectly legal.
 _ORDERED_PAIRS: tuple[tuple[str, str], ...] = (
     ("dose_min", "dose_max"),
     ("yield_min", "yield_max"),

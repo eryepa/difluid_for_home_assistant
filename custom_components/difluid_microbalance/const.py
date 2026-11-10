@@ -19,65 +19,21 @@ CONF_RECORD_DATASET = "record_dataset"
 
 DEVICE_TYPE_MICROBALANCE = "microbalance"
 DEVICE_TYPE_R2 = "r2"
-#: The detector: not a device at all, but an entry that reads one scale and,
-#: optionally, one refractometer.  It owns the BrewSession and every statistic
-#: derived from it.
 DEVICE_TYPE_DETECTOR = "detector"
 
-#: entry_id of the scale whose weight stream this detector reads.  Required.
 CONF_SCALE_ENTRY = "scale_entry"
-#: entry_id of the R2 whose TDS this detector reads.  Optional — the pairing of a
-#: shot with a measurement is iteration 2; this is the wire it will travel on.
 CONF_R2_ENTRY = "r2_entry"
 
-#: What every entity of this detector prefixes its unique_id with, stored rather
-#: than derived.
-#:
-#: The entity registry is keyed by (domain, platform, unique_id), and `platform`
-#: is the integration domain for every entry we create.  So a detector that
-#: registers `f"{prefix}_{key}"` with the prefix the *scale* entry used claims the
-#: existing registry rows and HA simply rewrites their config_entry_id and
-#: device_id in place — entity_id, recorder history, long-term statistics and the
-#: Prometheus series all survive the move untouched.  That is the whole migration.
-#:
-#: It has to be stored, not computed, for the case that gives the trick away: point
-#: an existing detector at a different scale and a derived prefix would change,
-#: orphaning seven entities and starting the odometer again at zero.  Written once
-#: when the entry is created, read forever after.
 CONF_UID_PREFIX = "uid_prefix"
 
-#: Set on a *scale* entry once its detector has been split out into an entry of its
-#: own, so the migration runs exactly once per scale.
-#:
-#: 1.5.0-beta.1 tried to recognise a not-yet-migrated install by the detector
-#: thresholds still sitting in the scale's options, which was a proxy and not the
-#: fact: options are only written when somebody opens the options form and changes a
-#: threshold, so an install running entirely on defaults had none, the migration never
-#: fired, and — because that version had already stopped the scale from creating the
-#: statistics entities — all seven went unavailable with no detector to claim them.
-#:
-#: The real condition is "a scale with no detector pointing at it".  This flag is what
-#: keeps that from meaning "recreate the detector every restart" after somebody
-#: deliberately deletes one.
 CONF_DETECTOR_IMPORTED = "detector_imported"
 
-#: Storage key for this detector's BrewSession, stored for the same reason and
-#: seeded by the same rule: an imported detector keeps `difluid_microbalance.brew`,
-#: which is where brew_count and the last pair already live, and a detector created
-#: from scratch gets its own key.  See brew_session._DEFAULT_STORE_KEY.
 CONF_STORE_KEY = "store_key"
 
 DEFAULT_MODEL_MICROBALANCE = "DFT-S101"
 DEFAULT_MODEL_MICROBALANCE_TI = "DFT-S102"
 DEFAULT_MODEL_R2 = "DFT-R102"
 
-#: Test Status values that mean a sample was just measured.
-#:
-#: "Calibration Finished" is deliberately absent.  Calibrating is putting distilled
-#: water on the prism, and it ends in a finished state like any other test — but the
-#: reading belongs to the water, not to the coffee, and every refractometer reading is
-#: attached to the last brew.  Without this distinction, zeroing the R2 after a shot
-#: would plot the shot at 0% TDS.
 R2_SAMPLE_FINISHED = frozenset(
     {"Test Finished", "Average Test Finished", "Loop Test Finished"}
 )
