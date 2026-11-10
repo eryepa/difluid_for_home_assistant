@@ -1,18 +1,13 @@
 DOMAIN = "difluid_microbalance"
 
-# Microbalance
 SERVICE_UUID_MICROBALANCE = "000000ee-0000-1000-8000-00805f9b34fb"
 CHARACTERISTIC_UUID_MICROBALANCE = "0000ff01-0000-1000-8000-00805f9b34fb"
 
-# Microbalance Ti
 SERVICE_UUID_MICROBALANCE_TI = "000000dd-0000-1000-8000-00805f9b34fb"
 CHARACTERISTIC_UUID_MICROBALANCE_TI = "0000aa01-0000-1000-8000-00805f9b34fb"
 
-# R2 Extract
 SERVICE_UUID_R2 = "000000ff-0000-1000-8000-00805f9b34fb"
 R2_API_URL = "https://cloud-gateway-os.digitizefluid.com/system"
-# Public demo key from the DiFluid SDK demo repository (r2Detail.vue).
-# Used as the default when no key is provided.
 R2_DEFAULT_LICENSE_KEY = "b0b978c8d7fe4ac782767996f34a6ce1"
 
 CONF_IS_TI = "is_ti"
@@ -20,15 +15,28 @@ CONF_DEVICE_TYPE = "device_type"
 CONF_LICENSE_KEY = "license_key"
 CONF_MODEL = "model"
 
+CONF_RECORD_DATASET = "record_dataset"
+
 DEVICE_TYPE_MICROBALANCE = "microbalance"
 DEVICE_TYPE_R2 = "r2"
+DEVICE_TYPE_DETECTOR = "detector"
 
-# Device model identifiers sent to the DiFluid cloud during the encrypted
-# handshake. Newer firmware encrypts its BLE traffic (frames start with 0xDADA)
-# and only streams cleartext sensor data after a license-authenticated handshake.
+CONF_SCALE_ENTRY = "scale_entry"
+CONF_R2_ENTRY = "r2_entry"
+
+CONF_UID_PREFIX = "uid_prefix"
+
+CONF_DETECTOR_IMPORTED = "detector_imported"
+
+CONF_STORE_KEY = "store_key"
+
 DEFAULT_MODEL_MICROBALANCE = "DFT-S101"
 DEFAULT_MODEL_MICROBALANCE_TI = "DFT-S102"
 DEFAULT_MODEL_R2 = "DFT-R102"
+
+R2_SAMPLE_FINISHED = frozenset(
+    {"Test Finished", "Average Test Finished", "Loop Test Finished"}
+)
 
 R2_STATUS_MAP = {
     0: "Test Finished",

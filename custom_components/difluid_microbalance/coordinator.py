@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
+
+if TYPE_CHECKING:
+    from .brew_session import BrewSession
 
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.exc import BleakError
@@ -33,25 +36,29 @@ _LOGGER = logging.getLogger(__name__)
 _HEADER = bytes([0xDF, 0xDF])
 _ENCRYPTED_HEADER = bytes([0xDA, 0xDA])
 
+_ABSENT_POLL_SECONDS = 15.0
+_PRESENT_RETRY_SECONDS = 5.0
+_PRESENT_RETRY_MAX_SECONDS = 30.0
 
 def _build_cmd(func: int, cmd: int, data: bytes = b"") -> bytes:
     frame = bytes([func, cmd, len(data)]) + data
     full = _HEADER + frame
     return full + bytes([sum(full) & 0xFF])
 
-
 _CMD_AUTO_SEND_ON   = _build_cmd(0x01, 0x00, bytes([0x01]))
 _CMD_GET_STATUS     = _build_cmd(0x03, 0x05)
-_CMD_TARE           = _build_cmd(0x03, 0x02, bytes([0x01]))  # Power Button Single Click
-_CMD_POWER_OFF      = _build_cmd(0x03, 0x04, bytes([0x01]))  # Power Button Long Press
+_CMD_TARE           = _build_cmd(0x03, 0x02, bytes([0x01]))
+_CMD_POWER_OFF      = _build_cmd(0x03, 0x04, bytes([0x01]))
 _CMD_GET_AUTO_DETECT = _build_cmd(0x01, 0x01)
 _CMD_GET_AUTO_STOP   = _build_cmd(0x01, 0x02)
 
-# Weight / flow / timer arrive as high-priority push notifications and are NOT
-# affected by this interval.  This only controls how often we poll the secondary
-# status packet (battery, charging, device_status) via GET_STATUS.
 _STATUS_POLL_INTERVAL = 1
 
+_GRAMS_PER_UNIT = {
+    0: 1.0,
+    1: 28.349523125,
+    2: 0.06479891,
+}
 
 @dataclass
 class MicrobalanceData:
@@ -65,7 +72,6 @@ class MicrobalanceData:
     auto_detect_timing: bool = False
     auto_stop_timing: bool = False
     connected: bool = False
-
 
 class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
 
@@ -82,6 +88,7 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         self.is_ti = is_ti
         self.license_key = license_key
         self.model = model
+        self._brew_consumers: list["BrewSession"] = []
         self._preferred_char_uuid = (
             CHARACTERISTIC_UUID_MICROBALANCE_TI if is_ti else CHARACTERISTIC_UUID_MICROBALANCE
         )
@@ -93,14 +100,42 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         self._client: Optional[BleakClientWithServiceCache] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
+        #: True while a connection attempt is in flight.
+        #:
+        #: Two attempts at one device is not merely wasted work: the proxy has been
+        #: seen to answer the second with "Connection request ignored, state:
+        #: CONNECTING" and then time the first one out, so a second attempt can cost
+        #: the first its chance.  Startup, the advertisement callback and the retry
+        #: loop all reach _do_connect, so the guard has to be in one place they share.
+        self._connecting = False
         self._bt_cancel: Optional[Callable] = None
         self._auto_shutdown_minutes: int = 0
-        self._no_reconnect_until: float = 0.0  # monotonic timestamp; reconnect suppressed until then
+        self._no_reconnect_until: float = 0.0
         self._last_weight_change_time: float = 0.0
         self._last_weight_value: float = 0.0
+        self._last_unit_idx: Optional[int] = None
         self.data = MicrobalanceData()
 
-    # ── public API for button / select / number entities ─────────────────────
+    def add_brew_consumer(self, session: "BrewSession") -> Callable[[], None]:
+        """Feed `session` this scale's weight stream.  Returns an unsubscribe.
+
+        The stream is handed over as a direct call from the BLE notification handler
+        rather than through the state machine.  It arrives at roughly 5 Hz, and while
+        the weight sensor does write a state per packet anyway, routing the detector
+        through that would tie its timing to the recorder's and put a hop between a
+        sample and the code deciding whether the pour has stopped.
+
+        The caller passes the returned callable to `entry.async_on_unload`, so a
+        detector that is reloaded — which every threshold change does — stops being
+        fed before its replacement starts.
+        """
+        self._brew_consumers.append(session)
+
+        def _remove() -> None:
+            if session in self._brew_consumers:
+                self._brew_consumers.remove(session)
+
+        return _remove
 
     async def async_send_command(self, cmd: bytes) -> None:
         """Send a control command to all known writable channels.
@@ -114,8 +149,8 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         sent = False
         for char_uuid in dict.fromkeys(filter(None, [
             self._write_char_uuid,
-            self._encrypted_uuid,   # FF01 — documented write channel for non-Ti
-            self._cleartext_uuid,   # AA01 — cleartext channel
+            self._encrypted_uuid,
+            self._cleartext_uuid,
         ])):
             try:
                 await self._client.write_gatt_char(char_uuid, cmd, response=False)
@@ -151,9 +186,6 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
                 pass
         _LOGGER.info("Power-off: BLE disconnected, reconnect suppressed for 60 s")
 
-        # After the cooldown, proactively start the reconnect loop so we
-        # reconnect when the scale is turned on — the BT advertisement callback
-        # may miss the first advertisement if the device is still in HA's cache.
         self._reconnect_task = self.hass.async_create_background_task(
             self._reconnect_loop_after_poweroff(), name="difluid_reconnect_after_poweroff"
         )
@@ -163,9 +195,9 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         import time as _time
         remaining = self._no_reconnect_until - _time.monotonic()
         if remaining > 0:
-            await asyncio.sleep(remaining + 1)  # +1 s buffer
+            await asyncio.sleep(remaining + 1)
         if self._client and self._client.is_connected:
-            return  # BT callback already reconnected us
+            return
         _LOGGER.info("Power-off cooldown expired; starting reconnect loop")
         await self._reconnect_loop()
 
@@ -173,25 +205,22 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         self._auto_shutdown_minutes = max(0, minutes)
         _LOGGER.debug("Auto-shutdown set to %d min", self._auto_shutdown_minutes)
 
-    # ── lifecycle ─────────────────────────────────────────────────────────────
-
     async def async_start(self) -> None:
-        # Register a BLE advertisement callback so we reconnect immediately when
-        # the device turns on, instead of waiting for HA's ConfigEntry retry timer.
         self._bt_cancel = bluetooth.async_register_callback(
             self.hass,
             self._on_bt_advertisement,
             BluetoothCallbackMatcher(address=self.address),
-            BluetoothScanningMode.ACTIVE,
+            BluetoothScanningMode.PASSIVE,
         )
         try:
-            await self._do_connect()
+            await self._connect_guarded()
         except Exception as err:
             _LOGGER.info(
-                "Device %s not available at startup (%s) — will connect when seen in BLE scan",
+                "Device %s not available at startup (%s) — will connect when seen in "
+                "BLE scan, or on the next retry",
                 self.address, err,
             )
-            # Don't raise — entities stay unavailable until the BT callback fires
+            self._ensure_reconnect_loop()
 
     async def async_stop(self) -> None:
         if self._bt_cancel:
@@ -207,8 +236,6 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
                 pass
         self._client = None
 
-    # ── BLE advertisement callback ────────────────────────────────────────────
-
     @callback
     def _on_bt_advertisement(
         self,
@@ -218,10 +245,11 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         """Triggered when the device starts advertising — attempt immediate connection."""
         import time as _time
         if _time.monotonic() < self._no_reconnect_until:
-            return  # power-off cooldown active
+            return
         if self._client and self._client.is_connected:
             return
-        # Cancel any sleeping reconnect loop and connect right now.
+        if self._connecting:
+            return
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
         _LOGGER.info("Device %s detected in BLE scan, connecting…", self.address)
@@ -233,16 +261,14 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         """Single connection attempt; restarts reconnect loop on failure."""
         import time as _time
         if _time.monotonic() < self._no_reconnect_until:
-            return  # power-off cooldown active
+            return
         try:
-            await self._do_connect()
+            await self._connect_guarded()
         except Exception as err:
             _LOGGER.debug("BT-triggered connection to %s failed: %s; resuming retry loop", self.address, err)
             self._reconnect_task = self.hass.async_create_background_task(
                 self._reconnect_loop(), name="difluid_reconnect_loop"
             )
-
-    # ── connection ────────────────────────────────────────────────────────────
 
     async def _do_connect(self) -> None:
         ble_device = bluetooth.async_ble_device_from_address(
@@ -297,26 +323,34 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         )
         self._client = client
 
-        if self._encrypted_uuid:
-            try:
-                await self._run_handshake(client)
-            except Exception as err:
-                _LOGGER.warning("Cloud handshake failed (%s); trying cleartext channel directly", err)
-                fallback_uuid = self._cleartext_uuid or write_uuid
-                self._write_char_uuid = fallback_uuid
-                await client.write_gatt_char(fallback_uuid, _CMD_AUTO_SEND_ON, response=False)
+        try:
+            if self._encrypted_uuid:
+                try:
+                    await self._run_handshake(client)
+                except Exception as err:
+                    _LOGGER.warning("Cloud handshake failed (%s); trying cleartext channel directly", err)
+                    fallback_uuid = self._cleartext_uuid or write_uuid
+                    self._write_char_uuid = fallback_uuid
+                    await client.write_gatt_char(fallback_uuid, _CMD_AUTO_SEND_ON, response=False)
+                    await asyncio.sleep(1.0)
+                    await client.write_gatt_char(fallback_uuid, _CMD_GET_STATUS, response=False)
+                    _LOGGER.info("Sent AUTO_SEND_ON to cleartext channel %s", fallback_uuid)
+            else:
+                await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=False)
                 await asyncio.sleep(1.0)
-                await client.write_gatt_char(fallback_uuid, _CMD_GET_STATUS, response=False)
-                _LOGGER.info("Sent AUTO_SEND_ON to cleartext channel %s", fallback_uuid)
-        else:
-            await client.write_gatt_char(write_uuid, _CMD_AUTO_SEND_ON, response=False)
-            await asyncio.sleep(1.0)
-            await client.write_gatt_char(write_uuid, _CMD_GET_STATUS, response=False)
-            _LOGGER.info("Auto-send enabled; waiting for notifications")
+                await client.write_gatt_char(write_uuid, _CMD_GET_STATUS, response=False)
+                _LOGGER.info("Auto-send enabled; waiting for notifications")
 
-        # Query current mode settings so the select entity shows the right value.
-        await client.write_gatt_char(self._write_char_uuid, _CMD_GET_AUTO_DETECT, response=False)
-        await client.write_gatt_char(self._write_char_uuid, _CMD_GET_AUTO_STOP, response=False)
+            await client.write_gatt_char(self._write_char_uuid, _CMD_GET_AUTO_DETECT, response=False)
+            await client.write_gatt_char(self._write_char_uuid, _CMD_GET_AUTO_STOP, response=False)
+        except BaseException:
+            self._client = None
+            self.data.connected = False
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001 - we are already failing; say so once
+                pass
+            raise
 
         self.data.connected = True
         self._last_weight_change_time = asyncio.get_event_loop().time()
@@ -376,8 +410,6 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         notify_uuids = [c.uuid.lower() for c in notify_chars]
         return write_uuid, notify_uuids
 
-    # ── poll loop ─────────────────────────────────────────────────────────────
-
     async def _poll_loop(self) -> None:
         while True:
             await asyncio.sleep(_STATUS_POLL_INTERVAL)
@@ -389,32 +421,53 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
             except Exception as err:
                 _LOGGER.warning("Status poll write failed: %s", err)
 
-            # Auto-shutdown: power off if weight hasn't changed for N minutes
             if self._auto_shutdown_minutes > 0 and self._last_weight_change_time > 0:
                 idle_sec = asyncio.get_event_loop().time() - self._last_weight_change_time
                 if idle_sec >= self._auto_shutdown_minutes * 60:
                     _LOGGER.info(
                         "Auto-shutdown: idle for %.1f min, sending power-off", idle_sec / 60
                     )
-                    # Reset timer so we don't resend every 30 s until the device disconnects
                     self._last_weight_change_time = asyncio.get_event_loop().time()
                     try:
                         await self.async_power_off()
                     except Exception as err:
                         _LOGGER.warning("Auto-shutdown failed: %s", err)
 
-    # ── disconnect / reconnect ────────────────────────────────────────────────
-
     def _on_disconnect(self, _client: BleakClientWithServiceCache) -> None:
         import time as _time
         self.data.connected = False
         self.async_set_updated_data(self.data)
+        for session in self._brew_consumers:
+            session.reset()
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
         if _time.monotonic() < self._no_reconnect_until:
             _LOGGER.info("Difluid Microbalance %s disconnected (power-off cooldown, won't reconnect for 60 s)", self.address)
             return
         _LOGGER.warning("Difluid Microbalance %s disconnected, will retry", self.address)
+        self._ensure_reconnect_loop()
+
+    async def _connect_guarded(self) -> None:
+        """Connect, unless an attempt is already under way."""
+        if self._connecting:
+            _LOGGER.debug(
+                "Connection to %s already in progress; not starting another",
+                self.address,
+            )
+            return
+        self._connecting = True
+        try:
+            await self._do_connect()
+        finally:
+            self._connecting = False
+
+    def _ensure_reconnect_loop(self) -> None:
+        """Start the reconnect loop unless one is already running.
+
+        One place rather than two, because the guard is the whole of it: a second loop
+        would race the first for the scale's single connection slot, and each would see
+        the other's half-open client as the reason it could not get in.
+        """
         if self._reconnect_task and not self._reconnect_task.done():
             return
         self._reconnect_task = self.hass.async_create_background_task(
@@ -422,25 +475,93 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         )
 
     async def _reconnect_loop(self) -> None:
+        """Retry until connected, pacing on whether the scale is actually there.
+
+        Backing off on consecutive failures is the wrong instinct for this device.
+        Nearly every failure means the same thing — the scale is switched off — and
+        a failure count keeps growing the delay for as long as that stays true.  So
+        by the time the scale is switched back on, the delay is always at its
+        maximum: the one moment that matters is the one the loop is least ready
+        for.  On 2026-08-14 the scale went off at 08:37, came back on at 08:47:11,
+        and the loop was asleep in a 120 s window; the brew was never measured.
+
+        Presence is the variable that actually matters, so pace on that instead.
+        An absent scale is not worth calling _do_connect for at all — it would fail
+        instantly with "not found" — so poll cheaply and stay ready.  A scale that
+        is advertising is retried hard, because it powers itself off again after a
+        few idle minutes and every second of that budget spent asleep is a brew
+        that goes unrecorded.
+
+        This also stops the loop depending on the advertisement callback, which is
+        the fast path but not a reliable one: on 2026-08-14 Home Assistant recorded
+        an advertisement at 08:47:11 and _on_bt_advertisement never fired.
+        """
         import time as _time
-        delay = 5
+        delay = _PRESENT_RETRY_SECONDS
         while True:
             await asyncio.sleep(delay)
-            # Respect power-off cooldown even if the loop was already running.
             remaining = self._no_reconnect_until - _time.monotonic()
             if remaining > 0:
                 await asyncio.sleep(remaining + 1)
-                delay = 5
+                delay = _PRESENT_RETRY_SECONDS
                 continue
+
+            if bluetooth.async_ble_device_from_address(
+                self.hass, self.address, connectable=True
+            ) is None:
+                delay = _ABSENT_POLL_SECONDS
+                continue
+
             try:
-                await self._do_connect()
+                await self._connect_guarded()
                 _LOGGER.info("Reconnected to Difluid Microbalance %s", self.address)
                 return
             except Exception as err:
-                _LOGGER.debug("Reconnect attempt failed (%ss): %s", delay, err)
-                delay = min(120, delay * 2)  # 5 → 10 → 20 → 40 → 80 → 120 s cap
+                _LOGGER.warning(
+                    "Difluid Microbalance %s is advertising but the connection failed "
+                    "(retry in %.0fs): %s",
+                    self.address, min(_PRESENT_RETRY_MAX_SECONDS, delay * 2), err,
+                )
+                delay = min(_PRESENT_RETRY_MAX_SECONDS, delay * 2)
 
-    # ── notification handler ──────────────────────────────────────────────────
+    def _note_weight_unit(self, unit_idx: int) -> None:
+        """Report the scale's display unit, once per change rather than per sample.
+
+        Weight packets arrive at ~5 Hz, so anything logged unconditionally here
+        produces around 18000 lines an hour and buries everything else in the log —
+        which is exactly what made the ZeroDivisionError from a zero stability window
+        so unpleasant to read.  The unit only changes when somebody presses a button
+        on the scale, so tracking the last one seen turns a flood into one line.
+
+        It is a warning and not a debug line because the reading is still converted
+        to grams and therefore still correct: without a warning there is nothing
+        anywhere to explain why the scale in the kitchen says 0.6 and Home Assistant
+        says 18.
+        """
+        if unit_idx == self._last_unit_idx:
+            return
+        previous = self._last_unit_idx
+        self._last_unit_idx = unit_idx
+        unit = WEIGHT_UNITS.get(unit_idx)
+        if unit is None:
+            _LOGGER.warning(
+                "Difluid Microbalance %s reported unknown weight unit index %s; "
+                "treating the reading as grams",
+                self.address, unit_idx,
+            )
+            return
+        if unit_idx == 0:
+            if previous is not None:
+                _LOGGER.info(
+                    "Difluid Microbalance %s is back in grams", self.address
+                )
+            return
+        _LOGGER.warning(
+            "Difluid Microbalance %s is displaying %s; readings are converted to "
+            "grams (x%s) for the sensors and the brew detector. Press the unit "
+            "button on the scale to switch back to grams.",
+            self.address, unit, _GRAMS_PER_UNIT.get(unit_idx, 1.0),
+        )
 
     def _on_notification(self, sender: Any, raw: bytearray) -> None:
         if len(raw) >= 2 and raw[0] == 0xDA and raw[1] == 0xDA:
@@ -465,14 +586,17 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         if func == 0x03 and cmd == 0x00 and len(payload) >= 13:
             weight_raw = int.from_bytes(payload[0:4], "big", signed=True)
             unit_idx = payload[12]
+            self._note_weight_unit(unit_idx)
             self.data.weight_unit = WEIGHT_UNITS.get(unit_idx, "g")
-            self.data.weight = weight_raw / (1000.0 if unit_idx == 1 else 10.0)
+            displayed = weight_raw / (1000.0 if unit_idx == 1 else 10.0)
+            self.data.weight = displayed * _GRAMS_PER_UNIT.get(unit_idx, 1.0)
             self.data.flow_rate = int.from_bytes(payload[4:6], "big", signed=True) / 10.0
             self.data.timer = int.from_bytes(payload[6:8], "big")
-            # Track weight changes for auto-shutdown
             if abs(self.data.weight - self._last_weight_value) > 0.2:
                 self._last_weight_change_time = asyncio.get_event_loop().time()
                 self._last_weight_value = self.data.weight
+            for session in self._brew_consumers:
+                session.feed(self.data.weight, self.data.flow_rate)
             updated = True
 
         elif func == 0x03 and cmd == 0x05 and len(payload) >= 3:

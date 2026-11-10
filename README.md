@@ -83,13 +83,39 @@
 
 > Второстепенные параметры (статус, батарея, зарядка) опрашиваются **раз в 1 секунду**. Вес и поток от этого не зависят — они приходят отдельными push-уведомлениями.
 
+### Microbalance — автоопределение дозы и пролива
+
+Интеграция сама распознаёт на потоке веса, когда ты взвесил зёрна и когда налил чашку, — вводить эти числа руками не нужно.
+
+| Объект | Описание |
+|---|---|
+| **Last Dose** | Вес зёрен последнего взвешивания (г). Атрибуты: `detected_at`, `plateau_seconds`, `rise_seconds` |
+| **Last Yield** | Вес напитка последнего пролива (г) |
+| **Brew Ratio** | Отношение пролив/доза последней пары. Атрибуты: `dose`, `yield`, `paired_at` |
+| **Integration Version** | Диагностический — какая сборка интеграции реально загружена |
+| Число **Measured Dose** | Доза последнего замера, введённая руками. Нужна, когда детектор принял за зёрна что-то другое — например портафильтр, поставленный обратно на весы |
+| Число **Measured Yield** | Выход последнего замера, введённый руками. Нужен, когда BLE отвалился и весы не увидели пролив |
+
+Оба числа правят **сохранённый замер** и пересчитывают экстракцию, но не трогают
+счётчик чашек и одометр смолотого: те считают то, что весы действительно взвесили.
+Если после ручного ввода весы всё-таки сообщат пролив, он заменит введённое значение —
+это была подстановка на время, а теперь есть измерение.
+
+Эти сенсоры **не уходят в `unavailable`** вместе с весами: результат последней чашки остаётся виден и после того, как весы отключились по авто-таймауту.
+
+Как это работает: детектор ищет на потоке участки стабильного веса и делит их по величине — 12–25 г это доза, 25–80 г это пролив. Доза дополнительно обязана продержаться не меньше 10 секунд, иначе портафильтр, поставленный на весы на пару секунд, засчитается как взвешивание зёрен. Пара доза → пролив собирается, если между ними прошло не больше 30 минут и отношение попадает в диапазон 1.2–6.0.
+
+Событие `difluid_microbalance_brew_detected` выдаётся на шину при каждой собранной паре — его удобно ловить автоматизациями и смотреть в Инструментах разработчика. Отдельное событие `difluid_microbalance_plateau_detected` приходит на каждое найденное плато, включая отброшенные.
+
+Все пороги настраиваются: **Настройки → Устройства и службы → DiFluid → Настроить**. Там же включается запись `difluid_brew_dataset.jsonl` — по строке на каждое плато вместе с сырым окном измерений, чтобы потом разобрать промахи.
+
 ### Microbalance — управление
 
 | Объект | Описание |
 |---|---|
 | Кнопка **Tare** | Обнуление веса (одиночное нажатие кнопки питания) |
 | Кнопка **Start/Stop** | Запуск / возобновление таймера (одиночное нажатие DLink) |
-| Селектор **Mode** | `Manual` / `Espresso` / `Pour Over` — управляет Auto Detect Timing и Auto Stop Timing |
+| Селектор **Mode** | `Manual` / `Espresso` / `Pour Over` — управляет Auto Detect Timing и Auto Stop Timing. Показывает «неизвестно», если весы оказались в комбинации, не совпадающей ни с одним режимом |
 | Число **Auto-disconnect Bluetooth** | Разорвать BLE через N минут без изменения веса (0 = отключено). После разрыва весы выключаются по собственному аппаратному таймеру |
 
 ### R2 Extract — сенсоры
@@ -127,9 +153,33 @@
 type: custom:difluid-card
 device: <device_id>   # выбирается в редакторе карточки
 title: Мои весы       # необязательно
+sections: [live]      # необязательно: live | statistics | diagnostic
+```
+
+`sections` выбирает, какие группы показывает одна карточка. Без него показываются все
+три — как и раньше, так что уже настроенные карточки не меняются. С ним статистику
+детектора и разбор последней чашки можно вынести на отдельные карточки, где заголовок
+называет детектор, а не весы:
+
+```yaml
+type: custom:difluid-card
+device: <device_id детектора>
+sections: [statistics]
 ```
 
 > Карточка грузится автоматически (интеграция регистрирует её как ресурс) — добавлять её в **Настройки → Панели** вручную не нужно. Если сразу не появилась в списке — обновите страницу с очисткой кэша (Ctrl+F5).
+
+### Готовый дашборд как пример
+
+В [`examples/dashboard-coffee.yaml`](examples/dashboard-coffee.yaml) лежит рабочий
+дашборд автора: график пролива, кнопки управления, живые показания весов и
+рефрактометр. Его можно взять целиком — **Изменить дашборд → ⋮ → Редактор кода** и
+вставить вместо содержимого — или растащить по кускам.
+
+Идентификаторы устройств в примере заменены на заглушки: они у каждой установки свои,
+и чужой `device_id` не совпадёт ни с чем, так что карточки останутся пустыми. Свои
+возьмите в **Настройки → Устройства и службы → Difluid** либо просто удалите строку
+`device:` и выберите устройство в редакторе карточки.
 
 ---
 
@@ -280,6 +330,32 @@ Display order: Weight → Flow Rate → Timer → Device Status → Battery.
 
 > Secondary values (status, battery, charging) are polled **once per second**. Weight and flow are independent — they arrive as separate push notifications.
 
+### Microbalance — automatic dose and yield detection
+
+The integration works out from the weight stream when you weighed beans and when you pulled a shot, so neither number has to be typed in.
+
+| Entity | Description |
+|---|---|
+| **Last Dose** | Bean weight of the last weighing (g). Attributes: `detected_at`, `plateau_seconds`, `rise_seconds` |
+| **Last Yield** | Beverage weight of the last pour (g) |
+| **Brew Ratio** | Yield-to-dose ratio of the last pair. Attributes: `dose`, `yield`, `paired_at` |
+| **Integration Version** | Diagnostic — which build is actually loaded |
+| **Measured Dose** number | The last measured brew's dose, typed in by hand. For when the detector took something else for the beans — a portafilter set back on the scale, say |
+| **Measured Yield** number | The last measured brew's yield, typed in by hand. For when BLE dropped and the scale never saw the pour |
+
+Both edit the **stored measurement** and recompute the extraction, and neither touches
+the brew count or the ground-coffee odometer: those count what the scale actually
+weighed. If the scale later reports the pour after all, it supersedes what was typed —
+that was a stand-in, and now there is a measurement.
+
+These sensors **do not go `unavailable`** with the scale: the last shot stays readable after the scale drops its BLE link on the idle timer.
+
+How it works: the detector finds stretches of stable weight and splits them by mass — 12–25 g is a dose, 25–80 g is a pour. A dose must additionally be held for at least 10 seconds, otherwise a portafilter rested on the scale for a moment would be counted as weighing beans. A dose → pour pair is formed when the two are less than 30 minutes apart and the ratio falls between 1.2 and 6.0.
+
+A `difluid_microbalance_brew_detected` event fires on the bus for every completed pair — convenient for automations and visible in Developer Tools. A separate `difluid_microbalance_plateau_detected` event fires for every plateau found, including rejected ones.
+
+Every threshold is configurable under **Settings → Devices & Services → DiFluid → Configure**, which is also where you enable writing `difluid_brew_dataset.jsonl` — one line per plateau with its raw measurement window, for diagnosing misses later.
+
 ### Microbalance — controls
 
 | Entity | Description |
@@ -324,9 +400,33 @@ The card works for both the scale and the R2. The YAML equivalent:
 type: custom:difluid-card
 device: <device_id>   # chosen in the card editor
 title: My Scale       # optional
+sections: [live]      # optional: live | statistics | diagnostic
+```
+
+`sections` picks which groups one card shows. Omit it and you get all three, exactly as
+before, so cards already on a dashboard are unchanged. With it, the detector's
+statistics and the last shot's working parts can each sit on their own card, headed by
+the detector rather than by the scale:
+
+```yaml
+type: custom:difluid-card
+device: <detector device_id>
+sections: [statistics]
 ```
 
 > The card is loaded automatically (the integration registers it as a resource) — you do **not** need to add it under **Settings → Dashboards → Resources**. If it doesn't appear right away, hard-refresh the page (Ctrl+F5).
+
+### A ready-made dashboard to start from
+
+[`examples/dashboard-coffee.yaml`](examples/dashboard-coffee.yaml) is the author's own
+working dashboard: pour chart, controls, live scale readings and the refractometer.
+Take it whole — **Edit dashboard → ⋮ → Raw configuration editor**, replace the contents
+— or lift the pieces you want.
+
+The device ids in it are placeholders. They are random per install, so someone else's
+`device_id` matches nothing and every card comes up blank. Find yours under **Settings →
+Devices & services → Difluid**, or just drop the `device:` line and pick the device in
+the card editor.
 
 ---
 

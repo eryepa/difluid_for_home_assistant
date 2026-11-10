@@ -7,14 +7,28 @@ from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_ADDRESS
+from homeassistant.core import callback
 
+from .brew_detect import TUNABLE_FIELDS, DetectorConfig
+from .brew_session import DEFAULT_STORE_KEY
 from .const import (
     CONF_DEVICE_TYPE,
     CONF_IS_TI,
     CONF_LICENSE_KEY,
     CONF_MODEL,
+    CONF_R2_ENTRY,
+    CONF_RECORD_DATASET,
+    CONF_SCALE_ENTRY,
+    CONF_STORE_KEY,
+    CONF_UID_PREFIX,
+    DEVICE_TYPE_DETECTOR,
     DEVICE_TYPE_MICROBALANCE,
     DEVICE_TYPE_R2,
     DOMAIN,
@@ -23,6 +37,7 @@ from .const import (
     SERVICE_UUID_R2,
 )
 
+_R2_NONE = "none"
 
 def _device_type(service_uuids: list[str]) -> str | None:
     lower = {u.lower() for u in service_uuids}
@@ -32,7 +47,6 @@ def _device_type(service_uuids: list[str]) -> str | None:
         return DEVICE_TYPE_MICROBALANCE
     return None
 
-
 def _device_type_from_name(name: str) -> str | None:
     """Detect device type from BLE advertisement name.
 
@@ -40,18 +54,14 @@ def _device_type_from_name(name: str) -> str | None:
     only reliable way to auto-discover them from the BLE scan list.
     """
     lower = (name or "").lower()
-    # R2 advertises as "DiFluid R2 XXXXXX"
     if lower.startswith("difluid r2") or lower.startswith("r2"):
         return DEVICE_TYPE_R2
-    # Microbalance advertises as "Microbalance XXXXXX" or "Microbalance Ti XXXXXX"
     if lower.startswith("microbalance"):
         return DEVICE_TYPE_MICROBALANCE
     return None
 
-
 def _discover_type(info: BluetoothServiceInfoBleak) -> str | None:
     return _device_type(info.service_uuids) or _device_type_from_name(info.name or "")
-
 
 class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
@@ -60,7 +70,10 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
         self._discovery_info: BluetoothServiceInfoBleak | None = None
         self._discovered_devices: dict[str, BluetoothServiceInfoBleak] = {}
 
-    # ── triggered by HA Bluetooth integration (service UUID match) ────────────
+    @staticmethod
+    @callback
+    def async_get_options_flow(entry: ConfigEntry) -> "DifluidOptionsFlow":
+        return DifluidOptionsFlow()
 
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
@@ -100,9 +113,92 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
             description_placeholders={"name": info.name or info.address},
         )
 
-    # ── user-initiated flow ────────────────────────────────────────────────────
+    def _entries_of_type(self, device_type: str) -> dict[str, str]:
+        """entry_id -> title, for every loaded entry of one device type."""
+        return {
+            entry.entry_id: entry.title
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+            if entry.data.get(CONF_DEVICE_TYPE, DEVICE_TYPE_MICROBALANCE) == device_type
+        }
 
     async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if self._entries_of_type(DEVICE_TYPE_MICROBALANCE):
+            return self.async_show_menu(
+                step_id="user", menu_options=["device", "detector"]
+            )
+        return await self.async_step_device()
+
+    async def async_step_detector(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Add the brew detector: which scale to read, and optionally which R2."""
+        scales = self._entries_of_type(DEVICE_TYPE_MICROBALANCE)
+        if not scales:
+            return self.async_abort(reason="no_scale")
+
+        if user_input is not None:
+            scale_id = user_input[CONF_SCALE_ENTRY]
+            await self.async_set_unique_id(
+                f"{DEVICE_TYPE_DETECTOR}_{scale_id}", raise_on_progress=False
+            )
+            self._abort_if_unique_id_configured()
+            r2_id = user_input.get(CONF_R2_ENTRY) or None
+            if r2_id == _R2_NONE:
+                r2_id = None
+            return self.async_create_entry(
+                title="Brew Detector",
+                data={
+                    CONF_DEVICE_TYPE: DEVICE_TYPE_DETECTOR,
+                    CONF_SCALE_ENTRY: scale_id,
+                    CONF_R2_ENTRY: r2_id,
+                },
+            )
+
+        r2s = {_R2_NONE: "None", **self._entries_of_type(DEVICE_TYPE_R2)}
+        return self.async_show_form(
+            step_id="detector",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_SCALE_ENTRY, default=next(iter(scales))
+                    ): vol.In(scales),
+                    vol.Optional(CONF_R2_ENTRY, default=_R2_NONE): vol.In(r2s),
+                }
+            ),
+        )
+
+    async def async_step_import(
+        self, import_data: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """Create the detector entry for an install that predates it.
+
+        Started by the scale's own setup when it finds detector thresholds still
+        sitting in its options and no detector referencing it.  The two keys that
+        matter are carried in rather than derived: CONF_UID_PREFIX is the scale's
+        entry_id, so the seven statistics entities keep the unique_ids they already
+        have and stay the same entities, and CONF_STORE_KEY is the singleton's old
+        key, so brew_count and the last pair come across with them.
+        """
+        scale_id = import_data[CONF_SCALE_ENTRY]
+        await self.async_set_unique_id(
+            f"{DEVICE_TYPE_DETECTOR}_{scale_id}", raise_on_progress=False
+        )
+        self._abort_if_unique_id_configured()
+        return self.async_create_entry(
+            title="Brew Detector",
+            data={
+                CONF_DEVICE_TYPE: DEVICE_TYPE_DETECTOR,
+                CONF_SCALE_ENTRY: scale_id,
+                CONF_R2_ENTRY: import_data.get(CONF_R2_ENTRY),
+                CONF_UID_PREFIX: scale_id,
+                CONF_STORE_KEY: DEFAULT_STORE_KEY,
+            },
+            options=import_data.get("options", {}),
+        )
+
+    async def async_step_device(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         current = self._async_current_ids()
@@ -111,7 +207,6 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
                 self._discovered_devices[info.address] = info
 
         if not self._discovered_devices:
-            # Nothing found in BLE scan — go straight to MAC entry form
             return await self.async_step_mac()
 
         if user_input is not None:
@@ -145,7 +240,7 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
         }
         choices["manual"] = "Enter MAC address manually…"
         return self.async_show_form(
-            step_id="user",
+            step_id="device",
             data_schema=vol.Schema(
                 {vol.Required(CONF_ADDRESS, default="manual"): vol.In(choices)}
             ),
@@ -190,4 +285,96 @@ class DifluidMicrobalanceConfigFlow(ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors=errors,
+        )
+
+ERROR_RANGE_ORDER = "invalid_range_order"
+
+_OPTION_RANGES: dict[str, tuple[float, float]] = {
+    "stable_tol": (0.01, 50.0),
+    "stable_seconds": (0.5, 60.0),
+    "stable_time_fraction": (0.05, 1.0),
+    "settle_min_seconds": (0.0, 60.0),
+    "min_mass": (0.0, 500.0),
+    "dose_min": (0.0, 500.0),
+    "dose_max": (0.0, 500.0),
+    "dose_min_hold_seconds": (0.0, 3600.0),
+    "dose_min_rise_seconds": (0.0, 3600.0),
+    "yield_min": (0.0, 500.0),
+    "yield_max": (0.0, 500.0),
+    "pair_window_seconds": (1.0, 86400.0),
+    "ratio_min": (0.01, 50.0),
+    "ratio_max": (0.01, 50.0),
+    "gap_reset_seconds": (0.5, 3600.0),
+}
+
+_FALLBACK_RANGE = (0.0, 86400.0)
+
+_ORDERED_PAIRS: tuple[tuple[str, str], ...] = (
+    ("dose_min", "dose_max"),
+    ("yield_min", "yield_max"),
+    ("ratio_min", "ratio_max"),
+)
+
+def _field_validator(key: str):
+    """voluptuous validator for one tunable: coerce to float, then bounds-check."""
+    low, high = _OPTION_RANGES.get(key, _FALLBACK_RANGE)
+    return vol.All(vol.Coerce(float), vol.Range(min=low, max=high))
+
+def _misordered_pairs(values: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return the bands in `values` whose low bound is above its high bound."""
+    bad: list[tuple[str, str]] = []
+    for low_key, high_key in _ORDERED_PAIRS:
+        if low_key not in values or high_key not in values:
+            continue
+        try:
+            if float(values[low_key]) > float(values[high_key]):
+                bad.append((low_key, high_key))
+        except (TypeError, ValueError):
+            continue
+    return bad
+
+class DifluidOptionsFlow(OptionsFlow):
+    """Tune the dose/pour detector without editing code or redeploying.
+
+    Only exposed for the detector entry.  It used to hang off the scale, which was
+    the only entry that existed to hang it on; now the thresholds live with the
+    thing they configure, and neither BLE entry has anything to tune here.
+    """
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if self.config_entry.data.get(CONF_DEVICE_TYPE) != DEVICE_TYPE_DETECTOR:
+            return self.async_abort(reason="no_options")
+
+        errors: dict[str, str] = {}
+        current: dict[str, Any] = dict(self.config_entry.options)
+
+        if user_input is not None:
+            bad = _misordered_pairs(user_input)
+            if not bad:
+                return self.async_create_entry(title="", data=user_input)
+            errors["base"] = ERROR_RANGE_ORDER
+            for low_key, high_key in bad:
+                errors[low_key] = ERROR_RANGE_ORDER
+                errors[high_key] = ERROR_RANGE_ORDER
+            current = dict(user_input)
+
+        defaults = DetectorConfig()
+        schema: dict[Any, Any] = {}
+        for key in TUNABLE_FIELDS:
+            default = getattr(defaults, key, None)
+            if default is None:
+                continue
+            schema[
+                vol.Optional(key, default=current.get(key, default))
+            ] = _field_validator(key)
+        schema[
+            vol.Optional(
+                CONF_RECORD_DATASET, default=current.get(CONF_RECORD_DATASET, False)
+            )
+        ] = bool
+
+        return self.async_show_form(
+            step_id="init", data_schema=vol.Schema(schema), errors=errors
         )
