@@ -11,6 +11,8 @@ that decide whether we ever try again.
 
 from __future__ import annotations
 
+import asyncio
+
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -169,3 +171,59 @@ async def test_the_reconnect_loop_is_never_started_twice(hass: HomeAssistant) ->
     assert coordinator._reconnect_task is first
 
     await coordinator.async_stop()
+
+
+async def test_two_attempts_at_once_collapse_into_one(hass: HomeAssistant) -> None:
+    """A second connection request while one is in flight must not be started.
+
+    Seen on the live install: the advertisement callback fired while the start-up
+    attempt was still running, and the proxy answered the second request with
+    "Connection request ignored, state: CONNECTING" — after which the first attempt
+    timed out.  A second attempt costs the first its chance, so it is not merely
+    wasted work.
+    """
+    coordinator = _coordinator(hass)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def slow_connect() -> None:
+        calls.append("attempt")
+        started.set()
+        await release.wait()
+
+    coordinator._do_connect = slow_connect
+
+    first = asyncio.create_task(coordinator._connect_guarded())
+    await started.wait()
+    await asyncio.wait_for(coordinator._connect_guarded(), timeout=0.5)  # must return
+    # at once, not queue a second attempt that would block until `release`
+    release.set()
+    await first
+
+    assert calls == ["attempt"], "a second connection was started while one was running"
+    assert coordinator._connecting is False
+
+
+async def test_the_guard_is_released_after_a_failure(hass: HomeAssistant) -> None:
+    """A failed attempt must not leave the coordinator permanently unable to retry."""
+    coordinator = _coordinator(hass)
+    coordinator._do_connect = AsyncMock(side_effect=OSError("nothing there"))
+
+    with pytest.raises(OSError):
+        await coordinator._connect_guarded()
+
+    assert coordinator._connecting is False, "the flag stayed set, so no retry can run"
+
+
+async def test_an_advertisement_during_a_connect_starts_nothing(
+    hass: HomeAssistant,
+) -> None:
+    coordinator = _coordinator(hass)
+    coordinator._connecting = True
+
+    coordinator._on_bt_advertisement(MagicMock(), MagicMock())
+
+    assert coordinator._reconnect_task is None, (
+        "an advertisement started a second attempt while one was already running"
+    )

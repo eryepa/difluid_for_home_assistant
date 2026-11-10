@@ -193,6 +193,9 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         self._auth_response: Optional[asyncio.Future] = None
         self._direct_probe: Optional[asyncio.Future] = None
         self._reconnect_task: Optional[asyncio.Task] = None
+        #: True while a connection attempt is in flight — see the same guard in
+        #: coordinator.py for why two attempts at one device are worse than none.
+        self._connecting = False
         self._shutdown_task: Optional[asyncio.Task] = None
         self._bt_cancel: Optional[Callable] = None
         self._no_reconnect_until: float = 0.0
@@ -210,7 +213,7 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             BluetoothScanningMode.PASSIVE,
         )
         try:
-            await self._do_connect()
+            await self._connect_guarded()
         except Exception as err:
             _LOGGER.info(
                 "R2 %s not available at startup (%s) — will keep looking",
@@ -288,6 +291,8 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             return
         if self._client and self._client.is_connected:
             return
+        if self._connecting:
+            return
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
         _LOGGER.info("R2 %s detected in BLE scan, connecting…", self.address)
@@ -300,13 +305,27 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         if _time.monotonic() < self._no_reconnect_until:
             return
         try:
-            await self._do_connect()
+            await self._connect_guarded()
         except Exception as err:
             _LOGGER.debug(
                 "BT-triggered R2 connection to %s failed: %s; resuming retry loop",
                 self.address, err,
             )
             self._ensure_reconnect_loop()
+
+    async def _connect_guarded(self) -> None:
+        """Connect, unless an attempt is already under way."""
+        if self._connecting:
+            _LOGGER.debug(
+                "Connection to %s already in progress; not starting another",
+                self.address,
+            )
+            return
+        self._connecting = True
+        try:
+            await self._do_connect()
+        finally:
+            self._connecting = False
 
     def _ensure_reconnect_loop(self) -> None:
         """Start the reconnect loop unless one is already running."""
@@ -569,7 +588,7 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             )
             try:
                 if present:
-                    await self._do_connect()
+                    await self._connect_guarded()
                     _LOGGER.info("Reconnected to Difluid R2 %s", self.address)
                     return
             except Exception as err:

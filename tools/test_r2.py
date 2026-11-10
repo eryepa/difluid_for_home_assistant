@@ -23,6 +23,7 @@ from __future__ import annotations
 import sys
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from homeassistant.core import HomeAssistant, State
@@ -544,3 +545,53 @@ async def test_the_loop_is_never_started_twice(hass: HomeAssistant) -> None:
     assert coordinator._reconnect_task is first
 
     await coordinator.async_stop()
+
+
+async def test_two_attempts_at_once_collapse_into_one(hass: HomeAssistant) -> None:
+    """Same guard as the scale's, and it was missing here too."""
+    import asyncio
+
+    coordinator = _coordinator(hass)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def slow_connect() -> None:
+        calls.append("attempt")
+        started.set()
+        await release.wait()
+
+    coordinator._do_connect = slow_connect
+
+    first = asyncio.create_task(coordinator._connect_guarded())
+    await started.wait()
+    await asyncio.wait_for(coordinator._connect_guarded(), timeout=0.5)  # must return
+    # at once, not queue a second attempt that would block until `release`
+    release.set()
+    await first
+
+    assert calls == ["attempt"]
+    assert coordinator._connecting is False
+
+
+async def test_the_guard_is_released_after_a_failure(hass: HomeAssistant) -> None:
+    coordinator = _coordinator(hass)
+    coordinator._do_connect = AsyncMock(side_effect=OSError("nothing there"))
+
+    with pytest.raises(OSError):
+        await coordinator._connect_guarded()
+
+    assert coordinator._connecting is False
+
+
+async def test_an_advertisement_during_a_connect_starts_nothing(
+    hass: HomeAssistant,
+) -> None:
+    from unittest.mock import MagicMock
+
+    coordinator = _coordinator(hass)
+    coordinator._connecting = True
+
+    coordinator._on_bt_advertisement(MagicMock(), MagicMock())
+
+    assert coordinator._reconnect_task is None

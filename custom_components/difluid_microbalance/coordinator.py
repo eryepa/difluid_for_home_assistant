@@ -100,6 +100,14 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         self._client: Optional[BleakClientWithServiceCache] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
+        #: True while a connection attempt is in flight.
+        #:
+        #: Two attempts at one device is not merely wasted work: the proxy has been
+        #: seen to answer the second with "Connection request ignored, state:
+        #: CONNECTING" and then time the first one out, so a second attempt can cost
+        #: the first its chance.  Startup, the advertisement callback and the retry
+        #: loop all reach _do_connect, so the guard has to be in one place they share.
+        self._connecting = False
         self._bt_cancel: Optional[Callable] = None
         self._auto_shutdown_minutes: int = 0
         self._no_reconnect_until: float = 0.0
@@ -205,7 +213,7 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
             BluetoothScanningMode.PASSIVE,
         )
         try:
-            await self._do_connect()
+            await self._connect_guarded()
         except Exception as err:
             _LOGGER.info(
                 "Device %s not available at startup (%s) — will connect when seen in "
@@ -240,6 +248,8 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
             return
         if self._client and self._client.is_connected:
             return
+        if self._connecting:
+            return
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
         _LOGGER.info("Device %s detected in BLE scan, connecting…", self.address)
@@ -253,7 +263,7 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         if _time.monotonic() < self._no_reconnect_until:
             return
         try:
-            await self._do_connect()
+            await self._connect_guarded()
         except Exception as err:
             _LOGGER.debug("BT-triggered connection to %s failed: %s; resuming retry loop", self.address, err)
             self._reconnect_task = self.hass.async_create_background_task(
@@ -437,6 +447,20 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
         _LOGGER.warning("Difluid Microbalance %s disconnected, will retry", self.address)
         self._ensure_reconnect_loop()
 
+    async def _connect_guarded(self) -> None:
+        """Connect, unless an attempt is already under way."""
+        if self._connecting:
+            _LOGGER.debug(
+                "Connection to %s already in progress; not starting another",
+                self.address,
+            )
+            return
+        self._connecting = True
+        try:
+            await self._do_connect()
+        finally:
+            self._connecting = False
+
     def _ensure_reconnect_loop(self) -> None:
         """Start the reconnect loop unless one is already running.
 
@@ -489,7 +513,7 @@ class DifluidMicrobalanceCoordinator(DataUpdateCoordinator[MicrobalanceData]):
                 continue
 
             try:
-                await self._do_connect()
+                await self._connect_guarded()
                 _LOGGER.info("Reconnected to Difluid Microbalance %s", self.address)
                 return
             except Exception as err:
