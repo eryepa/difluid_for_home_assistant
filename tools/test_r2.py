@@ -24,7 +24,8 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
-from homeassistant.core import HomeAssistant
+import pytest
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
@@ -340,3 +341,139 @@ async def test_a_calibration_result_does_not_overwrite_the_last_reading(
     assert coordinator.data.refractive_index == 1.35264, (
         "and took the refractive index with it"
     )
+
+
+# A package-2 header that claims seven payload bytes and carries three: the frame
+# announces more than arrived, which is what a dropped notification looks like.
+_TRUNCATED_RESULT = bytes.fromhex("dfdf0303070204 4f".replace(" ", ""))
+
+
+def test_a_short_frame_is_rejected_rather_than_parsed_short() -> None:
+    """`data_len` comes off the wire, so it cannot be trusted to bound the slice.
+
+    Without the length check the parser slices `payload[3:7]` off a payload of three
+    bytes, gets an empty slice, and publishes a refractive index of 0.0 — a number
+    shaped like a reading, from a packet that did not contain one.
+    """
+    from custom_components.difluid_microbalance.coordinator_r2 import _decode_frame
+
+    assert _decode_frame(_TRUNCATED_RESULT) is None
+    assert _decode_frame(b"\xdf\xdf\x03") is None
+    assert _decode_frame(b"\xda\xda\x00\x00\x00") is None
+    assert _decode_frame(_LOOP_RESULT) is not None
+
+
+async def test_a_truncated_result_leaves_the_last_reading_alone(
+    hass: HomeAssistant,
+) -> None:
+    coordinator = _coordinator(hass)
+    coordinator._on_data_notification(None, bytearray(_LOOP_RESULT))
+    before = coordinator.data.refractive_index
+
+    coordinator._on_data_notification(None, bytearray(_TRUNCATED_RESULT))
+
+    assert coordinator.data.refractive_index == before
+    assert coordinator.data.concentration == 11.03
+
+
+# ── the predicate, on its own ────────────────────────────────────────────────────
+# It used to be four ifs inside a closure that only a real state change could reach,
+# which meant three of its four branches could be deleted with the suite green.
+
+def _status_event(old_state, new_state):
+    from types import SimpleNamespace
+
+    def state(value):
+        return None if value is None else State("sensor.r2_test_status", value)
+
+    return SimpleNamespace(
+        data={"old_state": state(old_state), "new_state": state(new_state)}
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        # The ordinary case: a test started and has now finished.
+        ("Test Start", "Test Finished", True),
+        ("Loop Test Ongoing", "Loop Test Finished", True),
+        # Finished again with the same state republished: no new test.
+        ("Test Finished", "Test Finished", False),
+        # Coming back from the dead is not a test finishing — the coordinator still
+        # holds the previous reading and republishes it with this status.
+        ("unavailable", "Test Finished", False),
+        ("unknown", "Test Finished", False),
+        (None, "Test Finished", False),
+        # Nothing finished at all.
+        ("Test Start", "Test Start", False),
+        ("Test Start", "Loop Test Ongoing", False),
+        ("Calibration Start", "Calibration Finished", False),
+        # The entity is gone rather than changed: removing it fires a state change
+        # with no new state at all.
+        ("Test Finished", None, False),
+    ],
+)
+def test_only_a_real_finish_counts_as_one(old, new, expected) -> None:
+    from custom_components.difluid_microbalance import _is_finished_test
+
+    assert _is_finished_test(_status_event(old, new)) is expected
+
+
+# A Device Settings frame that sets the unit to Fahrenheit: func 0x01, cmd 0x00.
+# Taken from protocolR2.md's own example, checksum included.
+_SETTINGS_FAHRENHEIT = bytes.fromhex("dfdf01000101c1")
+
+# The same command with no payload — a *request* rather than a setting.  It must not
+# overwrite the unit, and it is the only frame that reaches the settings parser
+# without a payload, so it is what the length guard is really for.
+_SETTINGS_EMPTY = bytes.fromhex("dfdf010000bf")
+
+
+async def test_the_unit_arrives_from_the_settings_frame_too(hass: HomeAssistant) -> None:
+    """A fourth branch of the old parser: func 0x01, cmd 0x00.
+
+    It was the one branch with no test at all, and deleting it from the dispatch table
+    left the whole suite green — so a device that reports its unit this way would have
+    silently kept reporting the previous one.
+    """
+    coordinator = _coordinator(hass)
+
+    coordinator._on_data_notification(None, bytearray(_LOOP_TEMPS))
+    assert coordinator.data.temperature_unit == "°C"
+
+    coordinator._on_data_notification(None, bytearray(_SETTINGS_FAHRENHEIT))
+
+    assert coordinator.data.temperature_unit == "°F"
+
+
+async def test_an_empty_settings_frame_leaves_the_unit_alone(
+    hass: HomeAssistant,
+) -> None:
+    coordinator = _coordinator(hass)
+    coordinator._on_data_notification(None, bytearray(_LOOP_TEMPS))
+    before = coordinator.data.temperature_unit
+
+    coordinator._on_data_notification(None, bytearray(_SETTINGS_EMPTY))
+
+    assert coordinator.data.temperature_unit == before
+
+
+async def test_a_misspelled_field_fails_loudly(hass: HomeAssistant) -> None:
+    """The parser table returns field names as strings, so a typo would be silent.
+
+    `setattr(self.data, "temperature_units", …)` creates a stray attribute instead of
+    raising, and the entity that should have updated simply stops — no error, no log
+    line.  The guard turns that into an exception at the first packet.
+    """
+    from custom_components.difluid_microbalance import coordinator_r2
+
+    coordinator = _coordinator(hass)
+    original = coordinator_r2._R2_PACKAGE_PARSERS[coordinator_r2._R2_PKG_STATUS]
+    coordinator_r2._R2_PACKAGE_PARSERS[coordinator_r2._R2_PKG_STATUS] = (
+        lambda payload, cmd: {"temperature_units": "°F"}
+    )
+    try:
+        with pytest.raises(KeyError, match="temperature_units"):
+            coordinator._on_data_notification(None, bytearray(_LOOP_STATUS))
+    finally:
+        coordinator_r2._R2_PACKAGE_PARSERS[coordinator_r2._R2_PKG_STATUS] = original

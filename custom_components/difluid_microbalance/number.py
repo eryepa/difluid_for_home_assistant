@@ -21,14 +21,13 @@ from .const import (
 )
 from .coordinator import DifluidMicrobalanceCoordinator
 
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     if entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_R2:
-        return  # R2 has its own hardware auto-off, no need for this entity
+        return
 
     if entry.data.get(CONF_DEVICE_TYPE) == DEVICE_TYPE_DETECTOR:
         session: BrewSession = hass.data[DOMAIN][entry.entry_id]
@@ -51,7 +50,6 @@ async def async_setup_entry(
         model="Microbalance Ti" if is_ti else "Microbalance",
     )
     async_add_entities([AutoShutdownNumber(coordinator, entry, device_info)])
-
 
 class _MeasuredNumber(NumberEntity):
     """One half of the last measured brew, typed in by hand.
@@ -77,23 +75,15 @@ class _MeasuredNumber(NumberEntity):
     _attr_mode = NumberMode.BOX
     _attr_should_poll = False
 
-    #: entity_id suffix and the field of BrewMeasurement this one shows.  Subclasses
-    #: set both; nothing here has a default, because a subclass that forgot one would
-    #: otherwise silently become a second copy of the other control.
     _key: str
     _field: str
 
     def __init__(self, session: BrewSession, uid_prefix: str, device_info: DeviceInfo):
         self._session = session
-        # Same prefix rule as the brew sensors — see DifluidBrewSensor.__init__.  The
-        # `sensor.…_brew_yield` and `sensor.…_last_dose` that already exist are a
-        # different domain, so these unique_ids cannot collide with them.
         self._attr_unique_id = f"{uid_prefix}_{self._key}"
         self._attr_device_info = device_info
 
     async def async_added_to_hass(self) -> None:
-        # add_listener returns nothing, so the pairing is explicit rather than through
-        # async_on_remove — same as DifluidBrewSensor.
         self._session.add_listener(self._handle_update)
 
     async def async_will_remove_from_hass(self) -> None:
@@ -111,7 +101,6 @@ class _MeasuredNumber(NumberEntity):
         point = self._session.last_measurement
         return None if point is None else getattr(point, self._field)
 
-
 class MeasuredDoseNumber(_MeasuredNumber):
     """What went in, corrected by hand when the detector weighed the wrong thing.
 
@@ -125,14 +114,10 @@ class MeasuredDoseNumber(_MeasuredNumber):
     _field = "dose"
     _attr_name = "Measured Dose"
     _attr_icon = "mdi:coffee-outline"
-    # A dose, not a pour: the detector's own dose range with a lot of room either side,
-    # since this is for the cases it judged wrongly and its thresholds are guidance
-    # here rather than law.  100 g is already several portafilters.
     _attr_native_max_value = 100
 
     async def async_set_native_value(self, value: float) -> None:
         self._session.set_measured_dose(value)
-
 
 class MeasuredYieldNumber(_MeasuredNumber):
     """The yield of the brew that was measured last, typed in when the scale missed it.
@@ -144,21 +129,16 @@ class MeasuredYieldNumber(_MeasuredNumber):
     _field = "yield_g"
     _attr_name = "Measured Yield"
     _attr_icon = "mdi:cup-outline"
-    # The detector's own plausible-pour range, widened a little at both ends, for the
-    # same reason the dose's is.
     _attr_native_max_value = 200
 
     async def async_set_native_value(self, value: float) -> None:
         self._session.set_measured_yield(value)
-
 
 class AutoShutdownNumber(
     CoordinatorEntity[DifluidMicrobalanceCoordinator], NumberEntity, RestoreEntity
 ):
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.CONFIG
-    # Name it after what it actually does: disconnect BLE after N idle minutes,
-    # which lets the scale power off via its own hardware auto-off timer.
     _attr_name = "Auto-disconnect Bluetooth"
     _attr_icon = "mdi:bluetooth-off"
     _attr_native_min_value = 0
@@ -190,7 +170,6 @@ class AutoShutdownNumber(
 
     @property
     def available(self) -> bool:
-        # Always available — user can configure it even when device is off
         return True
 
     @property

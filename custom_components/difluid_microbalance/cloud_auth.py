@@ -11,7 +11,6 @@ from .const import R2_API_URL
 
 _LOGGER = logging.getLogger(__name__)
 
-
 class DifluidCloudAuth:
     """Runs the DiFluid 3-step cloud handshake that unlocks the cleartext channel.
 
@@ -52,7 +51,6 @@ class DifluidCloudAuth:
         """Execute the full handshake. Raises on failure."""
         headers = {"Content-Type": "application/json", "license": self._license_key}
         async with aiohttp.ClientSession() as session:
-            # Step 1: cmd1 → device → relay response → sn/mac
             cmd1 = await self._cmd_request(session, headers, "cmd1")
             resp1 = await self._write_and_wait(bytes.fromhex(cmd1))
             result1 = await self._dev_respond(session, headers, resp1.hex())
@@ -60,7 +58,6 @@ class DifluidCloudAuth:
             self.mac = result1.get("mac", "")
             _LOGGER.info("DiFluid handshake: SN=%s MAC=%s", self.sn, self.mac)
 
-            # Step 2: cmd2 → device → relay response → cmd3
             cmd2 = await self._cmd_request(
                 session, headers, "cmd2", {"sn": self.sn, "mac": self.mac}
             )
@@ -69,12 +66,10 @@ class DifluidCloudAuth:
                 session, headers, resp2.hex(), self.sn, self.mac
             )
 
-            # Step 3: cmd3 (instructContent) → device → relay response
             cmd3 = result2.get("instructContent", "")
             resp3 = await self._write_and_wait(bytes.fromhex(cmd3))
             await self._dev_respond(session, headers, resp3.hex(), self.sn, self.mac)
 
-            # Step 4: enableCleartext → device (no response expected)
             enable_cmd = await self._cmd_request(
                 session, headers, "enableCleartext", {"sn": self.sn, "mac": self.mac}
             )

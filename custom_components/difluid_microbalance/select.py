@@ -14,7 +14,6 @@ from .coordinator import DifluidMicrobalanceCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# (auto_detect_timing, auto_stop_timing)
 _MODE_MAP: dict[str, tuple[bool, bool]] = {
     "Manual":    (False, False),
     "Espresso":  (True, False),
@@ -26,7 +25,6 @@ def _build_cmd(func: int, cmd: int, data: bytes = b"") -> bytes:
     frame = bytes([func, cmd, len(data)]) + data
     full = header + frame
     return full + bytes([sum(full) & 0xFF])
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -44,7 +42,6 @@ async def async_setup_entry(
         model="Microbalance Ti" if is_ti else "Microbalance",
     )
     async_add_entities([DifluidModeSelect(coordinator, entry, device_info)])
-
 
 class DifluidModeSelect(CoordinatorEntity[DifluidMicrobalanceCoordinator], SelectEntity):
     _attr_has_entity_name = True
