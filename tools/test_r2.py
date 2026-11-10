@@ -477,3 +477,70 @@ async def test_a_misspelled_field_fails_loudly(hass: HomeAssistant) -> None:
             coordinator._on_data_notification(None, bytearray(_LOOP_STATUS))
     finally:
         coordinator_r2._R2_PACKAGE_PARSERS[coordinator_r2._R2_PKG_STATUS] = original
+
+
+# ── what happens when the R2 is simply not there ─────────────────────────────────
+# The R2 sat unavailable for a week with not a single line in the log: its start-up
+# attempt failed, nothing armed a retry, and the only path back was an advertisement
+# callback that never fired.  The scale had been taught this lesson already; the R2
+# had not.
+
+def test_the_retry_pace_follows_presence_not_failure_count() -> None:
+    """Absent means poll slowly; in range means back off from five seconds.
+
+    Pacing by failure count is what the scale's loop used to do, and it is why a brew
+    went missing on 2026-08-14: after a few failures the delay pegs at two minutes,
+    which is longer than the device stays awake.
+    """
+    from custom_components.difluid_microbalance.coordinator_r2 import _next_retry_delay
+
+    assert _next_retry_delay(present=False, delay=5.0) == 15.0
+    assert _next_retry_delay(present=False, delay=120.0) == 15.0
+    assert _next_retry_delay(present=True, delay=5.0) == 10.0
+    assert _next_retry_delay(present=True, delay=80.0) == 120.0
+    assert _next_retry_delay(present=True, delay=120.0) == 120.0
+
+
+async def test_a_startup_failure_arms_the_reconnect_loop(hass: HomeAssistant) -> None:
+    """The gap that left the R2 silent for a week.
+
+    `async_start` logged "will connect when seen in BLE scan" and armed nothing, so
+    with no advertisement arriving there was no retry at all — no timer, no log line,
+    no evidence anything was wrong.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from custom_components.difluid_microbalance.coordinator_r2 import DifluidR2Coordinator
+
+    coordinator = DifluidR2Coordinator(hass, "F4:12:FA:CE:8F:2A", "")
+    with (
+        patch(
+            "custom_components.difluid_microbalance.coordinator_r2"
+            ".bluetooth.async_register_callback",
+            return_value=lambda: None,
+        ),
+        patch.object(
+            DifluidR2Coordinator, "_do_connect", AsyncMock(side_effect=OSError("gone"))
+        ),
+    ):
+        await coordinator.async_start()
+
+    assert coordinator._reconnect_task is not None, (
+        "a failed start-up left no way back except an advertisement that may never come"
+    )
+    assert not coordinator._reconnect_task.done()
+
+    await coordinator.async_stop()
+
+
+async def test_the_loop_is_never_started_twice(hass: HomeAssistant) -> None:
+    from custom_components.difluid_microbalance.coordinator_r2 import DifluidR2Coordinator
+
+    coordinator = DifluidR2Coordinator(hass, "F4:12:FA:CE:8F:2A", "")
+    coordinator._ensure_reconnect_loop()
+    first = coordinator._reconnect_task
+    coordinator._ensure_reconnect_loop()
+
+    assert coordinator._reconnect_task is first
+
+    await coordinator.async_stop()

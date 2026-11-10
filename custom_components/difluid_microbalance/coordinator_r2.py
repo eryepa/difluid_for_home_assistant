@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -27,6 +28,25 @@ _LOGGER = logging.getLogger(__name__)
 _HEADER = bytes([0xDF, 0xDF])
 _R2_SERVICE_UUID = "000000ff-0000-1000-8000-00805f9b34fb"
 _DIRECT_PROBE_TIMEOUT = 3.0
+
+#: How often to look for a device that is not in the air, and how fast to retry one
+#: that is.
+#:
+#: The R2 is a handheld that spends most of its life switched off, so most of the time
+#: "not connected" means "not there" and there is nothing to retry.  Pacing by presence
+#: rather than by failure count keeps the radio quiet while it is off and still notices
+#: within about five seconds when it is switched on.  Same shape as the scale's loop,
+#: which learned this after a two-minute backoff hid a brew.
+_ABSENT_POLL_SECONDS = 15.0
+_PRESENT_RETRY_SECONDS = 5.0
+_PRESENT_RETRY_MAX_SECONDS = 120.0
+
+
+def _next_retry_delay(present: bool, delay: float) -> float:
+    """Next wait, given whether the device is in range right now."""
+    if not present:
+        return _ABSENT_POLL_SECONDS
+    return min(_PRESENT_RETRY_MAX_SECONDS, delay * 2)
 
 def _build_cmd(func: int, cmd: int, data: bytes = b"") -> bytes:
     frame = bytes([func, cmd, len(data)]) + data
@@ -193,9 +213,10 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             await self._do_connect()
         except Exception as err:
             _LOGGER.info(
-                "R2 %s not available at startup (%s) — will connect when seen in BLE scan",
+                "R2 %s not available at startup (%s) — will keep looking",
                 self.address, err,
             )
+            self._ensure_reconnect_loop()
 
     async def async_stop(self) -> None:
         if self._bt_cancel:
@@ -281,10 +302,19 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
         try:
             await self._do_connect()
         except Exception as err:
-            _LOGGER.debug("BT-triggered R2 connection to %s failed: %s; resuming retry loop", self.address, err)
-            self._reconnect_task = self.hass.async_create_background_task(
-                self._reconnect_loop(), name="difluid_r2_reconnect_loop"
+            _LOGGER.debug(
+                "BT-triggered R2 connection to %s failed: %s; resuming retry loop",
+                self.address, err,
             )
+            self._ensure_reconnect_loop()
+
+    def _ensure_reconnect_loop(self) -> None:
+        """Start the reconnect loop unless one is already running."""
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._reconnect_task = self.hass.async_create_background_task(
+            self._reconnect_loop(), name="difluid_r2_reconnect_loop"
+        )
 
     async def _do_connect(self) -> None:
         ble_device = bluetooth.async_ble_device_from_address(
@@ -520,29 +550,33 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             _LOGGER.info("Difluid R2 %s disconnected (power-off cooldown, won't reconnect for 60 s)", self.address)
             return
         _LOGGER.warning("Difluid R2 %s disconnected, will retry", self.address)
-        if self._reconnect_task and not self._reconnect_task.done():
-            return
-        self._reconnect_task = self.hass.async_create_background_task(
-            self._reconnect_loop(), name="difluid_r2_reconnect_loop"
-        )
+        self._ensure_reconnect_loop()
 
     async def _reconnect_loop(self) -> None:
-        import time as _time
-        delay = 5
+        delay = _PRESENT_RETRY_SECONDS
         while True:
             await asyncio.sleep(delay)
-            remaining = self._no_reconnect_until - _time.monotonic()
+            remaining = self._no_reconnect_until - time.monotonic()
             if remaining > 0:
                 await asyncio.sleep(remaining + 1)
-                delay = 5
+                delay = _PRESENT_RETRY_SECONDS
                 continue
+            present = (
+                bluetooth.async_ble_device_from_address(
+                    self.hass, self.address, connectable=True
+                )
+                is not None
+            )
             try:
-                await self._do_connect()
-                _LOGGER.info("Reconnected to Difluid R2 %s", self.address)
-                return
+                if present:
+                    await self._do_connect()
+                    _LOGGER.info("Reconnected to Difluid R2 %s", self.address)
+                    return
             except Exception as err:
-                _LOGGER.debug("R2 reconnect failed (%ss): %s", delay, err)
-                delay = min(120, delay * 2)
+                _LOGGER.warning(
+                    "R2 %s is in range but the connection failed: %s", self.address, err
+                )
+            delay = _next_retry_delay(present, delay)
 
     async def _async_update_data(self) -> R2Data:
         return self.data
