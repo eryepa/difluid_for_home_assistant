@@ -243,13 +243,14 @@ def _refractometer_entities(
 def _is_finished_test(event) -> bool:
     """Did this state change mean a test just finished, rather than something else?
 
-    Three ways it does not mean that, and each cost a real defect to learn:
+    Four ways it does not mean that, and each cost a real defect to learn:
 
     - the state is not a finished one at all, so this is a test starting;
     - the finished state was republished unchanged, which writes no meaningful event;
     - the entity was unavailable or unknown and has come back — the R2 is a handheld
       whose sensors go dark when it is switched off, and the coordinator keeps the
-      last reading, so a reconnect republishes "Test Finished" with a stale TDS.
+      last reading, so a reconnect republishes "Test Finished" with a stale TDS;
+    - there is no new state at all, which is what removing an entity looks like.
     """
     new = event.data.get("new_state")
     if new is None or new.state not in R2_SAMPLE_FINISHED:

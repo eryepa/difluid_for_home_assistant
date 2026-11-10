@@ -408,9 +408,72 @@ def _status_event(old_state, new_state):
         ("Test Start", "Test Start", False),
         ("Test Start", "Loop Test Ongoing", False),
         ("Calibration Start", "Calibration Finished", False),
+        # The entity is gone rather than changed: removing it fires a state change
+        # with no new state at all.
+        ("Test Finished", None, False),
     ],
 )
 def test_only_a_real_finish_counts_as_one(old, new, expected) -> None:
     from custom_components.difluid_microbalance import _is_finished_test
 
     assert _is_finished_test(_status_event(old, new)) is expected
+
+
+# A Device Settings frame that sets the unit to Fahrenheit: func 0x01, cmd 0x00.
+# Taken from protocolR2.md's own example, checksum included.
+_SETTINGS_FAHRENHEIT = bytes.fromhex("dfdf01000101c1")
+
+# The same command with no payload — a *request* rather than a setting.  It must not
+# overwrite the unit, and it is the only frame that reaches the settings parser
+# without a payload, so it is what the length guard is really for.
+_SETTINGS_EMPTY = bytes.fromhex("dfdf010000bf")
+
+
+async def test_the_unit_arrives_from_the_settings_frame_too(hass: HomeAssistant) -> None:
+    """A fourth branch of the old parser: func 0x01, cmd 0x00.
+
+    It was the one branch with no test at all, and deleting it from the dispatch table
+    left the whole suite green — so a device that reports its unit this way would have
+    silently kept reporting the previous one.
+    """
+    coordinator = _coordinator(hass)
+
+    coordinator._on_data_notification(None, bytearray(_LOOP_TEMPS))
+    assert coordinator.data.temperature_unit == "°C"
+
+    coordinator._on_data_notification(None, bytearray(_SETTINGS_FAHRENHEIT))
+
+    assert coordinator.data.temperature_unit == "°F"
+
+
+async def test_an_empty_settings_frame_leaves_the_unit_alone(
+    hass: HomeAssistant,
+) -> None:
+    coordinator = _coordinator(hass)
+    coordinator._on_data_notification(None, bytearray(_LOOP_TEMPS))
+    before = coordinator.data.temperature_unit
+
+    coordinator._on_data_notification(None, bytearray(_SETTINGS_EMPTY))
+
+    assert coordinator.data.temperature_unit == before
+
+
+async def test_a_misspelled_field_fails_loudly(hass: HomeAssistant) -> None:
+    """The parser table returns field names as strings, so a typo would be silent.
+
+    `setattr(self.data, "temperature_units", …)` creates a stray attribute instead of
+    raising, and the entity that should have updated simply stops — no error, no log
+    line.  The guard turns that into an exception at the first packet.
+    """
+    from custom_components.difluid_microbalance import coordinator_r2
+
+    coordinator = _coordinator(hass)
+    original = coordinator_r2._R2_PACKAGE_PARSERS[coordinator_r2._R2_PKG_STATUS]
+    coordinator_r2._R2_PACKAGE_PARSERS[coordinator_r2._R2_PKG_STATUS] = (
+        lambda payload, cmd: {"temperature_units": "°F"}
+    )
+    try:
+        with pytest.raises(KeyError, match="temperature_units"):
+            coordinator._on_data_notification(None, bytearray(_LOOP_STATUS))
+    finally:
+        coordinator_r2._R2_PACKAGE_PARSERS[coordinator_r2._R2_PKG_STATUS] = original

@@ -40,22 +40,22 @@ _R2_TEST_COMMANDS = frozenset({0x00, 0x01, 0x02, 0x03})
 _R2_FUNC_FIRMWARE = 0x00
 _R2_FUNC_SETTINGS = 0x01
 _R2_FUNC_ACTION = 0x03
-_R2_CMD_GET_FIRMWARE = 0x02
+_R2_CMD_FIRMWARE = 0x02
 _R2_CMD_CALIBRATE = 0x02
 _R2_PKG_STATUS = 0x00
 _R2_PKG_TEMPERATURES = 0x01
 _R2_PKG_RESULT = 0x02
 
-_Firmware = dict
 _Fields = dict
 
 
 def _decode_frame(raw: bytes) -> Optional[tuple[int, int, bytes]]:
     """Split a DF DF frame into (func, cmd, payload), or None if it is not one.
 
-    The length check is the whole defence here: `data_len` comes off the wire, so
-    slicing by it without asking whether that many bytes actually arrived is how a
-    truncated packet turns into a reading built from whatever followed it in memory.
+    `data_len` comes off the wire, so the frame is only as trustworthy as that byte:
+    the length check is what stops a truncated packet reaching the parsers at all.
+    Each parser re-checks the payload it needs, so this is the outer of two guards
+    rather than the only one.
     """
     if len(raw) < 6 or raw[0] != 0xDF or raw[1] != 0xDF:
         return None
@@ -95,6 +95,8 @@ def _parse_result(payload: bytes, cmd: int) -> Optional[_Fields]:
     }
 
 
+_CMD_GET_FIRMWARE = _build_cmd(_R2_FUNC_FIRMWARE, _R2_CMD_FIRMWARE)
+
 _R2_PACKAGE_PARSERS = {
     _R2_PKG_STATUS: _parse_status,
     _R2_PKG_TEMPERATURES: _parse_temperatures,
@@ -103,6 +105,17 @@ _R2_PACKAGE_PARSERS = {
 
 
 def _parse_action(cmd: int, payload: bytes) -> Optional[_Fields]:
+    """Parse one Device Action response: action command, then package number.
+
+    `_R2_TEST_COMMANDS` carries 0x03, which protocolR2.md does not document.  A test
+    started on the device itself answers on it whenever the prism is not yet at the
+    sample's temperature: the R2 re-tests in a loop until it settles, and reports
+    statuses 7/8/9 over that command.  Without it, every packet of such a test was
+    dropped and the reading only ever reached the device's own screen.
+
+    Bounded rather than open-ended because 0xFE and 0xFF are error codes in the same
+    function, and an error is not a reading.
+    """
     if cmd not in _R2_TEST_COMMANDS or not payload:
         return None
     parser = _R2_PACKAGE_PARSERS.get(payload[0])
@@ -129,6 +142,12 @@ def _to_celsius(value: float, fahrenheit: bool) -> float:
     hiding it.
     """
     return round((value - 32.0) * 5.0 / 9.0, 1) if fahrenheit else value
+
+_SECTION_FIELDS = frozenset(
+    {"concentration", "refractive_index", "prism_temperature", "sample_temperature",
+     "temperature_unit", "test_status"}
+)
+
 
 @dataclass
 class R2Data:
@@ -473,7 +492,7 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             return
 
         func, cmd, payload = frame
-        if func == _R2_FUNC_FIRMWARE and cmd == _R2_CMD_GET_FIRMWARE:
+        if func == _R2_FUNC_FIRMWARE and cmd == _R2_CMD_FIRMWARE:
             _LOGGER.info(
                 "R2 firmware version: %s",
                 payload.decode("ascii", errors="replace").rstrip("\x00"),
@@ -486,6 +505,8 @@ class DifluidR2Coordinator(DataUpdateCoordinator[R2Data]):
             return
 
         for name, value in fields.items():
+            if name not in _SECTION_FIELDS:
+                raise KeyError(f"unknown R2 field {name!r}")
             setattr(self.data, name, value)
         import time as _time
         self._last_activity_time = _time.monotonic()
